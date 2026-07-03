@@ -389,11 +389,7 @@ fn run_once(
                 };
                 let mut idle_ticks = 0u32;
                 for tick in 0..*max_ticks {
-                    println!(
-                        "[testing] pump watch tick {} of {}",
-                        tick + 1,
-                        max_ticks
-                    );
+                    println!("[testing] pump watch tick {} of {}", tick + 1, max_ticks);
                     crate::pump::tick(&ctx, override_arg)?;
                     counters.pumps += 1;
                     if matches!(scenario.mode, ScenarioMode::Stub) {
@@ -562,9 +558,11 @@ fn swarm_quiescent(ctx: &Context) -> Result<bool> {
         return Ok(false);
     }
 
-    let any_inbox = crate::store::list_agents(&ctx.conn)?
-        .iter()
-        .any(|agent| !crate::store::get_unprocessed_messages(&ctx.conn, agent).unwrap_or_default().is_empty());
+    let any_inbox = crate::store::list_agents(&ctx.conn)?.iter().any(|agent| {
+        !crate::store::get_unprocessed_messages(&ctx.conn, agent)
+            .unwrap_or_default()
+            .is_empty()
+    });
     if any_inbox {
         return Ok(false);
     }
@@ -618,12 +616,16 @@ fn validate_interactive_setup(ctx: &Context, scenario: &Scenario) -> Result<()> 
             ))
         })?;
 
-        let tmux_target = launch_target.tmux_target.as_deref().ok_or_else(|| {
-            TrelaneError::msg(format!(
-                "interactive scenario agent '{}' needs launch_target.tmux_target for terminal-backed testing",
-                agent.name
-            ))
-        })?;
+        let tmux_target = if launch_target.adapter == "tmux" {
+            launch_target.target.as_str()
+        } else {
+            launch_target.tmux_target.as_deref().ok_or_else(|| {
+                TrelaneError::msg(format!(
+                    "interactive scenario agent '{}' needs launch_target.tmux_target for terminal-backed testing",
+                    agent.name
+                ))
+            })?
+        };
         crate::commands::ensure_tmux_target(tmux_target)?;
     }
 
