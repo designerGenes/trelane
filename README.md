@@ -168,11 +168,23 @@ targets:
 
 `trelane pump` will prefer a stored launch target over the headless launcher.
 Supported adapters are `tmux`, `ghostty`, `iterm2`, `wezterm`, `kitty`, and `terminal.app`.
-The most reliable first choice remains `tmux`.
+The recommended approach for every supported terminal app is to run the agent
+inside `tmux` and have Trelane target the tmux pane/session. That is the only
+deterministic cross-terminal targeting layer Trelane currently supports well.
 
-For Ghostty on macOS, use `--target frontmost` to send to the active window, or
-set `--target` to a substring of the window title and Trelane will try to focus
-that window before typing.
+Examples:
+
+    # inside Ghostty, iTerm2, WezTerm, kitty, or Terminal.app
+    tmux new-session -s trelane-alpha
+    trelane set-launch-target alpha --adapter tmux --target trelane-alpha
+
+Native terminal adapters should be treated as best-effort fallbacks when tmux
+is not available. They are useful for convenience, but they are less precise
+than targeting tmux directly.
+
+For Ghostty on macOS, `--target frontmost` sends to the active window, and any
+other `--target` value is treated as a window-title substring. This still does
+not choose a specific split; it sends to the currently focused Ghostty split.
 
 ## Message format
 
