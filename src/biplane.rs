@@ -1,7 +1,10 @@
 use crate::error::{Result, TrelaneError};
 use serde::Serialize;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+const BIPLANE_REPORT_FILENAME: &str = "biplane-report.json";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BiplaneReport {
@@ -43,6 +46,29 @@ pub struct BiplaneClaim {
 }
 
 pub fn cmd_biplane(ctx: &crate::Context, safe_pocket_dir: Option<&Path>, json: bool) -> Result<()> {
+    let report = generate_biplane_report(ctx, safe_pocket_dir)?;
+
+    if let Some(pocket) = find_pocket_for_project(&ctx.root) {
+        let report_path = pocket.join(BIPLANE_REPORT_FILENAME);
+        fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
+        if !json {
+            println!("  Biplane report saved to {}", report_path.display());
+        }
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_biplane_report(&report);
+    }
+
+    Ok(())
+}
+
+fn generate_biplane_report(
+    ctx: &crate::Context,
+    safe_pocket_dir: Option<&Path>,
+) -> Result<BiplaneReport> {
     let agents = crate::store::list_agents(&ctx.conn)?;
     let mut agent_summaries = Vec::new();
     for name in &agents {
@@ -133,10 +159,128 @@ pub fn cmd_biplane(ctx: &crate::Context, safe_pocket_dir: Option<&Path>, json: b
         recommendations,
     };
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(report)
+}
+
+pub fn find_pocket_for_project(project_root: &Path) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let pockets_root = PathBuf::from(&home).join(".safe_pocket");
+    let entries = fs::read_dir(&pockets_root).ok()?;
+    for entry in entries.flatten() {
+        let pocket = entry.path();
+        let manifest_path = pocket.join("manifest.json");
+        if let Ok(text) = fs::read_to_string(&manifest_path)
+            && text.contains(&project_root.display().to_string())
+        {
+            return Some(pocket);
+        }
+        let agents_md = pocket.join("AGENTS.md");
+        if let Ok(text) = fs::read_to_string(&agents_md)
+            && text.contains(&project_root.display().to_string())
+        {
+            return Some(pocket);
+        }
+    }
+    None
+}
+
+pub fn has_existing_biplane_report(project_root: &Path) -> Option<PathBuf> {
+    let pocket = find_pocket_for_project(project_root)?;
+    let report_path = pocket.join(BIPLANE_REPORT_FILENAME);
+    if report_path.exists() {
+        Some(report_path)
     } else {
-        print_biplane_report(&report);
+        None
+    }
+}
+
+pub fn cmd_welcome(project: Option<PathBuf>) -> Result<()> {
+    let root = match project {
+        Some(p) => p.canonicalize()?,
+        None => std::env::current_dir()?.canonicalize()?,
+    };
+
+    crate::logo::print_logo();
+    println!();
+
+    let already_trelane = root.join(".trelane").join("trelane.db").exists();
+    let pocket = find_pocket_for_project(&root);
+
+    if let Some(ref pocket_path) = pocket {
+        println!("  Safe_pocket detected: {}", pocket_path.display());
+        let features_dir = pocket_path.join("FEATURES");
+        if features_dir.is_dir() {
+            let features = scan_feature_dir(&features_dir);
+            if !features.is_empty() {
+                println!("  Feature files found: {}", features.len());
+            }
+        }
+        println!();
+    }
+
+    if let Some(ref report_path) = has_existing_biplane_report(&root) {
+        println!("  This project has already been analyzed by Biplane.");
+        println!("  Report: {}", report_path.display());
+        println!();
+        println!("  To view the report:  trelane biplane");
+        println!(
+            "  To re-analyze:       trelane biplane --safe-pocket {}",
+            pocket
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
+        );
+        println!();
+    } else if pocket.is_some() {
+        println!("  This safe_pocket project has not been analyzed by Biplane yet.");
+        println!();
+        print!("  Run Biplane to analyze this project? [Y/n] ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let input = input.trim().to_lowercase();
+        if input.is_empty() || input == "y" || input == "yes" {
+            if !already_trelane {
+                crate::commands::cmd_init(Some(root.clone()))?;
+            }
+            let ctx = crate::Context::open(Some(&root))?;
+            return cmd_biplane(&ctx, pocket.as_deref(), false);
+        }
+        println!();
+        println!("  You can run it later with:  trelane biplane");
+        println!();
+    }
+
+    if already_trelane {
+        println!(
+            "  Trelane session: ACTIVE at {}",
+            root.join(".trelane").display()
+        );
+        println!();
+        println!("  Common commands:");
+        println!("    trelane status              -- show swarm state");
+        println!("    trelane biplane             -- analyze project and get recommendations");
+        println!("    trelane add-agent NAME --writable 'glob'  -- register an agent");
+        println!(
+            "    trelane send --from user --to AGENT --type question --subject '...'  -- assign work"
+        );
+        println!("    trelane pump --watch        -- start the pump");
+        println!("    trelane --testing tests/full-usage-scenario.json  -- run the test harness");
+        println!();
+    } else {
+        println!("  No Trelane session found at this location.");
+        println!();
+        println!("  Getting started:");
+        println!("    trelane init                -- initialize a session here");
+        println!("    trelane .                   -- attach to the current project");
+        println!("    trelane biplane             -- analyze a project and get recommendations");
+        println!();
+        println!("  Test harness (zero tokens):");
+        println!("    trelane --testing tests/full-usage-scenario.json");
+        println!();
+        println!("  Interactive test (real AI in tmux):");
+        println!("    trelane --testing tests/full-usage-scenario-interactive.json");
+        println!();
     }
 
     Ok(())

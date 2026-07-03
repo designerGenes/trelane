@@ -106,12 +106,7 @@ pub fn handle(cli: Cli) -> Result<()> {
     }
 
     match cli.command {
-        None => commands::cmd_attach_project(
-            cli.project,
-            cli.agents.as_deref(),
-            cli.no_agents.as_deref(),
-            true,
-        ),
+        None => biplane::cmd_welcome(cli.project),
         Some(Command::Init { project }) => commands::cmd_init(project.or(cli.project)),
         Some(Command::Attach { project, no_inject }) => commands::cmd_attach_project(
             project.or(cli.project),
