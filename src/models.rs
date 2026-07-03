@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 pub const MSG_TYPES: &[&str] = &[
     "question",
@@ -31,6 +32,7 @@ impl Default for Config {
             launcher: LauncherConfig {
                 template: r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50"#
                     .to_string(),
+                profiles: HashMap::new(),
             },
             pump: PumpConfig {
                 interval_s: 20,
@@ -54,6 +56,8 @@ pub struct AgentConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LauncherConfig {
     pub template: String,
+    #[serde(default)]
+    pub profiles: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

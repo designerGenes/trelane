@@ -22,7 +22,8 @@
     {
       "name": "frontend",
       "description": "Owns UI implementation",
-      "writable": ["src/ui/**"],
+      "writable": ["src/ui/**", "design/**"],
+      "forbidden_write": ["src/ui/secrets/**"],
       "launcher_agent": "stub-low-cost"
     },
     {
@@ -34,13 +35,14 @@
     {
       "name": "research",
       "description": "Owns research and notes",
-      "writable": ["research/**"],
+      "writable": ["research/**", "docs/briefs/**"],
       "launcher_agent": "stub-low-cost"
     }
   ],
   "steps": [
     {
       "type": "Send",
+      "explanation": "Frontend asks backend for the API schema before touching the UI table.",
       "from": "frontend",
       "to": "backend",
       "msg_type": "question",
@@ -50,6 +52,7 @@
     },
     {
       "type": "Park",
+      "explanation": "Frontend parks until the backend replies so the runner exercises inbox-driven wakeups.",
       "agent": "frontend",
       "task": "task-ui-table",
       "wait_reply_ref": "schema-question",
@@ -58,15 +61,18 @@
     },
     {
       "type": "Pump",
+      "explanation": "The pump wakes backend to answer, then frontend to resume from the reply.",
       "ticks": 2
     },
     {
       "type": "ClaimExpectDenied",
+      "explanation": "Backend should not be allowed to claim a frontend-owned UI file without a grant.",
       "agent": "backend",
       "path": "src/ui/app.ts"
     },
     {
       "type": "Send",
+      "explanation": "Backend requests permission to temporarily cross domains for a shared import update.",
       "from": "backend",
       "to": "frontend",
       "msg_type": "claim-request",
@@ -77,6 +83,7 @@
     },
     {
       "type": "Park",
+      "explanation": "Backend parks until frontend grants the contested claim.",
       "agent": "backend",
       "task": "task-fix-import",
       "wait_reply_ref": "ui-claim-request",
@@ -85,16 +92,19 @@
     },
     {
       "type": "Pump",
+      "explanation": "The pump wakes frontend to grant the claim, then backend to act on it.",
       "ticks": 2
     },
     {
       "type": "Redomain",
+      "explanation": "Research expands its writable scope to include UI copy review, simulating a mid-session domain shift.",
       "agent": "research",
       "writable": ["research/**", "src/ui/**"],
       "desc": "Expands into UI copy review after cross-team agreement."
     },
     {
       "type": "Send",
+      "explanation": "Research informs frontend that the domain shift happened so all agents have the same mental model.",
       "from": "research",
       "to": "frontend",
       "msg_type": "info",
@@ -103,18 +113,65 @@
     },
     {
       "type": "Pump",
+      "explanation": "Wake any agent with inbox work created by the domain-shift broadcast.",
+      "ticks": 1
+    },
+    {
+      "type": "Send",
+      "explanation": "Now create a real parked-task cycle: frontend waits on backend and backend waits on frontend with no natural reply coming.",
+      "from": "frontend",
+      "to": "backend",
+      "msg_type": "info",
+      "subject": "deadlock seed one",
+      "body": "This is a seed message for the deadlock test.",
+      "save_as": "deadlock-seed-1"
+    },
+    {
+      "type": "Send",
+      "explanation": "Mirror the seed in the opposite direction so each side can park on the other.",
+      "from": "backend",
+      "to": "frontend",
+      "msg_type": "info",
+      "subject": "deadlock seed two",
+      "body": "This is the counterpart seed message for the deadlock test.",
+      "save_as": "deadlock-seed-2"
+    },
+    {
+      "type": "Park",
+      "explanation": "Frontend parks on backend's seed message so it appears blocked on backend.",
+      "agent": "frontend",
+      "task": "task-deadlock-frontend",
+      "wait_reply_ref": "deadlock-seed-1",
+      "waiting_on": "backend",
+      "resume_hint": "Break the cycle with a documented assumption if designated."
+    },
+    {
+      "type": "Park",
+      "explanation": "Backend parks on frontend's seed message so it appears blocked on frontend.",
+      "agent": "backend",
+      "task": "task-deadlock-backend",
+      "wait_reply_ref": "deadlock-seed-2",
+      "waiting_on": "frontend",
+      "resume_hint": "Break the cycle with a documented assumption if designated."
+    },
+    {
+      "type": "Pump",
+      "explanation": "With no inbox-first progress left, the pump should detect the wait-cycle and wake the designated breaker.",
       "ticks": 1
     },
     {
       "type": "Pump",
+      "explanation": "The counterpart should wake on the deadlock-broken info message and clear the remaining parked work.",
       "ticks": 1
     },
     {
       "type": "AssertParkedCount",
+      "explanation": "After the deadlock breaker path runs, no parked tasks should remain.",
       "count": 0
     },
     {
-      "type": "AssertNoDeadlock"
+      "type": "AssertNoDeadlock",
+      "explanation": "The scenario should end without any residual wait-cycle in the ledger."
     }
   ],
   "metrics": [

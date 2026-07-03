@@ -73,9 +73,9 @@ Dry-run the full lifecycle with zero tokens first:
 
     bash demo-rust.sh
 
-This exercises message flow, claim negotiation, and a manufactured total
-deadlock, domain shifting, and repeated pump-driven wakeups, all driven by
-`trelane stub` (a scripted no-AI agent). Set
+This exercises message flow, claim negotiation, a manufactured parked-task
+deadlock and its recovery, domain shifting, and repeated pump-driven wakeups,
+all driven by `trelane stub` (a scripted no-AI agent). Set
 `TRELANE_DEMO_REPEAT=N` to run it repeatedly and `TRELANE_DEMO_REPORT=/path/report.jsonl`
 to capture a per-run report.
 
@@ -133,7 +133,8 @@ This does three things:
 
 Session agent selection is now operational, not just informational: if a
 domain agent is registered with `--launcher-agent <model>`, Trelane will
-refuse to wake or relaunch it when that session model is disabled.
+refuse to wake or relaunch it when that session model is disabled, and it can
+also pick a launcher command from `launcher.profiles.<model>` when configured.
 
 Default enabled/disabled agents can also be configured globally:
 
@@ -144,7 +145,11 @@ Default enabled/disabled agents can also be configured globally:
     "disabled": ["expensive-experimental-model"]
   },
   "launcher": {
-    "template": "claude -p \"$(cat {prompt_file})\" --permission-mode acceptEdits --allowedTools \"Bash(trelane *)\" --max-turns 50"
+    "template": "claude -p \"$(cat {prompt_file})\" --permission-mode acceptEdits --allowedTools \"Bash(trelane *)\" --max-turns 50",
+    "profiles": {
+      "stub-low-cost": "trelane --root {root} stub {agent}",
+      "claude": "claude -p \"$(cat {prompt_file})\" --permission-mode acceptEdits --allowedTools \"Bash(trelane *)\" --max-turns 50"
+    }
   },
   "pump": {
     "interval_s": 20,
@@ -191,7 +196,11 @@ than targeting tmux directly.
 
 When `--tmux-target` is set on a non-`tmux` adapter, Trelane now injects a real
 `tmux send-keys ... Enter` relay into the host terminal instead of typing the
-raw `trelane inbox ...` command directly.
+raw wake command directly.
+
+Without a custom `--command`, terminal relaunch now surfaces the generated
+`.trelane/agents/<agent>/.prompt.md` file by default rather than only printing
+the inbox.
 
 For Ghostty on macOS, `--target frontmost` sends to the active window, and any
 other `--target` value is treated as a window-title substring. This still does
@@ -204,7 +213,16 @@ Full usage scenarios live under `tests/` as JSON files. A scenario describes:
 - the project files to create
 - the participating agents and their domains
 - the ordered coordination steps to run
+- a verbal explanation for each step
 - the metrics to record per run
+
+The shipped scenario demonstrates:
+
+- multiple domain shapes, including multi-glob domains
+- a forbidden-write carve-out
+- cross-domain claim negotiation
+- mid-session redomaining
+- a manufactured parked-task deadlock and pump-driven recovery
 
 Run one directly with:
 

@@ -1,5 +1,6 @@
 use crate::Context;
 use crate::commands;
+use crate::crypto;
 use crate::error::{Result, TrelaneError};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -35,6 +36,8 @@ pub struct ScenarioAgent {
     pub description: String,
     pub writable: Vec<String>,
     #[serde(default)]
+    pub forbidden_write: Vec<String>,
+    #[serde(default)]
     pub launcher_agent: Option<String>,
 }
 
@@ -42,6 +45,7 @@ pub struct ScenarioAgent {
 #[serde(tag = "type")]
 pub enum ScenarioStep {
     Send {
+        explanation: String,
         from: String,
         to: String,
         msg_type: String,
@@ -56,6 +60,7 @@ pub enum ScenarioStep {
         save_as: Option<String>,
     },
     Park {
+        explanation: String,
         agent: String,
         #[serde(default)]
         task: Option<String>,
@@ -64,20 +69,26 @@ pub enum ScenarioStep {
         resume_hint: String,
     },
     Pump {
+        explanation: String,
         ticks: u32,
     },
     ClaimExpectDenied {
+        explanation: String,
         agent: String,
         path: String,
     },
     Redomain {
+        explanation: String,
         agent: String,
         writable: Vec<String>,
         #[serde(default)]
         desc: Option<String>,
     },
-    AssertNoDeadlock,
+    AssertNoDeadlock {
+        explanation: String,
+    },
     AssertParkedCount {
+        explanation: String,
         count: usize,
     },
 }
@@ -208,6 +219,17 @@ fn run_once(
             Some(&agent.description),
             agent.launcher_agent.as_deref(),
         )?;
+        if !agent.forbidden_write.is_empty() {
+            crate::store::upsert_agent(
+                &ctx.conn,
+                &agent.name,
+                &agent.description,
+                &agent.writable,
+                agent.launcher_agent.as_deref(),
+                &agent.forbidden_write,
+                &crypto::now_iso(),
+            )?;
+        }
     }
 
     let started_at = chrono::Utc::now();
@@ -215,9 +237,15 @@ fn run_once(
     let mut counters = Counters::default();
 
     for (index, step) in scenario.steps.iter().enumerate() {
-        println!("[testing] step {}: {}", index + 1, step_name(step));
+        println!(
+            "[testing] step {}: {} - {}",
+            index + 1,
+            step_name(step),
+            step_explanation(step)
+        );
         match step {
             ScenarioStep::Send {
+                explanation: _,
                 from,
                 to,
                 msg_type,
@@ -249,6 +277,7 @@ fn run_once(
                 counters.messages_sent += 1;
             }
             ScenarioStep::Park {
+                explanation: _,
                 agent,
                 task,
                 wait_reply_ref,
@@ -268,7 +297,10 @@ fn run_once(
                     resume_hint,
                 )?;
             }
-            ScenarioStep::Pump { ticks } => {
+            ScenarioStep::Pump {
+                explanation: _,
+                ticks,
+            } => {
                 let launcher = launcher_override
                     .map(str::to_string)
                     .unwrap_or_else(default_stub_launcher);
@@ -279,7 +311,11 @@ fn run_once(
                     counters.pumps += 1;
                 }
             }
-            ScenarioStep::ClaimExpectDenied { agent, path } => {
+            ScenarioStep::ClaimExpectDenied {
+                explanation: _,
+                agent,
+                path,
+            } => {
                 let rel =
                     crate::domain::norm_rel(&ctx.root, &ctx.root.join(path).display().to_string())?;
                 let dom = crate::store::get_domain(&ctx.conn, agent)?
@@ -294,6 +330,7 @@ fn run_once(
                 println!("[testing] verified claim should be denied for {agent} on {rel}");
             }
             ScenarioStep::Redomain {
+                explanation: _,
                 agent,
                 writable,
                 desc,
@@ -301,7 +338,7 @@ fn run_once(
                 commands::cmd_redomain(&ctx, agent, writable, desc.as_deref())?;
                 counters.redomains += 1;
             }
-            ScenarioStep::AssertNoDeadlock => {
+            ScenarioStep::AssertNoDeadlock { explanation: _ } => {
                 let (_, cycle) = crate::pump::wait_graph(&ctx.conn)?;
                 if cycle.is_some() {
                     return Err(TrelaneError::msg(
@@ -309,7 +346,10 @@ fn run_once(
                     ));
                 }
             }
-            ScenarioStep::AssertParkedCount { count } => {
+            ScenarioStep::AssertParkedCount {
+                explanation: _,
+                count,
+            } => {
                 let parked = crate::store::list_parked_tasks(&ctx.conn)?;
                 if parked.len() != *count {
                     return Err(TrelaneError::msg(format!(
@@ -352,8 +392,20 @@ fn step_name(step: &ScenarioStep) -> &'static str {
         ScenarioStep::Pump { .. } => "pump",
         ScenarioStep::ClaimExpectDenied { .. } => "claim-expect-denied",
         ScenarioStep::Redomain { .. } => "redomain",
-        ScenarioStep::AssertNoDeadlock => "assert-no-deadlock",
+        ScenarioStep::AssertNoDeadlock { .. } => "assert-no-deadlock",
         ScenarioStep::AssertParkedCount { .. } => "assert-parked-count",
+    }
+}
+
+fn step_explanation(step: &ScenarioStep) -> &str {
+    match step {
+        ScenarioStep::Send { explanation, .. }
+        | ScenarioStep::Park { explanation, .. }
+        | ScenarioStep::Pump { explanation, .. }
+        | ScenarioStep::ClaimExpectDenied { explanation, .. }
+        | ScenarioStep::Redomain { explanation, .. }
+        | ScenarioStep::AssertNoDeadlock { explanation }
+        | ScenarioStep::AssertParkedCount { explanation, .. } => explanation,
     }
 }
 
@@ -367,6 +419,9 @@ fn init_git_repo(root: &Path) -> Result<()> {
             root.display()
         )));
     }
+    let ignore_path = root.join("src/ui/secrets");
+    fs::create_dir_all(&ignore_path)?;
+    fs::write(ignore_path.join("token.txt"), "do-not-touch\n")?;
     Ok(())
 }
 
@@ -425,6 +480,7 @@ mod tests {
           "steps": [
             {
               "type": "Send",
+              "explanation": "demo send",
               "from": "alpha",
               "to": "alpha",
               "msg_type": "info",
@@ -433,6 +489,7 @@ mod tests {
             },
             {
               "type": "Redomain",
+              "explanation": "demo redomain",
               "agent": "alpha",
               "writable": ["src/**"]
             }
@@ -456,7 +513,9 @@ mod tests {
     #[test]
     fn step_name_is_stable() {
         assert_eq!(
-            step_name(&ScenarioStep::AssertNoDeadlock),
+            step_name(&ScenarioStep::AssertNoDeadlock {
+                explanation: "x".to_string()
+            }),
             "assert-no-deadlock"
         );
     }

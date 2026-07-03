@@ -93,31 +93,6 @@ CREATE TABLE IF NOT EXISTS launch_targets (
 );
 "#;
 
-const SCHEMA_V2: &str = r#"
-CREATE TABLE IF NOT EXISTS session_agents (
-    name            TEXT PRIMARY KEY,
-    enabled         INTEGER NOT NULL,
-    source          TEXT NOT NULL,
-    updated_at      TEXT NOT NULL
-);
-"#;
-
-const SCHEMA_V3: &str = r#"
-CREATE TABLE IF NOT EXISTS launch_targets (
-    agent           TEXT PRIMARY KEY,
-    adapter         TEXT NOT NULL,
-    target          TEXT NOT NULL,
-    command         TEXT NOT NULL,
-    updated_at      TEXT NOT NULL
-);
-
-ALTER TABLE agents ADD COLUMN launcher_agent TEXT;
-"#;
-
-const SCHEMA_V4: &str = r#"
-ALTER TABLE launch_targets ADD COLUMN tmux_target TEXT;
-"#;
-
 pub fn open(db_path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
     conn.execute_batch(
@@ -128,45 +103,45 @@ pub fn open(db_path: &std::path::Path) -> Result<Connection> {
 }
 
 fn migrate(conn: &Connection) -> Result<()> {
-    let version: u32 = conn
+    let mut version: u32 = conn
         .query_row("SELECT user_version FROM pragma_user_version", [], |r| {
             r.get(0)
         })
         .unwrap_or(0);
     if version < 1 {
         conn.execute_batch(SCHEMA_V1)?;
-        conn.execute_batch("PRAGMA user_version = 3;")?;
-    } else if version < 2 {
-        conn.execute_batch(SCHEMA_V2)?;
+        conn.execute_batch("PRAGMA user_version = 4;")?;
+        return Ok(());
+    }
+
+    if version < 2 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_agents (
+                name TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );",
+        )?;
         conn.execute_batch("PRAGMA user_version = 2;")?;
+        version = 2;
     }
     if version < 3 {
-        match conn.execute_batch(SCHEMA_V3) {
-            Ok(()) => {}
-            Err(rusqlite::Error::SqliteFailure(err, _))
-                if err.extended_code == rusqlite::ffi::SQLITE_ERROR =>
-            {
-                conn.execute_batch(
-                    "CREATE TABLE IF NOT EXISTS launch_targets (
-                        agent TEXT PRIMARY KEY,
-                        adapter TEXT NOT NULL,
-                        target TEXT NOT NULL,
-                        command TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
-                    );",
-                )?;
-            }
-            Err(e) => return Err(e.into()),
-        }
+        conn.execute_batch("ALTER TABLE agents ADD COLUMN launcher_agent TEXT;")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS launch_targets (
+                agent TEXT PRIMARY KEY,
+                adapter TEXT NOT NULL,
+                target TEXT NOT NULL,
+                command TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );",
+        )?;
         conn.execute_batch("PRAGMA user_version = 3;")?;
+        version = 3;
     }
     if version < 4 {
-        match conn.execute_batch(SCHEMA_V4) {
-            Ok(()) => {}
-            Err(rusqlite::Error::SqliteFailure(err, _))
-                if err.extended_code == rusqlite::ffi::SQLITE_ERROR => {}
-            Err(e) => return Err(e.into()),
-        }
+        conn.execute_batch("ALTER TABLE launch_targets ADD COLUMN tmux_target TEXT;")?;
         conn.execute_batch("PRAGMA user_version = 4;")?;
     }
     Ok(())

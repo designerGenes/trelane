@@ -17,6 +17,18 @@ pub fn is_running(conn: &Connection, agent: &str) -> Result<bool> {
         None => Ok(false),
         Some(lock) => {
             if lock.pid <= 0 {
+                let age_s = chrono::DateTime::parse_from_rfc3339(&lock.started_at)
+                    .ok()
+                    .map(|dt| {
+                        chrono::Utc::now()
+                            .signed_duration_since(dt.with_timezone(&chrono::Utc))
+                            .num_seconds()
+                    })
+                    .unwrap_or(0);
+                if age_s > 900 {
+                    store::delete_running_lock(conn, agent)?;
+                    return Ok(false);
+                }
                 return Ok(true);
             }
             let alive = unsafe { libc::kill(lock.pid, 0) == 0 };
@@ -263,6 +275,7 @@ fn domain_launch_enabled(ctx: &Context, domain_agent: &str) -> Result<bool> {
     }
 }
 
+#[cfg(test)]
 fn relaunch_command_for_agent(ctx: &Context, agent: &str) -> String {
     format!(
         "trelane --root {} inbox {} --json",
@@ -292,6 +305,33 @@ fn command_for_launch_target(target: &LaunchTarget) -> String {
         ),
         _ => target.command.clone(),
     }
+}
+
+fn launcher_command_for_agent(
+    ctx: &Context,
+    agent: &str,
+    prompt_file: &Path,
+    launcher_override: Option<&str>,
+) -> Result<String> {
+    if let Some(override_cmd) = launcher_override {
+        return Ok(override_cmd
+            .replace("{prompt_file}", &prompt_file.display().to_string())
+            .replace("{agent}", agent)
+            .replace("{root}", &ctx.root.display().to_string()));
+    }
+
+    let domain = store::get_domain(&ctx.conn, agent)?
+        .ok_or_else(|| TrelaneError::msg(format!("unknown agent '{agent}'")))?;
+    let template = domain
+        .launcher_agent
+        .as_deref()
+        .and_then(|name| ctx.config.launcher.profiles.get(name))
+        .map(String::as_str)
+        .unwrap_or(&ctx.config.launcher.template);
+    Ok(template
+        .replace("{prompt_file}", &prompt_file.display().to_string())
+        .replace("{agent}", agent)
+        .replace("{root}", &ctx.root.display().to_string()))
 }
 
 fn launch_via_adapter(adapter: &str, target: &str, command: &str) -> Result<()> {
@@ -961,7 +1001,14 @@ pub fn cmd_wake(
     if launcher_override.is_none()
         && let Some(target) = store::get_launch_target(&ctx.conn, agent)?
     {
-        let command = command_for_launch_target(&target);
+        let command = command_for_launch_target(&LaunchTarget {
+            command: target
+                .command
+                .replace("{prompt_file}", &prompt_file.display().to_string())
+                .replace("{agent}", agent)
+                .replace("{root}", &ctx.root.display().to_string()),
+            ..target.clone()
+        });
         launch_via_adapter(&target.adapter, &target.target, &command)?;
         let inserted =
             store::insert_running_lock(&ctx.conn, agent, -1, &crypto::now_iso(), reason)?;
@@ -975,11 +1022,7 @@ pub fn cmd_wake(
         return Ok(());
     }
 
-    let template = launcher_override.unwrap_or(&ctx.config.launcher.template);
-    let cmd = template
-        .replace("{prompt_file}", &prompt_file.display().to_string())
-        .replace("{agent}", agent)
-        .replace("{root}", &ctx.root.display().to_string());
+    let cmd = launcher_command_for_agent(ctx, agent, &prompt_file, launcher_override)?;
 
     let log_dir = ctx.trelane_dir().join("agents").join(agent).join("logs");
     std::fs::create_dir_all(&log_dir)?;
@@ -1030,9 +1073,18 @@ pub fn cmd_set_launch_target(
             "agent '{agent}' is mapped to a disabled session agent/model"
         )));
     }
-    let command = command
-        .map(str::to_string)
-        .unwrap_or_else(|| relaunch_command_for_agent(ctx, agent));
+    let default_command = format!(
+        "cat {}",
+        shell_single_quote(
+            &ctx.trelane_dir()
+                .join("agents")
+                .join(agent)
+                .join(".prompt.md")
+                .display()
+                .to_string()
+        )
+    );
+    let command = command.map(str::to_string).unwrap_or(default_command);
     store::upsert_launch_target(
         &ctx.conn,
         agent,
@@ -1077,7 +1129,19 @@ pub fn cmd_relaunch(
     let command = command
         .map(str::to_string)
         .or_else(|| stored.as_ref().map(|t| t.command.clone()))
-        .unwrap_or_else(|| relaunch_command_for_agent(ctx, agent));
+        .unwrap_or_else(|| {
+            format!(
+                "cat {}",
+                shell_single_quote(
+                    &ctx.trelane_dir()
+                        .join("agents")
+                        .join(agent)
+                        .join(".prompt.md")
+                        .display()
+                        .to_string()
+                )
+            )
+        });
 
     let launch_target = LaunchTarget {
         agent: agent.to_string(),
