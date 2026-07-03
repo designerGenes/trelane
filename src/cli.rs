@@ -1,0 +1,165 @@
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(
+    name = "trelane",
+    version,
+    about = "Park-and-pump multi-agent coordination protocol"
+)]
+pub struct Cli {
+    #[arg(long, global = true, help = "project root (default: walk up from cwd)")]
+    pub root: Option<PathBuf>,
+
+    #[arg(
+        long,
+        global = true,
+        help = "comma-separated agents/models to enable for this session"
+    )]
+    pub agents: Option<String>,
+
+    #[arg(
+        long = "no-agents",
+        global = true,
+        help = "comma-separated agents/models to disable for this session"
+    )]
+    pub no_agents: Option<String>,
+
+    #[arg(
+        value_name = "PROJECT",
+        help = "attach/init a trelane session for an existing project"
+    )]
+    pub project: Option<PathBuf>,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// Initialize a new trelane session in a project
+    Init {
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+
+    /// Attach Trelane to an existing project and inject AGENTS.md instructions
+    Attach {
+        project: Option<PathBuf>,
+        #[arg(long = "no-inject")]
+        no_inject: bool,
+    },
+
+    /// Register a new agent with a domain
+    AddAgent {
+        name: String,
+        #[arg(long = "writable")]
+        writable: Vec<String>,
+        #[arg(long = "desc")]
+        desc: Option<String>,
+    },
+
+    /// Send a signed message to another agent's inbox
+    Send {
+        #[arg(long = "from")]
+        from: String,
+        #[arg(long = "to")]
+        to: String,
+        #[arg(long = "type")]
+        msg_type: String,
+        #[arg(long = "subject")]
+        subject: String,
+        #[arg(long = "body", default_value = "")]
+        body: String,
+        #[arg(long = "re")]
+        re: Option<String>,
+        #[arg(long = "task")]
+        task: Option<String>,
+        #[arg(long = "path")]
+        paths: Vec<String>,
+        #[arg(long = "urgency", default_value = "normal")]
+        urgency: String,
+    },
+
+    /// List unprocessed messages for an agent
+    Inbox {
+        agent: String,
+        #[arg(long = "json")]
+        json: bool,
+    },
+
+    /// Mark a message as processed
+    Ack { agent: String, msg_id: String },
+
+    /// Acquire a file lease (claim)
+    Claim {
+        agent: String,
+        path: String,
+        #[arg(long = "ttl")]
+        ttl: Option<u64>,
+        #[arg(long = "task")]
+        task: Option<String>,
+        #[arg(long = "grant")]
+        grant: Option<String>,
+    },
+
+    /// Release a file lease
+    Release {
+        agent: String,
+        path: String,
+        #[arg(long = "force")]
+        force: bool,
+    },
+
+    /// Park a blocked task as a durable continuation
+    Park {
+        agent: String,
+        #[arg(long = "task")]
+        task: Option<String>,
+        #[arg(long = "wait-reply")]
+        wait_reply: Option<String>,
+        #[arg(long = "wait-claim")]
+        wait_claim: Option<String>,
+        #[arg(long = "waiting-on", required = true)]
+        waiting_on: String,
+        #[arg(long = "resume-hint", default_value = "")]
+        resume_hint: String,
+    },
+
+    /// Remove a parked task
+    Unpark { task: String },
+
+    /// Show full swarm status
+    Status,
+
+    /// Launch an agent process
+    Wake {
+        agent: String,
+        #[arg(long = "why")]
+        why: Option<String>,
+        #[arg(long = "launcher")]
+        launcher: Option<String>,
+    },
+
+    /// Mark an agent as done (release running lock)
+    Done { agent: String },
+
+    /// The dumb pump — relaunches agents that have a reason to wake
+    Pump {
+        #[arg(long = "once")]
+        once: bool,
+        #[arg(long = "watch")]
+        watch: bool,
+        #[arg(long = "interval")]
+        interval: Option<u64>,
+        #[arg(long = "launcher")]
+        launcher: Option<String>,
+    },
+
+    /// Token-free scripted agent for demos and testing
+    Stub { agent: String },
+
+    /// Audit an agent's run for out-of-domain file changes
+    Audit { agent: String },
+}
