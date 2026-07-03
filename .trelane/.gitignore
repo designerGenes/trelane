@@ -1,0 +1,6 @@
+secret
+agents/*/.prompt.md
+agents/*/logs/
+pump.log
+*.db-wal
+*.db-shm
