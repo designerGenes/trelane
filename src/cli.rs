@@ -15,6 +15,27 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
+        help = "comma-separated models allowed for this session (e.g. glm-5.2)"
+    )]
+    pub models: Option<String>,
+
+    #[arg(
+        long = "max-agents",
+        global = true,
+        help = "maximum number of agents to spawn"
+    )]
+    pub max_agents: Option<u32>,
+
+    #[arg(
+        long = "with-biplane",
+        global = true,
+        help = "run Biplane analysis before launching agents to determine domains"
+    )]
+    pub with_biplane: bool,
+
+    #[arg(
+        long,
+        global = true,
         help = "run a full usage scenario from a test file"
     )]
     pub testing: Option<PathBuf>,

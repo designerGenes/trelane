@@ -1,10 +1,276 @@
 use crate::error::{Result, TrelaneError};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const BIPLANE_REPORT_FILENAME: &str = "biplane-report.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BiplanePlan {
+    pub agents: Vec<BiplanePlanAgent>,
+    pub initial_tasks: Vec<BiplanePlanTask>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BiplanePlanAgent {
+    pub name: String,
+    pub description: String,
+    pub writable: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BiplanePlanTask {
+    pub agent: String,
+    pub subject: String,
+    pub body: String,
+}
+
+pub fn run_biplane_plan(
+    project_root: &Path,
+    model: &str,
+    max_agents: usize,
+) -> Result<BiplanePlan> {
+    let project_structure = scan_project_structure(project_root);
+    let safe_pocket_features = collect_safe_pocket_feature_text(project_root);
+
+    let prompt = compose_biplane_planning_prompt(
+        &project_structure,
+        &safe_pocket_features,
+        max_agents,
+        project_root,
+    );
+
+    let prompt_file = project_root.join(".trelane").join("biplane-plan-prompt.md");
+    if let Some(parent) = prompt_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&prompt_file, &prompt)?;
+
+    let launcher_template = resolve_launcher_template(model)?;
+    let cmd = launcher_template
+        .replace("{prompt_file}", &prompt_file.display().to_string())
+        .replace("{agent}", "biplane")
+        .replace("{root}", &project_root.display().to_string());
+
+    println!("[biplane] Launching planner with model '{}'...", model);
+    println!("[biplane] Prompt: {}", prompt_file.display());
+
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .current_dir(project_root)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(TrelaneError::msg(format!(
+            "biplane planner failed: {}",
+            stderr.trim()
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let plan = parse_biplane_plan(&stdout, max_agents)?;
+
+    Ok(plan)
+}
+
+fn resolve_launcher_template(model: &str) -> Result<String> {
+    let config = crate::load_config()?;
+
+    if let Some(template) = config.launcher.profiles.get(model) {
+        return Ok(template.clone());
+    }
+
+    Ok(format!(
+        "opencode {{root}} --model openrouter/{} --prompt \"$(cat {{prompt_file}})\"",
+        model
+    ))
+}
+
+fn compose_biplane_planning_prompt(
+    structure: &str,
+    features: &str,
+    max_agents: usize,
+    project_root: &Path,
+) -> String {
+    format!(
+        r#"# Biplane Project Analysis
+
+You are analyzing the project at `{}` to determine how to split it across multiple AI agents using the Trelane coordination protocol.
+
+## Project Structure
+
+```
+{}
+```
+
+## Feature Files
+
+{}
+
+## Your Task
+
+Analyze this project and propose a domain split for up to {} agents. Each agent should own a distinct area of the codebase. Consider:
+
+- Natural separation of concerns (e.g., UI vs API vs data vs tests)
+- File paths that can be grouped into writable globs
+- Dependencies between areas (agents that need to coordinate)
+- Balanced workload
+
+Output your plan as a JSON object with this exact structure (and nothing else after the JSON):
+
+```json
+{{
+  "agents": [
+    {{
+      "name": "short-name",
+      "description": "what this agent owns",
+      "writable": ["src/path/**", "other/path/**"]
+    }}
+  ],
+  "initial_tasks": [
+    {{
+      "agent": "short-name",
+      "subject": "first task for this agent",
+      "body": "detailed instructions for what to build first"
+    }}
+  ]
+}}
+```
+
+Rules:
+- Use 2-{} agents
+- Agent names must be lowercase with hyphens only (e.g., "frontend", "data-model")
+- Each agent must have at least one writable glob
+- writable globs should be specific enough to avoid overlap
+- Provide one initial task per agent
+- Do not include .trelane/** or .git/** in writable (those are forbidden automatically)
+"#,
+        project_root.display(),
+        structure,
+        if features.is_empty() {
+            "(no safe_pocket feature files found)"
+        } else {
+            features
+        },
+        max_agents,
+        max_agents
+    )
+}
+
+fn parse_biplane_plan(output: &str, max_agents: usize) -> Result<BiplanePlan> {
+    let json_start = output
+        .find('{')
+        .ok_or_else(|| TrelaneError::msg("biplane planner did not produce JSON output"))?;
+    let json_end = output
+        .rfind('}')
+        .ok_or_else(|| TrelaneError::msg("biplane planner JSON output is incomplete"))?;
+    let json_str = &output[json_start..=json_end];
+
+    let mut plan: BiplanePlan = serde_json::from_str(json_str)
+        .map_err(|e| TrelaneError::msg(format!("failed to parse biplane plan JSON: {e}")))?;
+
+    if plan.agents.len() > max_agents {
+        plan.agents.truncate(max_agents);
+    }
+    if plan.agents.is_empty() {
+        return Err(TrelaneError::msg("biplane planner proposed zero agents"));
+    }
+
+    for a in &mut plan.agents {
+        if a.name.is_empty() {
+            return Err(TrelaneError::msg(
+                "biplane planner produced an agent with an empty name",
+            ));
+        }
+        a.name = a.name.to_lowercase().replace(' ', "-");
+        if a.writable.is_empty() {
+            a.writable.push(format!("src/{}/**", a.name));
+        }
+    }
+
+    plan.initial_tasks
+        .retain(|t| plan.agents.iter().any(|a| a.name == t.agent));
+
+    Ok(plan)
+}
+
+fn scan_project_structure(root: &Path) -> String {
+    let mut result = Vec::new();
+    scan_dir(root, root, 0, 3, &mut result);
+    result.join("\n")
+}
+
+fn scan_dir(root: &Path, dir: &Path, depth: usize, max_depth: usize, result: &mut Vec<String>) {
+    if depth > max_depth {
+        return;
+    }
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            if name_str.starts_with('.') && name_str != ".env" {
+                continue;
+            }
+            if matches!(
+                name_str.as_ref(),
+                "target" | "node_modules" | "__pycache__" | "dist" | "build"
+            ) {
+                continue;
+            }
+
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            let prefix = "  ".repeat(depth);
+            if path.is_dir() {
+                result.push(format!("{}{}/", prefix, rel.display()));
+                scan_dir(root, &path, depth + 1, max_depth, result);
+            } else {
+                result.push(format!("{}{}", prefix, rel.display()));
+            }
+        }
+    }
+}
+
+fn collect_safe_pocket_feature_text(project_root: &Path) -> String {
+    let pocket = match find_pocket_for_project(project_root) {
+        Some(p) => p,
+        None => return String::new(),
+    };
+    let features_dir = pocket.join("FEATURES");
+    if !features_dir.is_dir() {
+        return String::new();
+    }
+
+    let mut texts = Vec::new();
+    collect_feature_text(&features_dir, &features_dir, &mut texts);
+    texts.join("\n\n---\n\n")
+}
+
+fn collect_feature_text(base: &Path, dir: &Path, texts: &mut Vec<String>) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_feature_text(base, &path, texts);
+            } else if path.extension().is_some_and(|ext| ext == "md")
+                && let Ok(rel) = path.strip_prefix(base)
+                && let Ok(content) = fs::read_to_string(&path)
+            {
+                let truncated = if content.len() > 2000 {
+                    format!("{}...(truncated)", &content[..2000])
+                } else {
+                    content
+                };
+                texts.push(format!("## {}\n\n{}", rel.display(), truncated));
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BiplaneReport {
@@ -65,7 +331,7 @@ pub fn cmd_biplane(ctx: &crate::Context, safe_pocket_dir: Option<&Path>, json: b
     Ok(())
 }
 
-fn generate_biplane_report(
+pub fn generate_biplane_report(
     ctx: &crate::Context,
     safe_pocket_dir: Option<&Path>,
 ) -> Result<BiplaneReport> {

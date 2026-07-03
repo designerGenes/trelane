@@ -19,6 +19,7 @@ use crate::error::{Result, TrelaneError};
 use crate::models::{Config, TRELANE_DIR};
 use clap::Parser;
 use rusqlite::Connection;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 /// Resolve the global config directory, respecting XDG_CONFIG_HOME.
@@ -94,6 +95,216 @@ pub fn run() -> Result<()> {
     handle(cli)
 }
 
+fn cmd_launch(cli: Cli) -> Result<()> {
+    let root = match cli.project.as_deref().or(cli.root.as_deref()) {
+        Some(p) => p.canonicalize()?,
+        None => std::env::current_dir()?.canonicalize()?,
+    };
+
+    let models: Vec<String> = cli
+        .models
+        .as_deref()
+        .unwrap_or("glm-5.2")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let max_agents = cli.max_agents.unwrap_or(3) as usize;
+    let primary_model = models
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "glm-5.2".to_string());
+
+    crate::logo::print_logo();
+    println!();
+    println!("  Project   : {}", root.display());
+    println!("  Models    : {}", models.join(", "));
+    println!("  Max agents: {}", max_agents);
+    println!();
+
+    if !root.join(TRELANE_DIR).join("trelane.db").exists() {
+        crate::commands::cmd_init(Some(root.clone()))?;
+    }
+
+    let existing_agents = {
+        let ctx = Context::open(Some(&root))?;
+        crate::store::list_agents(&ctx.conn)?
+    };
+
+    if existing_agents.is_empty() {
+        if cli.with_biplane {
+            println!(
+                "[launch] Running Biplane analysis with {}...",
+                primary_model
+            );
+            let plan = biplane::run_biplane_plan(&root, &primary_model, max_agents)?;
+
+            println!("[launch] Biplane proposed {} agent(s):", plan.agents.len());
+            for a in &plan.agents {
+                println!(
+                    "  - {} : {} (writable: {})",
+                    a.name,
+                    a.description,
+                    a.writable.join(", ")
+                );
+            }
+            println!();
+
+            let ctx = Context::open(Some(&root))?;
+            for agent in &plan.agents {
+                crate::commands::cmd_add_agent(
+                    &ctx,
+                    &agent.name,
+                    &agent.writable,
+                    Some(&agent.description),
+                    Some(&primary_model),
+                )?;
+            }
+
+            for task in &plan.initial_tasks {
+                crate::commands::cmd_send(
+                    &ctx,
+                    "user",
+                    &task.agent,
+                    "question",
+                    "normal",
+                    &task.subject,
+                    &task.body,
+                    &None,
+                    &None,
+                    &[],
+                )?;
+            }
+
+            if let Some(pocket) = biplane::find_pocket_for_project(&root) {
+                let report_path = pocket.join("biplane-report.json");
+                let report = biplane::generate_biplane_report(&ctx, Some(&pocket))?;
+                std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
+                println!("[launch] Biplane report saved to {}", report_path.display());
+            }
+            println!();
+        } else {
+            println!("[launch] No agents registered. Use --with-biplane or add agents manually.");
+            println!(
+                "[launch] Run: trelane --project {} --models {} --max-agents {} --with-biplane",
+                root.display(),
+                primary_model,
+                max_agents
+            );
+            return Ok(());
+        }
+    } else {
+        println!(
+            "[launch] Found {} existing agent(s): {}",
+            existing_agents.len(),
+            existing_agents.join(", ")
+        );
+        println!();
+    }
+
+    println!("[launch] Starting interactive tmux session...");
+    println!("[launch] The pump will run inside tmux. Agents will launch in visible panes.");
+    println!();
+
+    launch_interactive_pump(&root, &primary_model)?;
+
+    Ok(())
+}
+
+fn launch_interactive_pump(root: &std::path::Path, _primary_model: &str) -> Result<()> {
+    let session_name = format!("trelane-{}", chrono::Utc::now().format("%Y%m%d%H%M%S"));
+    let exe = std::env::current_exe()?;
+    let pump_cmd = format!(
+        "TRELANE_PUMP_SESSION=1 {} --root {} pump --watch",
+        shell_quote(&exe.display().to_string()),
+        shell_quote(&root.display().to_string())
+    );
+
+    std::process::Command::new("tmux")
+        .args(["new-session", "-d", "-s", &session_name, &pump_cmd])
+        .status()?;
+
+    let ctx = Context::open(Some(root))?;
+    let agents = crate::store::list_agents(&ctx.conn)?;
+
+    crate::splash::set_session_status_bar(
+        &session_name,
+        &root.file_name().unwrap_or_default().to_string_lossy(),
+        true,
+    )
+    .ok();
+    std::fs::write(
+        format!("/tmp/trelane-{}-root", session_name),
+        root.display().to_string(),
+    )
+    .ok();
+
+    let controller_pane = {
+        let output = std::process::Command::new("tmux")
+            .args(["list-panes", "-t", &session_name, "-F", "#{pane_id}"])
+            .output()?;
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+
+    for agent in &agents {
+        let output = std::process::Command::new("tmux")
+            .args([
+                "split-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                &controller_pane,
+            ])
+            .output()?;
+        if !output.status.success() {
+            continue;
+        }
+        let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        std::process::Command::new("tmux")
+            .args(["select-pane", "-t", &pane_id, "-T", agent])
+            .status()?;
+
+        crate::splash::send_splash_to_pane(
+            &pane_id,
+            agent,
+            "interactive launch",
+            &root.display().to_string(),
+        )
+        .ok();
+
+        crate::commands::cmd_set_launch_target(&ctx, agent, "tmux", &pane_id, None, None)?;
+    }
+
+    std::process::Command::new("tmux")
+        .args(["select-layout", "-t", &session_name, "tiled"])
+        .status()?;
+
+    crate::splash::bind_diagnostic_toggle(&session_name).ok();
+
+    println!("[launch] tmux session created: {}", session_name);
+    println!(
+        "[launch] Attach with: tmux attach-session -t {}",
+        session_name
+    );
+    println!();
+
+    if std::io::stdout().is_terminal() {
+        std::process::Command::new("tmux")
+            .args(["attach-session", "-t", &session_name])
+            .status()?;
+    }
+
+    Ok(())
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
 pub fn handle(cli: Cli) -> Result<()> {
     if let Some(scenario) = cli.testing.as_deref() {
         return testing::run_testing(
@@ -103,6 +314,10 @@ pub fn handle(cli: Cli) -> Result<()> {
             cli.testing_sandbox_root.as_deref(),
             cli.testing_launcher.as_deref(),
         );
+    }
+
+    if cli.models.is_some() && cli.command.is_none() {
+        return cmd_launch(cli);
     }
 
     match cli.command {
