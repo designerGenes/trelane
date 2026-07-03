@@ -74,7 +74,8 @@ Dry-run the full lifecycle with zero tokens first:
     bash demo-rust.sh
 
 This exercises message flow, claim negotiation, and a manufactured total
-deadlock, all driven by `trelane stub` (a scripted no-AI agent). Set
+deadlock, domain shifting, and repeated pump-driven wakeups, all driven by
+`trelane stub` (a scripted no-AI agent). Set
 `TRELANE_DEMO_REPEAT=N` to run it repeatedly and `TRELANE_DEMO_REPORT=/path/report.jsonl`
 to capture a per-run report.
 
@@ -102,6 +103,7 @@ to capture a per-run report.
 | `trelane audit AGENT` | Check for out-of-domain file changes |
 | `trelane pump --once \| --watch [--interval SECS]` | The dumb pump |
 | `trelane stub AGENT` | Token-free scripted agent for demos |
+| `trelane --testing tests/full-usage-scenario.json [--testing-runs N]` | Run a full usage scenario harness and write a JSONL report |
 
 ## Launcher
 
@@ -195,6 +197,25 @@ For Ghostty on macOS, `--target frontmost` sends to the active window, and any
 other `--target` value is treated as a window-title substring. This still does
 not choose a specific split; it sends to the currently focused Ghostty split.
 
+## Testing Harness
+
+Full usage scenarios live under `tests/` as JSON files. A scenario describes:
+
+- the project files to create
+- the participating agents and their domains
+- the ordered coordination steps to run
+- the metrics to record per run
+
+Run one directly with:
+
+    trelane --testing /Users/jadennation/DEV/01_active_projects/trelane/tests/full-usage-scenario.json \
+      --testing-runs 3 \
+      --testing-report /tmp/trelane-scenario-report.jsonl \
+      --testing-sandbox-root /tmp/trelane-scenarios
+
+The runner emits regular debug output as each step executes and appends one
+JSON object per run to the report file.
+
 ## Message format
 
 Messages are stored as rows in SQLite, HMAC-SHA256 signed over the
@@ -249,7 +270,8 @@ protocol above is unchanged.
     cargo build          # compile
     cargo clippy -- -D warnings   # lint
     cargo test           # run unit tests
-    TRELANE_DEMO_REPEAT=3 bash demo-rust.sh    # repeatable end-to-end protocol demo (no tokens)
+    TRELANE_DEMO_REPEAT=3 bash demo-rust.sh    # repeatable full-usage scenario demo (no tokens)
+    trelane --testing /Users/jadennation/DEV/01_active_projects/trelane/tests/full-usage-scenario.json --testing-runs 3
 
 ## License
 

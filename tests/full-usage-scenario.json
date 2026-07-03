@@ -1,0 +1,126 @@
+{
+  "name": "full-usage-scenario",
+  "description": "Complex multi-agent scenario covering domain ownership, messaging, domain shifting, and repeated pump-driven wakeups.",
+  "launcher": "trelane --root {root} stub {agent}",
+  "project": {
+    "files": [
+      {
+        "path": "src/ui/app.ts",
+        "contents": "export const usersTable = [];\n"
+      },
+      {
+        "path": "src/api/routes.py",
+        "contents": "def users():\n    return []\n"
+      },
+      {
+        "path": "research/notes.md",
+        "contents": "# Notes\n\nPending schema alignment.\n"
+      }
+    ]
+  },
+  "agents": [
+    {
+      "name": "frontend",
+      "description": "Owns UI implementation",
+      "writable": ["src/ui/**"],
+      "launcher_agent": "stub-low-cost"
+    },
+    {
+      "name": "backend",
+      "description": "Owns API implementation",
+      "writable": ["src/api/**"],
+      "launcher_agent": "stub-low-cost"
+    },
+    {
+      "name": "research",
+      "description": "Owns research and notes",
+      "writable": ["research/**"],
+      "launcher_agent": "stub-low-cost"
+    }
+  ],
+  "steps": [
+    {
+      "type": "Send",
+      "from": "frontend",
+      "to": "backend",
+      "msg_type": "question",
+      "subject": "Need /users payload schema",
+      "body": "Provide the response shape so the UI table can be wired.",
+      "save_as": "schema-question"
+    },
+    {
+      "type": "Park",
+      "agent": "frontend",
+      "task": "task-ui-table",
+      "wait_reply_ref": "schema-question",
+      "waiting_on": "backend",
+      "resume_hint": "Resume wiring the UI table once backend answers."
+    },
+    {
+      "type": "Pump",
+      "ticks": 2
+    },
+    {
+      "type": "ClaimExpectDenied",
+      "agent": "backend",
+      "path": "src/ui/app.ts"
+    },
+    {
+      "type": "Send",
+      "from": "backend",
+      "to": "frontend",
+      "msg_type": "claim-request",
+      "subject": "Need UI file for API import update",
+      "body": "Please grant a temporary claim for src/ui/app.ts.",
+      "paths": ["src/ui/app.ts"],
+      "save_as": "ui-claim-request"
+    },
+    {
+      "type": "Park",
+      "agent": "backend",
+      "task": "task-fix-import",
+      "wait_reply_ref": "ui-claim-request",
+      "waiting_on": "frontend",
+      "resume_hint": "Use the grant to update the shared import."
+    },
+    {
+      "type": "Pump",
+      "ticks": 2
+    },
+    {
+      "type": "Redomain",
+      "agent": "research",
+      "writable": ["research/**", "src/ui/**"],
+      "desc": "Expands into UI copy review after cross-team agreement."
+    },
+    {
+      "type": "Send",
+      "from": "research",
+      "to": "frontend",
+      "msg_type": "info",
+      "subject": "Research expanding into UI copy review",
+      "body": "I have shifted domain to include src/ui/** for copy review and text updates."
+    },
+    {
+      "type": "Pump",
+      "ticks": 1
+    },
+    {
+      "type": "Pump",
+      "ticks": 1
+    },
+    {
+      "type": "AssertParkedCount",
+      "count": 0
+    },
+    {
+      "type": "AssertNoDeadlock"
+    }
+  ],
+  "metrics": [
+    "messages_sent",
+    "pumps",
+    "redomains",
+    "deadlocks_detected"
+  ]
+}

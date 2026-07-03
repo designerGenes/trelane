@@ -15,6 +15,37 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
+        help = "run a full usage scenario from a test file"
+    )]
+    pub testing: Option<PathBuf>,
+
+    #[arg(long = "testing-runs", global = true, help = "number of scenario runs")]
+    pub testing_runs: Option<u32>,
+
+    #[arg(
+        long = "testing-report",
+        global = true,
+        help = "path to JSONL report output"
+    )]
+    pub testing_report: Option<PathBuf>,
+
+    #[arg(
+        long = "testing-sandbox-root",
+        global = true,
+        help = "sandbox root for scenario runs"
+    )]
+    pub testing_sandbox_root: Option<PathBuf>,
+
+    #[arg(
+        long = "testing-launcher",
+        global = true,
+        help = "launcher template override for testing pumps"
+    )]
+    pub testing_launcher: Option<String>,
+
+    #[arg(
+        long,
+        global = true,
         help = "comma-separated agents/models to enable for this session"
     )]
     pub agents: Option<String>,

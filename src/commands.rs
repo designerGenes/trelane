@@ -8,7 +8,7 @@ use crate::store;
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 // ----------------------------------------------------------------- helpers
 
@@ -273,6 +273,10 @@ fn relaunch_command_for_agent(ctx: &Context, agent: &str) -> String {
 
 fn applescript_escape(input: &str) -> String {
     input.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn shell_double_quote(input: &str) -> String {
+    format!("\"{}\"", input.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn shell_single_quote(input: &str) -> String {
@@ -981,21 +985,26 @@ pub fn cmd_wake(
     std::fs::create_dir_all(&log_dir)?;
     let log_name = format!("run-{}.log", crypto::new_id("r"));
     let log_path = log_dir.join(&log_name);
-    let log_file = std::fs::File::create(&log_path)?;
-
-    use std::os::unix::process::CommandExt;
-    let mut command = std::process::Command::new("sh");
-    command
+    let launch_script = format!(
+        "({}) >> {} 2>&1 & printf '%s' $!",
+        cmd,
+        shell_double_quote(&log_path.display().to_string())
+    );
+    let output = Command::new("sh")
         .arg("-c")
-        .arg(&cmd)
+        .arg(&launch_script)
         .current_dir(&ctx.root)
-        .stdout(Stdio::from(log_file.try_clone()?))
-        .stderr(Stdio::from(log_file))
-        .process_group(0);
-
-    let child = command.spawn()?;
-    let pid = child.id() as i32;
-    std::mem::forget(child);
+        .output()?;
+    if !output.status.success() {
+        return Err(TrelaneError::msg(format!(
+            "launcher shell failed for {agent}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let pid_text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let pid = pid_text.parse::<i32>().map_err(|_| {
+        TrelaneError::msg(format!("failed to parse launched pid from '{pid_text}'"))
+    })?;
 
     let inserted = store::insert_running_lock(&ctx.conn, agent, pid, &crypto::now_iso(), reason)?;
     if !inserted {
@@ -1336,5 +1345,13 @@ mod tests {
         let wrapped = command_for_launch_target(&target);
         assert!(wrapped.contains("tmux send-keys -t 'trelane-alpha'"));
         assert!(wrapped.contains("trelane --root /tmp/demo inbox alpha --json"));
+    }
+
+    #[test]
+    fn shell_double_quote_escapes_quotes_and_backslashes() {
+        assert_eq!(
+            shell_double_quote("/tmp/a \"quoted\" path"),
+            "\"/tmp/a \\\"quoted\\\" path\""
+        );
     }
 }

@@ -8,6 +8,7 @@ pub mod models;
 pub mod prompt;
 pub mod pump;
 pub mod store;
+pub mod testing;
 
 use crate::cli::{Cli, Command};
 use crate::domain::find_root;
@@ -91,6 +92,16 @@ pub fn run() -> Result<()> {
 }
 
 pub fn handle(cli: Cli) -> Result<()> {
+    if let Some(scenario) = cli.testing.as_deref() {
+        return testing::run_testing(
+            scenario,
+            cli.testing_runs.unwrap_or(1),
+            cli.testing_report.as_deref(),
+            cli.testing_sandbox_root.as_deref(),
+            cli.testing_launcher.as_deref(),
+        );
+    }
+
     match cli.command {
         None => commands::cmd_attach_project(
             cli.project,
