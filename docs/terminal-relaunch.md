@@ -30,6 +30,10 @@ is Ghostty, iTerm2, WezTerm, kitty, or Terminal.app. Native terminal adapters
 remain useful, but they should be treated as fallback delivery mechanisms rather
 than the primary orchestration layer.
 
+Trelane now supports this directly for stored launch targets: a non-`tmux`
+adapter can carry a `tmux` relay target, and the adapter will inject a
+`tmux send-keys ... Enter` command into the visible host terminal.
+
 ## macOS Terminal.app
 
 Apple documents Terminal as AppleScript-scriptable and runnable via `osascript`.
@@ -48,6 +52,7 @@ Limitations:
 - macOS Automation permissions are required.
 - It is better for opening a new command in a tab than for safely typing into an arbitrary running TUI.
 - If the visible terminal contains multiple tabs, panes, or splits, `tmux` inside the terminal is still the recommended targeting layer.
+- A practical pattern is `--adapter terminal.app --target <window/tab selector> --tmux-target <tmux session>`.
 
 ## iTerm2
 
@@ -76,6 +81,7 @@ Limitations:
 - Requires Automation permissions.
 - Correct target selection should use a recorded session id, not only window title.
 - Even with better session objects, tmux inside iTerm2 is still the more deterministic way to target the correct running agent surface.
+- A practical pattern is `--adapter iterm2 --target <session/window selector> --tmux-target <tmux session>`.
 
 ## kitty
 
@@ -92,6 +98,7 @@ Limitations:
 - Remote control must be enabled/configured.
 - The safest selector is a title or window id recorded during attach.
 - If the agent is already hosted inside tmux within kitty, target tmux directly instead of the kitty window.
+- If you still want kitty to be the visible entrypoint, pair the kitty adapter with `--tmux-target`.
 
 ## WezTerm
 
@@ -108,6 +115,7 @@ Limitations:
 - Requires discovering and storing the pane id.
 - The CLI is best when paired with WezTerm's mux metadata.
 - If WezTerm is only hosting a tmux session, Trelane should still prefer the tmux adapter over the WezTerm adapter.
+- If WezTerm is the visible host but tmux owns the real agent surface, configure `--tmux-target`.
 
 ## Ghostty
 
@@ -135,7 +143,7 @@ Notes:
 
 - Ghostty windows can contain multiple splits.
 - The current Ghostty fallback only types into the currently focused split.
-- It does not have a split-specific selector in Trelane today.
+- Without `--tmux-target`, it does not have a split-specific selector in Trelane today.
 
 Limitations:
 
@@ -143,6 +151,7 @@ Limitations:
 - Window targeting is less precise than pane-aware terminals like tmux or WezTerm.
 - Safe automation depends on consistent window naming.
 - For split-heavy Ghostty layouts, tmux inside Ghostty is strongly preferred.
+- Pairing the Ghostty adapter with `--tmux-target` is the intended way to make split-heavy layouts reliable.
 
 ## tmux
 
@@ -166,6 +175,9 @@ Recommended order of operations:
 1. `tmux` inside any supported terminal app.
 2. Terminal-native pane/session targeting where a terminal offers a reliable API.
 3. GUI scripting fallback for terminals that do not expose deterministic remote control.
+
+In practice, step 1 can now be configured either by using the `tmux` adapter
+directly or by attaching a `--tmux-target` relay to another adapter.
 
 Adapter quality, as currently understood:
 

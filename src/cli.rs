@@ -162,6 +162,8 @@ pub enum Command {
         target: String,
         #[arg(long = "command")]
         command: Option<String>,
+        #[arg(long = "tmux-target")]
+        tmux_target: Option<String>,
     },
 
     /// Inject a wake command into an attached terminal session

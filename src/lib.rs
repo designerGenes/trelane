@@ -206,9 +206,17 @@ pub fn handle(cli: Cli) -> Result<()> {
             adapter,
             target,
             command,
+            tmux_target,
         }) => {
             let ctx = Context::open(cli.root.as_deref())?;
-            commands::cmd_set_launch_target(&ctx, &agent, &adapter, &target, command.as_deref())
+            commands::cmd_set_launch_target(
+                &ctx,
+                &agent,
+                &adapter,
+                &target,
+                command.as_deref(),
+                tmux_target.as_deref(),
+            )
         }
         Some(Command::Relaunch {
             agent,

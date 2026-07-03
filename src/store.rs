@@ -490,17 +490,19 @@ pub fn upsert_launch_target(
     adapter: &str,
     target: &str,
     command: &str,
+    tmux_target: Option<&str>,
     updated_at: &str,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO launch_targets (agent, adapter, target, command, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO launch_targets (agent, adapter, target, command, tmux_target, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(agent) DO UPDATE SET
             adapter = excluded.adapter,
             target = excluded.target,
             command = excluded.command,
+            tmux_target = excluded.tmux_target,
             updated_at = excluded.updated_at",
-        params![agent, adapter, target, command, updated_at],
+        params![agent, adapter, target, command, tmux_target, updated_at],
     )?;
     Ok(())
 }
@@ -508,7 +510,7 @@ pub fn upsert_launch_target(
 pub fn get_launch_target(conn: &Connection, agent: &str) -> Result<Option<LaunchTarget>> {
     let result = conn
         .query_row(
-            "SELECT agent, adapter, target, command, updated_at FROM launch_targets WHERE agent = ?1",
+            "SELECT agent, adapter, target, command, tmux_target, updated_at FROM launch_targets WHERE agent = ?1",
             params![agent],
             |row| {
                 Ok(LaunchTarget {
@@ -516,7 +518,8 @@ pub fn get_launch_target(conn: &Connection, agent: &str) -> Result<Option<Launch
                     adapter: row.get(1)?,
                     target: row.get(2)?,
                     command: row.get(3)?,
-                    updated_at: row.get(4)?,
+                    tmux_target: row.get(4)?,
+                    updated_at: row.get(5)?,
                 })
             },
         )
@@ -526,7 +529,7 @@ pub fn get_launch_target(conn: &Connection, agent: &str) -> Result<Option<Launch
 
 pub fn list_launch_targets(conn: &Connection) -> Result<Vec<LaunchTarget>> {
     let mut stmt = conn.prepare(
-        "SELECT agent, adapter, target, command, updated_at FROM launch_targets ORDER BY agent",
+        "SELECT agent, adapter, target, command, tmux_target, updated_at FROM launch_targets ORDER BY agent",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(LaunchTarget {
@@ -534,7 +537,8 @@ pub fn list_launch_targets(conn: &Connection) -> Result<Vec<LaunchTarget>> {
             adapter: row.get(1)?,
             target: row.get(2)?,
             command: row.get(3)?,
-            updated_at: row.get(4)?,
+            tmux_target: row.get(4)?,
+            updated_at: row.get(5)?,
         })
     })?;
     let mut out = Vec::new();

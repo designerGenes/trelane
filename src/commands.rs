@@ -275,6 +275,21 @@ fn applescript_escape(input: &str) -> String {
     input.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+fn shell_single_quote(input: &str) -> String {
+    format!("'{}'", input.replace('\'', "'\"'\"'"))
+}
+
+fn command_for_launch_target(target: &LaunchTarget) -> String {
+    match target.tmux_target.as_deref() {
+        Some(tmux_target) if target.adapter != "tmux" => format!(
+            "tmux send-keys -t {} {} Enter",
+            shell_single_quote(tmux_target),
+            shell_single_quote(&target.command)
+        ),
+        _ => target.command.clone(),
+    }
+}
+
 fn launch_via_adapter(adapter: &str, target: &str, command: &str) -> Result<()> {
     let status = match adapter {
         "tmux" => Command::new("tmux")
@@ -858,8 +873,12 @@ pub fn cmd_status(ctx: &Context) -> Result<()> {
         println!("launch targets:");
         for target in &launch_targets {
             println!(
-                "  {:<16} adapter={} target={} command={}",
-                target.agent, target.adapter, target.target, target.command
+                "  {:<16} adapter={} target={} tmux_target={} command={}",
+                target.agent,
+                target.adapter,
+                target.target,
+                target.tmux_target.as_deref().unwrap_or("(none)"),
+                target.command
             );
         }
     }
@@ -938,7 +957,8 @@ pub fn cmd_wake(
     if launcher_override.is_none()
         && let Some(target) = store::get_launch_target(&ctx.conn, agent)?
     {
-        launch_via_adapter(&target.adapter, &target.target, &target.command)?;
+        let command = command_for_launch_target(&target);
+        launch_via_adapter(&target.adapter, &target.target, &command)?;
         let inserted =
             store::insert_running_lock(&ctx.conn, agent, -1, &crypto::now_iso(), reason)?;
         if !inserted {
@@ -991,6 +1011,7 @@ pub fn cmd_set_launch_target(
     adapter: &str,
     target: &str,
     command: Option<&str>,
+    tmux_target: Option<&str>,
 ) -> Result<()> {
     if !store::agent_exists(&ctx.conn, agent)? {
         return Err(TrelaneError::msg(format!("unknown agent '{agent}'")));
@@ -1009,9 +1030,13 @@ pub fn cmd_set_launch_target(
         adapter,
         target,
         &command,
+        tmux_target,
         &crypto::now_iso(),
     )?;
-    println!("stored launch target for {agent}: {adapter} {target}");
+    println!(
+        "stored launch target for {agent}: {adapter} {target} tmux_target={}",
+        tmux_target.unwrap_or("(none)")
+    );
     Ok(())
 }
 
@@ -1045,6 +1070,16 @@ pub fn cmd_relaunch(
         .or_else(|| stored.as_ref().map(|t| t.command.clone()))
         .unwrap_or_else(|| relaunch_command_for_agent(ctx, agent));
 
+    let launch_target = LaunchTarget {
+        agent: agent.to_string(),
+        adapter: adapter.clone(),
+        target: target.clone(),
+        command,
+        tmux_target: stored.as_ref().and_then(|t| t.tmux_target.clone()),
+        updated_at: String::new(),
+    };
+
+    let command = command_for_launch_target(&launch_target);
     launch_via_adapter(&adapter, &target, &command)?;
     println!("relaunched {agent} via {adapter} target={target}");
     Ok(())
@@ -1285,5 +1320,21 @@ mod tests {
         let config = Config::default();
         let ctx = Context { root, conn, config };
         assert!(relaunch_command_for_agent(&ctx, "alpha").contains("inbox alpha --json"));
+    }
+
+    #[test]
+    fn command_for_launch_target_wraps_through_tmux_overlay() {
+        let target = LaunchTarget {
+            agent: "alpha".to_string(),
+            adapter: "ghostty".to_string(),
+            target: "frontmost".to_string(),
+            command: "trelane --root /tmp/demo inbox alpha --json".to_string(),
+            tmux_target: Some("trelane-alpha".to_string()),
+            updated_at: String::new(),
+        };
+
+        let wrapped = command_for_launch_target(&target);
+        assert!(wrapped.contains("tmux send-keys -t 'trelane-alpha'"));
+        assert!(wrapped.contains("trelane --root /tmp/demo inbox alpha --json"));
     }
 }

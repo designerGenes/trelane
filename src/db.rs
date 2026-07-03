@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS launch_targets (
     adapter         TEXT NOT NULL,
     target          TEXT NOT NULL,
     command         TEXT NOT NULL,
+    tmux_target     TEXT,
     updated_at      TEXT NOT NULL
 );
 "#;
@@ -111,6 +112,10 @@ CREATE TABLE IF NOT EXISTS launch_targets (
 );
 
 ALTER TABLE agents ADD COLUMN launcher_agent TEXT;
+"#;
+
+const SCHEMA_V4: &str = r#"
+ALTER TABLE launch_targets ADD COLUMN tmux_target TEXT;
 "#;
 
 pub fn open(db_path: &std::path::Path) -> Result<Connection> {
@@ -154,6 +159,15 @@ fn migrate(conn: &Connection) -> Result<()> {
             Err(e) => return Err(e.into()),
         }
         conn.execute_batch("PRAGMA user_version = 3;")?;
+    }
+    if version < 4 {
+        match conn.execute_batch(SCHEMA_V4) {
+            Ok(()) => {}
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.extended_code == rusqlite::ffi::SQLITE_ERROR => {}
+            Err(e) => return Err(e.into()),
+        }
+        conn.execute_batch("PRAGMA user_version = 4;")?;
     }
     Ok(())
 }

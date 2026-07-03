@@ -166,6 +166,11 @@ targets:
     trelane set-launch-target alpha --adapter tmux --target trelane:alpha
     trelane relaunch alpha
 
+Or, when the visible host is a terminal app but the real agent lives inside
+tmux within that app:
+
+    trelane set-launch-target alpha --adapter ghostty --target frontmost --tmux-target trelane-alpha
+
 `trelane pump` will prefer a stored launch target over the headless launcher.
 Supported adapters are `tmux`, `ghostty`, `iterm2`, `wezterm`, `kitty`, and `terminal.app`.
 The recommended approach for every supported terminal app is to run the agent
@@ -181,6 +186,10 @@ Examples:
 Native terminal adapters should be treated as best-effort fallbacks when tmux
 is not available. They are useful for convenience, but they are less precise
 than targeting tmux directly.
+
+When `--tmux-target` is set on a non-`tmux` adapter, Trelane now injects a real
+`tmux send-keys ... Enter` relay into the host terminal instead of typing the
+raw `trelane inbox ...` command directly.
 
 For Ghostty on macOS, `--target frontmost` sends to the active window, and any
 other `--target` value is treated as a window-title substring. This still does

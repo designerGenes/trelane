@@ -85,6 +85,7 @@ pub struct LaunchTarget {
     pub adapter: String,
     pub target: String,
     pub command: String,
+    pub tmux_target: Option<String>,
     pub updated_at: String,
 }
 
