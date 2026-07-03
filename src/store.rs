@@ -1,5 +1,5 @@
 use crate::error::{Result, TrelaneError};
-use crate::models::{Domain, Lease, Message, ParkedTask, RunningLock, Violation};
+use crate::models::{Domain, LaunchTarget, Lease, Message, ParkedTask, RunningLock, Violation};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
 
@@ -10,16 +10,18 @@ pub fn insert_agent(
     name: &str,
     description: &str,
     writable: &[String],
+    launcher_agent: Option<&str>,
     forbidden: &[String],
     created_at: &str,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO agents (id, description, writable_json, forbidden_json, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO agents (id, description, writable_json, launcher_agent, forbidden_json, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             name,
             description,
             serde_json::to_string(writable)?,
+            launcher_agent,
             serde_json::to_string(forbidden)?,
             created_at,
         ],
@@ -49,23 +51,53 @@ pub fn agent_exists(conn: &Connection, name: &str) -> Result<bool> {
 pub fn get_domain(conn: &Connection, agent: &str) -> Result<Option<Domain>> {
     let result = conn
         .query_row(
-            "SELECT id, description, writable_json, forbidden_json FROM agents WHERE id = ?1",
+            "SELECT id, description, writable_json, launcher_agent, forbidden_json FROM agents WHERE id = ?1",
             params![agent],
             |r| {
                 let writable: Vec<String> =
                     serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default();
                 let forbidden: Vec<String> =
-                    serde_json::from_str(&r.get::<_, String>(3)?).unwrap_or_default();
+                    serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default();
                 Ok(Domain {
                     agent: r.get(0)?,
                     description: r.get(1)?,
                     writable,
+                    launcher_agent: r.get(3)?,
                     forbidden_write: forbidden,
                 })
             },
         )
         .optional()?;
     Ok(result)
+}
+
+pub fn upsert_agent(
+    conn: &Connection,
+    name: &str,
+    description: &str,
+    writable: &[String],
+    launcher_agent: Option<&str>,
+    forbidden: &[String],
+    created_at: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO agents (id, description, writable_json, launcher_agent, forbidden_json, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(id) DO UPDATE SET
+            description = excluded.description,
+            writable_json = excluded.writable_json,
+            launcher_agent = excluded.launcher_agent,
+            forbidden_json = excluded.forbidden_json",
+        params![
+            name,
+            description,
+            serde_json::to_string(writable)?,
+            launcher_agent,
+            serde_json::to_string(forbidden)?,
+            created_at,
+        ],
+    )?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------- messages
@@ -431,6 +463,79 @@ pub fn list_session_agents(conn: &Connection) -> Result<Vec<(String, bool, Strin
             row.get::<_, i32>(1)? != 0,
             row.get::<_, String>(2)?,
         ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn session_agent_enabled(conn: &Connection, name: &str) -> Result<Option<bool>> {
+    let result = conn
+        .query_row(
+            "SELECT enabled FROM session_agents WHERE name = ?1",
+            params![name],
+            |row| Ok(row.get::<_, i32>(0)? != 0),
+        )
+        .optional()?;
+    Ok(result)
+}
+
+// ------------------------------------------------------------ launch targets
+
+pub fn upsert_launch_target(
+    conn: &Connection,
+    agent: &str,
+    adapter: &str,
+    target: &str,
+    command: &str,
+    updated_at: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO launch_targets (agent, adapter, target, command, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(agent) DO UPDATE SET
+            adapter = excluded.adapter,
+            target = excluded.target,
+            command = excluded.command,
+            updated_at = excluded.updated_at",
+        params![agent, adapter, target, command, updated_at],
+    )?;
+    Ok(())
+}
+
+pub fn get_launch_target(conn: &Connection, agent: &str) -> Result<Option<LaunchTarget>> {
+    let result = conn
+        .query_row(
+            "SELECT agent, adapter, target, command, updated_at FROM launch_targets WHERE agent = ?1",
+            params![agent],
+            |row| {
+                Ok(LaunchTarget {
+                    agent: row.get(0)?,
+                    adapter: row.get(1)?,
+                    target: row.get(2)?,
+                    command: row.get(3)?,
+                    updated_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(result)
+}
+
+pub fn list_launch_targets(conn: &Connection) -> Result<Vec<LaunchTarget>> {
+    let mut stmt = conn.prepare(
+        "SELECT agent, adapter, target, command, updated_at FROM launch_targets ORDER BY agent",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(LaunchTarget {
+            agent: row.get(0)?,
+            adapter: row.get(1)?,
+            target: row.get(2)?,
+            command: row.get(3)?,
+            updated_at: row.get(4)?,
+        })
     })?;
     let mut out = Vec::new();
     for row in rows {

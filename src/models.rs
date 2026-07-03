@@ -73,8 +73,19 @@ pub struct Domain {
     #[serde(default)]
     pub description: String,
     pub writable: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launcher_agent: Option<String>,
     #[serde(default)]
     pub forbidden_write: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LaunchTarget {
+    pub agent: String,
+    pub adapter: String,
+    pub target: String,
+    pub command: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

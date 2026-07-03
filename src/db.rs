@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS agents (
     id              TEXT PRIMARY KEY,
     description     TEXT NOT NULL DEFAULT '',
     writable_json   TEXT NOT NULL DEFAULT '[]',
+    launcher_agent  TEXT,
     forbidden_json  TEXT NOT NULL DEFAULT '[]',
     created_at      TEXT NOT NULL
 );
@@ -81,6 +82,14 @@ CREATE TABLE IF NOT EXISTS session_agents (
     source          TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS launch_targets (
+    agent           TEXT PRIMARY KEY,
+    adapter         TEXT NOT NULL,
+    target          TEXT NOT NULL,
+    command         TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
 "#;
 
 const SCHEMA_V2: &str = r#"
@@ -90,6 +99,18 @@ CREATE TABLE IF NOT EXISTS session_agents (
     source          TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
+"#;
+
+const SCHEMA_V3: &str = r#"
+CREATE TABLE IF NOT EXISTS launch_targets (
+    agent           TEXT PRIMARY KEY,
+    adapter         TEXT NOT NULL,
+    target          TEXT NOT NULL,
+    command         TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+ALTER TABLE agents ADD COLUMN launcher_agent TEXT;
 "#;
 
 pub fn open(db_path: &std::path::Path) -> Result<Connection> {
@@ -109,10 +130,30 @@ fn migrate(conn: &Connection) -> Result<()> {
         .unwrap_or(0);
     if version < 1 {
         conn.execute_batch(SCHEMA_V1)?;
-        conn.execute_batch("PRAGMA user_version = 2;")?;
+        conn.execute_batch("PRAGMA user_version = 3;")?;
     } else if version < 2 {
         conn.execute_batch(SCHEMA_V2)?;
         conn.execute_batch("PRAGMA user_version = 2;")?;
+    }
+    if version < 3 {
+        match conn.execute_batch(SCHEMA_V3) {
+            Ok(()) => {}
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.extended_code == rusqlite::ffi::SQLITE_ERROR =>
+            {
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS launch_targets (
+                        agent TEXT PRIMARY KEY,
+                        adapter TEXT NOT NULL,
+                        target TEXT NOT NULL,
+                        command TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );",
+                )?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+        conn.execute_batch("PRAGMA user_version = 3;")?;
     }
     Ok(())
 }

@@ -39,6 +39,7 @@ pub fn default_domain(agent: &str) -> Domain {
         agent: agent.to_string(),
         description: String::new(),
         writable: vec![],
+        launcher_agent: None,
         forbidden_write: vec![format!("{TRELANE_DIR}/**"), ".git/**".to_string()],
     }
 }
@@ -102,6 +103,7 @@ mod tests {
             agent: "test".to_string(),
             description: String::new(),
             writable: writable.iter().map(|s| s.to_string()).collect(),
+            launcher_agent: None,
             forbidden_write: forbidden.iter().map(|s| s.to_string()).collect(),
         }
     }

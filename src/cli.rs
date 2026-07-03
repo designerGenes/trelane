@@ -58,6 +58,17 @@ pub enum Command {
         writable: Vec<String>,
         #[arg(long = "desc")]
         desc: Option<String>,
+        #[arg(long = "launcher-agent")]
+        launcher_agent: Option<String>,
+    },
+
+    /// Update an agent's domain and notify peers
+    Redomain {
+        agent: String,
+        #[arg(long = "writable")]
+        writable: Vec<String>,
+        #[arg(long = "desc")]
+        desc: Option<String>,
     },
 
     /// Send a signed message to another agent's inbox
@@ -140,6 +151,28 @@ pub enum Command {
         why: Option<String>,
         #[arg(long = "launcher")]
         launcher: Option<String>,
+    },
+
+    /// Store a terminal relaunch target for an agent
+    SetLaunchTarget {
+        agent: String,
+        #[arg(long = "adapter")]
+        adapter: String,
+        #[arg(long = "target")]
+        target: String,
+        #[arg(long = "command")]
+        command: Option<String>,
+    },
+
+    /// Inject a wake command into an attached terminal session
+    Relaunch {
+        agent: String,
+        #[arg(long = "adapter")]
+        adapter: Option<String>,
+        #[arg(long = "target")]
+        target: Option<String>,
+        #[arg(long = "command")]
+        command: Option<String>,
     },
 
     /// Mark an agent as done (release running lock)

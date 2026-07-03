@@ -8,7 +8,7 @@ use crate::store;
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
 
 // ----------------------------------------------------------------- helpers
 
@@ -16,6 +16,9 @@ pub fn is_running(conn: &Connection, agent: &str) -> Result<bool> {
     match store::get_running_lock(conn, agent)? {
         None => Ok(false),
         Some(lock) => {
+            if lock.pid <= 0 {
+                return Ok(true);
+            }
             let alive = unsafe { libc::kill(lock.pid, 0) == 0 };
             if !alive {
                 store::delete_running_lock(conn, agent)?;
@@ -247,6 +250,67 @@ fn list_or_none(items: &[String]) -> String {
     }
 }
 
+fn is_agent_enabled(ctx: &Context, agent: &str) -> Result<bool> {
+    Ok(store::session_agent_enabled(&ctx.conn, agent)?.unwrap_or(true))
+}
+
+fn domain_launch_enabled(ctx: &Context, domain_agent: &str) -> Result<bool> {
+    let domain = store::get_domain(&ctx.conn, domain_agent)?
+        .ok_or_else(|| TrelaneError::msg(format!("unknown agent '{domain_agent}'")))?;
+    match domain.launcher_agent.as_deref() {
+        Some(session_agent) => is_agent_enabled(ctx, session_agent),
+        None => Ok(true),
+    }
+}
+
+fn relaunch_command_for_agent(ctx: &Context, agent: &str) -> String {
+    format!(
+        "trelane --root {} inbox {} --json",
+        ctx.root.display(),
+        agent
+    )
+}
+
+fn launch_via_adapter(adapter: &str, target: &str, command: &str) -> Result<()> {
+    let status = match adapter {
+        "tmux" => Command::new("tmux")
+            .args(["send-keys", "-t", target, command, "Enter"])
+            .status()?,
+        "kitty" => Command::new("kitty")
+            .args(["@", "send-text", "--match", target, &format!("{command}\n")])
+            .status()?,
+        "wezterm" => Command::new("wezterm")
+            .args(["cli", "send-text", "--pane-id", target, command])
+            .status()?,
+        "iterm2" => Command::new("osascript")
+            .args([
+                "-e",
+                &format!(
+                    "tell application \"iTerm2\" to tell current session of current window to write text \"{}\"",
+                    command.replace('\\', "\\\\").replace('"', "\\\"")
+                ),
+            ])
+            .status()?,
+        "terminal.app" => Command::new("osascript")
+            .args([
+                "-e",
+                &format!(
+                    "tell application \"Terminal\" to do script \"{}\" in selected tab of front window",
+                    command.replace('\\', "\\\\").replace('"', "\\\"")
+                ),
+            ])
+            .status()?,
+        other => return Err(TrelaneError::msg(format!("unsupported adapter '{other}'"))),
+    };
+
+    if !status.success() {
+        return Err(TrelaneError::msg(format!(
+            "adapter '{adapter}' failed for target '{target}'"
+        )));
+    }
+    Ok(())
+}
+
 fn inject_agents_md(root: &Path, enabled: &[String], disabled: &[String]) -> Result<()> {
     let path = root.join("AGENTS.md");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
@@ -300,6 +364,7 @@ pub fn cmd_add_agent(
     name: &str,
     writable: &[String],
     desc: Option<&str>,
+    launcher_agent: Option<&str>,
 ) -> Result<()> {
     if !is_valid_agent_name(name) {
         return Err(TrelaneError::msg(
@@ -308,6 +373,13 @@ pub fn cmd_add_agent(
     }
     if store::agent_exists(&ctx.conn, name)? {
         return Err(TrelaneError::msg(format!("agent '{name}' already exists")));
+    }
+    if let Some(session_agent) = launcher_agent
+        && !is_agent_enabled(ctx, session_agent)?
+    {
+        return Err(TrelaneError::msg(format!(
+            "session agent/model '{session_agent}' is disabled for this session"
+        )));
     }
 
     let forbidden = vec![format!("{TRELANE_DIR}/**"), ".git/**".to_string()];
@@ -319,11 +391,71 @@ pub fn cmd_add_agent(
         name,
         desc.unwrap_or(""),
         writable,
+        launcher_agent,
         &forbidden,
         &crypto::now_iso(),
     )?;
 
+    if let Some(session_agent) = launcher_agent {
+        let now = crypto::now_iso();
+        store::upsert_session_agent(&ctx.conn, session_agent, true, "add-agent", &now)?;
+    }
+
     println!("added agent '{name}' writable={writable:?}");
+    Ok(())
+}
+
+pub fn cmd_redomain(
+    ctx: &Context,
+    agent: &str,
+    writable: &[String],
+    desc: Option<&str>,
+) -> Result<()> {
+    if !store::agent_exists(&ctx.conn, agent)? {
+        return Err(TrelaneError::msg(format!("unknown agent '{agent}'")));
+    }
+
+    let existing = store::get_domain(&ctx.conn, agent)?
+        .ok_or_else(|| TrelaneError::msg(format!("unknown agent '{agent}'")))?;
+
+    let forbidden = vec![format!("{TRELANE_DIR}/**"), ".git/**".to_string()];
+    let now = crypto::now_iso();
+    store::upsert_agent(
+        &ctx.conn,
+        agent,
+        desc.unwrap_or(&existing.description),
+        writable,
+        existing.launcher_agent.as_deref(),
+        &forbidden,
+        &now,
+    )?;
+
+    for other in store::list_agents(&ctx.conn)? {
+        if other == agent {
+            continue;
+        }
+        let mut msg = Message::new(
+            crypto::new_id("msg"),
+            agent.to_string(),
+            other,
+            "info".to_string(),
+            "normal".to_string(),
+            format!("domain updated: {agent}"),
+            format!(
+                "Agent '{agent}' updated its writable globs to: {}",
+                writable.join(", ")
+            ),
+            None,
+            None,
+            vec![],
+            crypto::now_iso(),
+        );
+        let secret = ctx.secret()?;
+        crypto::sign(&secret, &mut msg);
+        store::insert_message(&ctx.conn, &msg)?;
+    }
+
+    println!("updated domain for '{agent}' writable={writable:?}");
     Ok(())
 }
 
@@ -666,6 +798,15 @@ pub fn cmd_status(ctx: &Context) -> Result<()> {
             "stopped"
         };
         println!("  {ag:<16} {run:<8} inbox={n}");
+        if let Some(dom) = store::get_domain(&ctx.conn, ag)? {
+            println!("    writable   : {}", list_or_none(&dom.writable));
+            println!(
+                "    launcher   : {}",
+                dom.launcher_agent
+                    .unwrap_or_else(|| "(default)".to_string())
+            );
+            println!("    forbidden  : {}", list_or_none(&dom.forbidden_write));
+        }
     }
 
     let session_agents = store::list_session_agents(&ctx.conn)?;
@@ -674,6 +815,17 @@ pub fn cmd_status(ctx: &Context) -> Result<()> {
         for (name, enabled, source) in &session_agents {
             let state = if *enabled { "enabled" } else { "disabled" };
             println!("  {name:<24} {state:<8} source={source}");
+        }
+    }
+
+    let launch_targets = store::list_launch_targets(&ctx.conn)?;
+    if !launch_targets.is_empty() {
+        println!("launch targets:");
+        for target in &launch_targets {
+            println!(
+                "  {:<16} adapter={} target={} command={}",
+                target.agent, target.adapter, target.target, target.command
+            );
         }
     }
 
@@ -731,6 +883,11 @@ pub fn cmd_wake(
     if !store::agent_exists(&ctx.conn, agent)? {
         return Err(TrelaneError::msg(format!("unknown agent '{agent}'")));
     }
+    if !domain_launch_enabled(ctx, agent)? {
+        return Err(TrelaneError::msg(format!(
+            "agent '{agent}' is mapped to a disabled session agent/model"
+        )));
+    }
     if is_running(&ctx.conn, agent)? {
         return Err(TrelaneError::msg(format!("{agent} is already running")));
     }
@@ -741,6 +898,22 @@ pub fn cmd_wake(
 
     if let Some(dirty) = git_dirty(&ctx.root) {
         store::save_audit_baseline(&ctx.conn, agent, &dirty)?;
+    }
+
+    if launcher_override.is_none()
+        && let Some(target) = store::get_launch_target(&ctx.conn, agent)?
+    {
+        launch_via_adapter(&target.adapter, &target.target, &target.command)?;
+        let inserted =
+            store::insert_running_lock(&ctx.conn, agent, -1, &crypto::now_iso(), reason)?;
+        if !inserted {
+            eprintln!("warning: {agent} was already launched by another pump");
+        }
+        println!(
+            "relaunched {agent} via {} target={} reason={reason}",
+            target.adapter, target.target
+        );
+        return Ok(());
     }
 
     let template = launcher_override.unwrap_or(&ctx.config.launcher.template);
@@ -774,6 +947,71 @@ pub fn cmd_wake(
         eprintln!("warning: {agent} was already launched by another pump");
     }
     println!("launched {agent} pid={pid} reason={reason}");
+    Ok(())
+}
+
+pub fn cmd_set_launch_target(
+    ctx: &Context,
+    agent: &str,
+    adapter: &str,
+    target: &str,
+    command: Option<&str>,
+) -> Result<()> {
+    if !store::agent_exists(&ctx.conn, agent)? {
+        return Err(TrelaneError::msg(format!("unknown agent '{agent}'")));
+    }
+    if !domain_launch_enabled(ctx, agent)? {
+        return Err(TrelaneError::msg(format!(
+            "agent '{agent}' is mapped to a disabled session agent/model"
+        )));
+    }
+    let command = command
+        .map(str::to_string)
+        .unwrap_or_else(|| relaunch_command_for_agent(ctx, agent));
+    store::upsert_launch_target(
+        &ctx.conn,
+        agent,
+        adapter,
+        target,
+        &command,
+        &crypto::now_iso(),
+    )?;
+    println!("stored launch target for {agent}: {adapter} {target}");
+    Ok(())
+}
+
+pub fn cmd_relaunch(
+    ctx: &Context,
+    agent: &str,
+    adapter: Option<&str>,
+    target: Option<&str>,
+    command: Option<&str>,
+) -> Result<()> {
+    if !store::agent_exists(&ctx.conn, agent)? {
+        return Err(TrelaneError::msg(format!("unknown agent '{agent}'")));
+    }
+    if !domain_launch_enabled(ctx, agent)? {
+        return Err(TrelaneError::msg(format!(
+            "agent '{agent}' is mapped to a disabled session agent/model"
+        )));
+    }
+
+    let stored = store::get_launch_target(&ctx.conn, agent)?;
+    let adapter = adapter
+        .map(str::to_string)
+        .or_else(|| stored.as_ref().map(|t| t.adapter.clone()))
+        .ok_or_else(|| TrelaneError::msg("missing --adapter and no stored launch target"))?;
+    let target = target
+        .map(str::to_string)
+        .or_else(|| stored.as_ref().map(|t| t.target.clone()))
+        .ok_or_else(|| TrelaneError::msg("missing --target and no stored launch target"))?;
+    let command = command
+        .map(str::to_string)
+        .or_else(|| stored.as_ref().map(|t| t.command.clone()))
+        .unwrap_or_else(|| relaunch_command_for_agent(ctx, agent));
+
+    launch_via_adapter(&adapter, &target, &command)?;
+    println!("relaunched {agent} via {adapter} target={target}");
     Ok(())
 }
 
@@ -1002,5 +1240,15 @@ mod tests {
         config.agents.disabled = vec!["blocked".to_string()];
         let selected = selected_agents(&config, Some("gpt-4, gpt-4-32k, blocked"), Some("claude"));
         assert_eq!(selected, vec!["gpt-4", "gpt-4-32k"]);
+    }
+
+    #[test]
+    fn relaunch_command_uses_project_root_and_agent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let conn = Connection::open_in_memory().unwrap();
+        let config = Config::default();
+        let ctx = Context { root, conn, config };
+        assert!(relaunch_command_for_agent(&ctx, "alpha").contains("inbox alpha --json"));
     }
 }

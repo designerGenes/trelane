@@ -109,9 +109,24 @@ pub fn handle(cli: Cli) -> Result<()> {
             name,
             writable,
             desc,
+            launcher_agent,
         }) => {
             let ctx = Context::open(cli.root.as_deref())?;
-            commands::cmd_add_agent(&ctx, &name, &writable, desc.as_deref())
+            commands::cmd_add_agent(
+                &ctx,
+                &name,
+                &writable,
+                desc.as_deref(),
+                launcher_agent.as_deref(),
+            )
+        }
+        Some(Command::Redomain {
+            agent,
+            writable,
+            desc,
+        }) => {
+            let ctx = Context::open(cli.root.as_deref())?;
+            commands::cmd_redomain(&ctx, &agent, &writable, desc.as_deref())
         }
         Some(Command::Send {
             from,
@@ -185,6 +200,30 @@ pub fn handle(cli: Cli) -> Result<()> {
         }) => {
             let ctx = Context::open(cli.root.as_deref())?;
             commands::cmd_wake(&ctx, &agent, why.as_deref(), launcher.as_deref())
+        }
+        Some(Command::SetLaunchTarget {
+            agent,
+            adapter,
+            target,
+            command,
+        }) => {
+            let ctx = Context::open(cli.root.as_deref())?;
+            commands::cmd_set_launch_target(&ctx, &agent, &adapter, &target, command.as_deref())
+        }
+        Some(Command::Relaunch {
+            agent,
+            adapter,
+            target,
+            command,
+        }) => {
+            let ctx = Context::open(cli.root.as_deref())?;
+            commands::cmd_relaunch(
+                &ctx,
+                &agent,
+                adapter.as_deref(),
+                target.as_deref(),
+                command.as_deref(),
+            )
         }
         Some(Command::Done { agent }) => {
             let ctx = Context::open(cli.root.as_deref())?;

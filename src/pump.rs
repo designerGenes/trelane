@@ -186,3 +186,109 @@ pub fn tick(ctx: &Context, launcher_override: Option<&str>) -> Result<usize> {
 
     Ok(launched)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+    use crate::models::ParkedTask;
+
+    fn in_memory_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE parked_tasks (
+                task TEXT PRIMARY KEY,
+                agent TEXT NOT NULL,
+                wait_type TEXT NOT NULL,
+                wait_re TEXT,
+                wait_path TEXT,
+                waiting_on TEXT NOT NULL,
+                resume_hint TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                from_agent TEXT NOT NULL,
+                to_agent TEXT NOT NULL,
+                msg_type TEXT NOT NULL,
+                urgency TEXT NOT NULL DEFAULT 'normal',
+                subject TEXT NOT NULL,
+                body TEXT NOT NULL DEFAULT '',
+                re TEXT,
+                task TEXT,
+                paths_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                schema_version INTEGER NOT NULL DEFAULT 1,
+                sig TEXT NOT NULL,
+                processed_at TEXT
+            );
+            CREATE TABLE claims (
+                path TEXT PRIMARY KEY,
+                holder TEXT NOT NULL,
+                task TEXT,
+                grant TEXT,
+                acquired_at TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                expires_human TEXT NOT NULL,
+                contested INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .unwrap();
+        let _ = db::open;
+        conn
+    }
+
+    fn parked(agent: &str, waiting_on: &str) -> ParkedTask {
+        ParkedTask {
+            task: format!("task-{agent}"),
+            agent: agent.to_string(),
+            wait_type: "reply".to_string(),
+            wait_re: Some(format!("msg-{agent}")),
+            wait_path: None,
+            waiting_on: waiting_on.to_string(),
+            resume_hint: String::new(),
+            created_at: "2026-07-03T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn wait_graph_detects_cycle() {
+        let conn = in_memory_conn();
+        store::insert_parked_task(&conn, &parked("alpha", "beta")).unwrap();
+        store::insert_parked_task(&conn, &parked("beta", "gamma")).unwrap();
+        store::insert_parked_task(&conn, &parked("gamma", "alpha")).unwrap();
+
+        let (_, cycle) = wait_graph(&conn).unwrap();
+        let cycle = cycle.unwrap();
+        assert_eq!(cycle.len(), 3);
+        assert!(cycle.contains(&"alpha".to_string()));
+        assert!(cycle.contains(&"beta".to_string()));
+        assert!(cycle.contains(&"gamma".to_string()));
+    }
+
+    #[test]
+    fn wait_graph_returns_none_without_cycle() {
+        let conn = in_memory_conn();
+        store::insert_parked_task(&conn, &parked("alpha", "beta")).unwrap();
+        store::insert_parked_task(&conn, &parked("beta", "user")).unwrap();
+
+        let (_, cycle) = wait_graph(&conn).unwrap();
+        assert!(cycle.is_none());
+    }
+
+    #[test]
+    fn dfs_cycle_handles_self_loop() {
+        let mut edges = HashMap::new();
+        edges.insert("alpha".to_string(), HashSet::from(["alpha".to_string()]));
+        let mut visited = HashSet::new();
+        let mut stack = Vec::new();
+        let mut stack_set = HashSet::new();
+
+        let cycle = dfs_cycle("alpha", &edges, &mut visited, &mut stack, &mut stack_set).unwrap();
+        assert_eq!(cycle, vec!["alpha".to_string()]);
+    }
+}

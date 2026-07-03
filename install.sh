@@ -9,7 +9,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
 
 CARGO_TOML="$SCRIPT_DIR/Cargo.toml"
 INSTALL_DIR="$HOME/.local/bin"
@@ -64,11 +63,10 @@ fi
 # --------------------------------------------------------------- build + install
 
 echo "Building trelane..."
-cargo build --release
+cargo install --path "$SCRIPT_DIR" --root "$HOME/.local" --force
 
 echo "Installing binary to $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"
-cp "$SCRIPT_DIR/target/release/trelane" "$INSTALL_DIR/trelane"
 
 # Add ~/.local/bin to PATH in shell rc if not present
 if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then

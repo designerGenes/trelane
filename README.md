@@ -74,7 +74,9 @@ Dry-run the full lifecycle with zero tokens first:
     bash demo-rust.sh
 
 This exercises message flow, claim negotiation, and a manufactured total
-deadlock, all driven by `trelane stub` (a scripted no-AI agent).
+deadlock, all driven by `trelane stub` (a scripted no-AI agent). Set
+`TRELANE_DEMO_REPEAT=N` to run it repeatedly and `TRELANE_DEMO_REPORT=/path/report.jsonl`
+to capture a per-run report.
 
 ## Commands
 
@@ -83,7 +85,8 @@ deadlock, all driven by `trelane stub` (a scripted no-AI agent).
 | `trelane [--agents A,B] [--no-agents C,D] PROJECT` | Attach/init Trelane for an existing project and inject `AGENTS.md` instructions |
 | `trelane init [--project DIR]` | Initialize a new trelane session |
 | `trelane attach [PROJECT] [--no-inject]` | Attach/init a project and optionally skip `AGENTS.md` injection |
-| `trelane add-agent NAME --writable GLOB [--desc TEXT]` | Register an agent with a domain |
+| `trelane add-agent NAME --writable GLOB [--desc TEXT] [--launcher-agent MODEL]` | Register an agent with a domain and optional session-model binding |
+| `trelane redomain AGENT --writable GLOB [--desc TEXT]` | Update an agent's domain and notify peers |
 | `trelane send --from A --to B --type TYPE --subject TEXT [--body ...]` | Send a signed message |
 | `trelane inbox AGENT [--json]` | List unprocessed messages |
 | `trelane ack AGENT MSG_ID` | Mark a message as processed |
@@ -93,6 +96,8 @@ deadlock, all driven by `trelane stub` (a scripted no-AI agent).
 | `trelane unpark TASK_ID` | Remove a parked task |
 | `trelane status` | Show full swarm state |
 | `trelane wake AGENT [--why TEXT] [--launcher CMD]` | Launch an agent process |
+| `trelane set-launch-target AGENT --adapter tmux --target pane-or-session [--command TEXT]` | Store a GUI/terminal relaunch target |
+| `trelane relaunch AGENT [--adapter ... --target ... --command ...]` | Inject a wake command into an attached terminal session |
 | `trelane done AGENT` | Mark an agent as done (release running lock) |
 | `trelane audit AGENT` | Check for out-of-domain file changes |
 | `trelane pump --once \| --watch [--interval SECS]` | The dumb pump |
@@ -124,6 +129,10 @@ This does three things:
 3. Inserts a managed Trelane block into the project's `AGENTS.md`, giving
    already-running agents the protocol, commands, and exit checklist.
 
+Session agent selection is now operational, not just informational: if a
+domain agent is registered with `--launcher-agent <model>`, Trelane will
+refuse to wake or relaunch it when that session model is disabled.
+
 Default enabled/disabled agents can also be configured globally:
 
 ```json
@@ -151,10 +160,15 @@ agent selection without modifying `AGENTS.md`.
 ## GUI Relaunch
 
 Headless relaunch is implemented through `trelane pump` and the launcher
-template. GUI relaunch is terminal-specific adapter work. Research notes
-are in `docs/terminal-relaunch.md` and cover Terminal.app, iTerm2, kitty,
-WezTerm, and tmux. The recommended first adapter is tmux, followed by
-iTerm2 session `write text` on macOS.
+template. Attached-session relaunch is now available through stored launch
+targets:
+
+    trelane set-launch-target alpha --adapter tmux --target trelane:alpha
+    trelane relaunch alpha
+
+`trelane pump` will prefer a stored launch target over the headless launcher.
+Supported adapters are `tmux`, `iterm2`, `wezterm`, `kitty`, and `terminal.app`.
+The most reliable first choice remains `tmux`.
 
 ## Message format
 
@@ -210,7 +224,7 @@ protocol above is unchanged.
     cargo build          # compile
     cargo clippy -- -D warnings   # lint
     cargo test           # run unit tests
-    bash demo-rust.sh    # end-to-end protocol demo (no tokens)
+    TRELANE_DEMO_REPEAT=3 bash demo-rust.sh    # repeatable end-to-end protocol demo (no tokens)
 
 ## License
 
