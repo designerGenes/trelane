@@ -228,4 +228,12 @@ pub enum Command {
 
     /// Audit an agent's run for out-of-domain file changes
     Audit { agent: String },
+
+    /// Biplane -- analyze the current project and generate a state report
+    Biplane {
+        #[arg(long = "safe-pocket")]
+        safe_pocket_dir: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
 }

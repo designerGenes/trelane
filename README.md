@@ -1,5 +1,25 @@
 # trelane -- park-and-pump multi-agent coordination
 
+```
+                         |
+                         |  trelane
+                    \    |    /
+                     \   |   /
+                      \  |  /
+                       \ | /
+                        \|/
+                   _____ _|_____
+                  |     | |     |__
+              ____|_____|_|_____|__|___
+             /    |           /       | \
+            /_____|__________/________|__\
+           [==|_____________]_[_________]_]
+          /  /  _\___/_      |  |  |  |
+         /__/___[_____]______|__|__|__|
+                \___/
+     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+```
+
 A coordination protocol for running multiple single-shot AI agents (Claude
 Code, opencode, or any headless CLI agent) on one project without deadlock.
 
@@ -11,8 +31,8 @@ wake, drain inbox, work, park anything blocked, exit.
 ## The three invariants
 
 1. **Never wait while running.** Blocking on another agent is forbidden.
-   Blocked work is *parked* — turned into a ledger entry with a resume
-   hint — and the agent moves on or exits. A parked task is data, not a
+   Blocked work is *parked* -- turned into a ledger entry with a resume
+   hint -- and the agent moves on or exits. A parked task is data, not a
    stuck process, so no running agent can deadlock, by construction.
 2. **Inbox first.** Every run begins by draining the inbox. Responsiveness
    happens at run boundaries; run boundaries are frequent because runs are
@@ -31,12 +51,12 @@ lexicographically-first member as designated breaker (documented assumption
 ## Architecture
 
 All state lives in SQLite (`.trelane/trelane.db`) with WAL mode for
-concurrent reads. No daemons, no external services, no message queues —
+concurrent reads. No daemons, no external services, no message queues --
 just one file.
 
 Global configuration (launcher template, pump settings, claim TTL) lives
 at `~/.config/trelane/config.json` (respects `XDG_CONFIG_HOME`). This is
-shared across all projects — each project session only needs its own
+shared across all projects -- each project session only needs its own
 database, secret, and prompts.
 
     ~/.config/trelane/
@@ -56,7 +76,7 @@ database, secret, and prompts.
     cargo install --path .
 
 Requires Rust 1.85+ (edition 2024). SQLite is compiled in via
-`rusqlite`'s `bundled` feature — no system SQLite needed.
+`rusqlite`'s `bundled` feature -- no system SQLite needed.
 
 ## Quickstart
 
@@ -96,6 +116,7 @@ to capture a per-run report.
 | `trelane park AGENT --wait-reply MSG_ID \| --wait-claim PATH --waiting-on AGENT [--resume-hint TEXT]` | Park a blocked task |
 | `trelane unpark TASK_ID` | Remove a parked task |
 | `trelane status` | Show full swarm state |
+| `trelane biplane [--safe-pocket DIR] [--json]` | Analyze the project and generate a state report (Biplane) |
 | `trelane wake AGENT [--why TEXT] [--launcher CMD]` | Launch an agent process |
 | `trelane set-launch-target AGENT --adapter tmux --target session[:window[:pane]] [--command TEXT]` | Store a tmux relaunch target |
 | `trelane relaunch AGENT [--adapter tmux --target ... --command ...]` | Inject a wake command into a tmux target |
@@ -148,7 +169,8 @@ Default enabled/disabled agents can also be configured globally:
     "template": "claude -p \"$(cat {prompt_file})\" --permission-mode acceptEdits --allowedTools \"Bash(trelane *)\" --max-turns 50",
     "profiles": {
       "stub-low-cost": "trelane --root {root} stub {agent}",
-      "claude": "claude -p \"$(cat {prompt_file})\" --permission-mode acceptEdits --allowedTools \"Bash(trelane *)\" --max-turns 50"
+      "claude-haiku": "opencode {root} --model github-copilot/claude-haiku-4.5 --prompt \"$(cat {prompt_file})\"",
+      "gpt-5-mini": "opencode {root} --model github-copilot/gpt-5-mini --prompt \"$(cat {prompt_file})\""
     }
   },
   "pump": {
@@ -178,6 +200,43 @@ target tmux sessions/panes directly.
 
 Trelane can auto-create missing tmux sessions for interactive scenarios and can
 then wake agents by sending their resolved launcher commands straight into tmux.
+
+### Interactive tmux testing UX
+
+When you launch an interactive testing scenario, Trelane:
+
+1. Creates a dedicated tmux session with a top status bar
+2. Creates controller and agent panes with splash screens
+3. Labels each pane with the agent name
+4. Binds `F2` to show a diagnostic status split
+5. Binds `F3` to show the current pane's inbox
+
+The top bar shows `Trelane | <scenario> | ACTIVE` in red while running,
+and turns green when the swarm becomes idle.
+
+## Biplane
+
+Biplane is Trelane's analysis tool. It scans the current project session and
+generates a report of the current state, including:
+
+- All agents, their domains, running state, and inbox counts
+- All parked tasks and whether they are ready
+- All active claims and their expiry
+- Deadlock detection in the wait-for graph
+- Safe_pocket feature files found in the pocket directory
+- Actionable recommendations
+
+Run it with:
+
+    trelane biplane
+
+Or with safe_pocket scanning:
+
+    trelane biplane --safe-pocket ~/.safe_pocket
+
+Or as JSON for scripting:
+
+    trelane biplane --json | jq .
 
 ## Testing Harness
 
@@ -239,7 +298,108 @@ agents, so it will finish in seconds rather than minutes.
 You can then inspect the live sessions directly with commands like:
 
     tmux ls
-    tmux attach -t trelane-frontend
+    tmux attach -t trelane-testing-<timestamp>
+
+## Command Sequence Examples
+
+### Scenario 1: Two agents building a web app
+
+    # 1. Initialize Trelane on your project
+    trelane init --project ~/myapp
+    cd ~/myapp
+
+    # 2. Attach and select models
+    trelane --agents "claude-haiku,gpt-5-mini" --no-agents "gpt-4" .
+
+    # 3. Register agents with disjoint domains
+    trelane add-agent frontend --writable 'src/ui/**' --desc 'owns the UI layer' --launcher-agent claude-haiku
+    trelane add-agent backend  --writable 'src/api/**' --desc 'owns the API layer' --launcher-agent gpt-5-mini
+
+    # 4. Assign initial work
+    trelane send --from user --to frontend --type question \
+        --subject "build the login page" --body "Create a login form with email/password fields."
+    trelane send --from user --to backend --type question \
+        --subject "create the auth endpoint" --body "POST /api/auth/login that validates credentials."
+
+    # 5. Start the pump
+    trelane pump --watch
+
+    # 6. Check on progress
+    trelane status
+    trelane biplane
+
+### Scenario 2: Cross-domain claim negotiation
+
+    # Frontend needs to edit a backend-owned file
+    trelane send --from frontend --to backend --type claim-request \
+        --subject "need src/api/auth.py for import update" \
+        --path src/api/auth.py
+
+    # Frontend parks while waiting
+    trelane park frontend --task task-fix-import --wait-reply msg-XXXX \
+        --waiting-on backend --resume-hint "fix the import in auth.py"
+
+    # Pump wakes backend, which grants the claim
+    trelane pump --once
+
+    # Frontend wakes, uses the grant to claim the file
+    # (the pump handles this automatically)
+
+    # Frontend releases when done and exits
+    trelane release frontend src/api/auth.py
+    trelane done frontend
+
+### Scenario 3: Resolving a deadlock
+
+    # Two agents parked on each other -- neither can proceed
+    trelane park alpha --task task-a --wait-reply msg-never-a --waiting-on beta \
+        --resume-hint "blocked on beta forever"
+    trelane park beta --task task-b --wait-reply msg-never-b --waiting-on alpha \
+        --resume-hint "blocked on alpha forever"
+
+    # The pump detects the cycle and wakes the designated breaker
+    trelane pump --once
+
+    # Check that the deadlock was resolved
+    trelane status
+    trelane biplane
+
+### Scenario 4: Domain shifting mid-session
+
+    # Research agent expands into UI copy review
+    trelane redomain research --writable 'research/**' 'src/ui/**' \
+        --desc 'Expands into UI copy review after cross-team agreement.'
+
+    # Other agents are notified automatically via info messages.
+    # The pump will wake them to process the notification.
+
+    trelane pump --once
+
+### Scenario 5: Interactive tmux testing with real AI
+
+    # 1. Configure low-cost models in ~/.config/trelane/config.json
+    #    (see the Testing Harness section above)
+
+    # 2. Run the interactive scenario
+    trelane --testing /Users/jadennation/DEV/01_active_projects/trelane/tests/full-usage-scenario-interactive.json
+
+    # 3. Attach to the created tmux session
+    tmux attach-session -t trelane-testing-<timestamp>
+
+    # 4. Watch the agents work in their panes.
+    #    Press F2 for a diagnostic status overlay.
+    #    Press F3 for the current pane's inbox.
+
+    # 5. Run Biplane for a full analysis
+    trelane biplane
+
+### Scenario 6: Safe_pocket project analysis
+
+    # Analyze a project that has a safe_pocket with feature files
+    trelane biplane --safe-pocket ~/.safe_pocket
+
+    # Get JSON output for scripting
+    trelane biplane --safe-pocket ~/.safe_pocket --json > report.json
 
 ## Message format
 
@@ -261,8 +421,8 @@ canonical JSON (sorted keys, `sig` excluded) with the session secret.
 | schema     | yes | integer, currently 1                           |
 | sig        | yes | HMAC-SHA256 hex                                 |
 
-Lifecycle: unprocessed → (handled) → processed. An unacked message keeps
-its recipient on the pump's wake list — messages cannot sit unnoticed.
+Lifecycle: unprocessed -> (handled) -> processed. An unacked message keeps
+its recipient on the pump's wake list -- messages cannot sit unnoticed.
 
 ## Domains and claims
 
@@ -272,8 +432,8 @@ write. Enforcement is three layers:
 1. **Prompt**: the bootstrap states the domain and the rules.
 2. **Claim gate**: `trelane claim` refuses paths in another agent's domain
    unless a `claim-grant` message id is presented (`--grant`). Leases are
-   acquired via SQLite `INSERT OR IGNORE` — one winner even under a true
-   race — and expire on TTL (the pump reaps and notifies).
+   acquired via SQLite `INSERT OR IGNORE` -- one winner even under a true
+   race -- and expire on TTL (the pump reaps and notifies).
 3. **Audit**: at wake, trelane snapshots content hashes of all dirty files;
    `trelane audit <agent>` flags out-of-domain files changed *during that
    run*. Violations are recorded in the database and the run fails its exit

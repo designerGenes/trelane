@@ -668,6 +668,15 @@ fn provision_interactive_tmux_layout(ctx: &Context, scenario: &Scenario) -> Resu
         .args(["select-pane", "-t", &controller_pane, "-T", "controller"])
         .status()?;
 
+    crate::splash::set_session_status_bar(&session_name, &scenario.name, true).ok();
+    crate::splash::bind_diagnostic_toggle(&session_name).ok();
+
+    std::fs::write(
+        format!("/tmp/trelane-{}-root", session_name),
+        ctx.root.display().to_string(),
+    )
+    .ok();
+
     let mut pane_ids = Vec::new();
     if !scenario.agents.is_empty() {
         let first = std::process::Command::new("tmux")
@@ -717,6 +726,13 @@ fn provision_interactive_tmux_layout(ctx: &Context, scenario: &Scenario) -> Resu
         std::process::Command::new("tmux")
             .args(["select-pane", "-t", pane_id, "-T", &agent.name])
             .status()?;
+        crate::splash::send_splash_to_pane(
+            pane_id,
+            &agent.name,
+            "interactive test bootstrap",
+            &ctx.root.display().to_string(),
+        )
+        .ok();
         commands::cmd_set_launch_target(ctx, &agent.name, "tmux", pane_id, None, None)?;
     }
 

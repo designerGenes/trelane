@@ -1,12 +1,15 @@
+pub mod biplane;
 pub mod cli;
 pub mod commands;
 pub mod crypto;
 pub mod db;
 pub mod domain;
 pub mod error;
+pub mod logo;
 pub mod models;
 pub mod prompt;
 pub mod pump;
+pub mod splash;
 pub mod store;
 pub mod testing;
 
@@ -251,6 +254,13 @@ pub fn handle(cli: Cli) -> Result<()> {
         Some(Command::Audit { agent }) => {
             let ctx = Context::open(cli.root.as_deref())?;
             commands::cmd_audit(&ctx, &agent)
+        }
+        Some(Command::Biplane {
+            safe_pocket_dir,
+            json,
+        }) => {
+            let ctx = Context::open(cli.root.as_deref())?;
+            biplane::cmd_biplane(&ctx, safe_pocket_dir.as_deref(), json)
         }
         Some(Command::Stub { agent }) => {
             let ctx = Context::open(cli.root.as_deref())?;
