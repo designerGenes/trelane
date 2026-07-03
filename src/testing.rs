@@ -12,6 +12,8 @@ pub struct Scenario {
     pub description: String,
     #[serde(default)]
     pub launcher: Option<String>,
+    #[serde(default)]
+    pub mode: ScenarioMode,
     pub project: ScenarioProject,
     pub agents: Vec<ScenarioAgent>,
     pub steps: Vec<ScenarioStep>,
@@ -39,6 +41,26 @@ pub struct ScenarioAgent {
     pub forbidden_write: Vec<String>,
     #[serde(default)]
     pub launcher_agent: Option<String>,
+    #[serde(default)]
+    pub launch_target: Option<ScenarioLaunchTarget>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScenarioMode {
+    #[default]
+    Stub,
+    Interactive,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScenarioLaunchTarget {
+    pub adapter: String,
+    pub target: String,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub tmux_target: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +93,12 @@ pub enum ScenarioStep {
     Pump {
         explanation: String,
         ticks: u32,
+    },
+    PumpWatch {
+        explanation: String,
+        interval_s: u64,
+        max_ticks: u32,
+        idle_grace_ticks: u32,
     },
     ClaimExpectDenied {
         explanation: String,
@@ -107,6 +135,7 @@ pub struct ScenarioReport {
     pub redomains: u32,
     pub deadlocks_detected: usize,
     pub metrics: Vec<String>,
+    pub mode: String,
 }
 
 #[derive(Default)]
@@ -230,6 +259,20 @@ fn run_once(
                 &crypto::now_iso(),
             )?;
         }
+        if let Some(target) = &agent.launch_target {
+            commands::cmd_set_launch_target(
+                &ctx,
+                &agent.name,
+                &target.adapter,
+                &target.target,
+                target.command.as_deref(),
+                target.tmux_target.as_deref(),
+            )?;
+        }
+    }
+
+    if matches!(scenario.mode, ScenarioMode::Interactive) {
+        validate_interactive_setup(&ctx, scenario)?;
     }
 
     let started_at = chrono::Utc::now();
@@ -301,14 +344,79 @@ fn run_once(
                 explanation: _,
                 ticks,
             } => {
-                let launcher = launcher_override
-                    .map(str::to_string)
-                    .unwrap_or_else(default_stub_launcher);
+                let launcher = match scenario.mode {
+                    ScenarioMode::Stub => launcher_override
+                        .map(str::to_string)
+                        .unwrap_or_else(default_stub_launcher),
+                    ScenarioMode::Interactive => launcher_override
+                        .map(str::to_string)
+                        .or_else(|| scenario.launcher.clone())
+                        .unwrap_or_default(),
+                };
                 for tick in 0..*ticks {
                     println!("[testing] pump tick {} of {}", tick + 1, ticks);
-                    crate::pump::tick(&ctx, Some(launcher.as_str()))?;
-                    wait_for_idle(&ctx, 40, std::time::Duration::from_millis(250))?;
+                    let override_arg = if launcher.is_empty() {
+                        None
+                    } else {
+                        Some(launcher.as_str())
+                    };
+                    crate::pump::tick(&ctx, override_arg)?;
+                    if matches!(scenario.mode, ScenarioMode::Stub) {
+                        wait_for_idle(&ctx, 40, std::time::Duration::from_millis(250))?;
+                    }
                     counters.pumps += 1;
+                }
+            }
+            ScenarioStep::PumpWatch {
+                explanation: _,
+                interval_s,
+                max_ticks,
+                idle_grace_ticks,
+            } => {
+                let launcher = match scenario.mode {
+                    ScenarioMode::Stub => launcher_override
+                        .map(str::to_string)
+                        .unwrap_or_else(default_stub_launcher),
+                    ScenarioMode::Interactive => launcher_override
+                        .map(str::to_string)
+                        .or_else(|| scenario.launcher.clone())
+                        .unwrap_or_default(),
+                };
+                let override_arg = if launcher.is_empty() {
+                    None
+                } else {
+                    Some(launcher.as_str())
+                };
+                let mut idle_ticks = 0u32;
+                for tick in 0..*max_ticks {
+                    println!(
+                        "[testing] pump watch tick {} of {}",
+                        tick + 1,
+                        max_ticks
+                    );
+                    crate::pump::tick(&ctx, override_arg)?;
+                    counters.pumps += 1;
+                    if matches!(scenario.mode, ScenarioMode::Stub) {
+                        wait_for_idle(&ctx, 40, std::time::Duration::from_millis(250))?;
+                    }
+                    if swarm_quiescent(&ctx)? {
+                        idle_ticks += 1;
+                        if idle_ticks >= *idle_grace_ticks {
+                            println!(
+                                "[testing] swarm quiescent for {} consecutive tick(s); stopping watch loop",
+                                idle_ticks
+                            );
+                            break;
+                        }
+                    } else {
+                        idle_ticks = 0;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(*interval_s));
+                    if tick + 1 == *max_ticks {
+                        return Err(TrelaneError::msg(
+                            "pump watch exhausted max_ticks before the swarm became quiescent",
+                        ));
+                    }
                 }
             }
             ScenarioStep::ClaimExpectDenied {
@@ -382,6 +490,10 @@ fn run_once(
         redomains: counters.redomains,
         deadlocks_detected,
         metrics: scenario.metrics.clone(),
+        mode: match scenario.mode {
+            ScenarioMode::Stub => "stub".to_string(),
+            ScenarioMode::Interactive => "interactive".to_string(),
+        },
     })
 }
 
@@ -390,6 +502,7 @@ fn step_name(step: &ScenarioStep) -> &'static str {
         ScenarioStep::Send { .. } => "send",
         ScenarioStep::Park { .. } => "park",
         ScenarioStep::Pump { .. } => "pump",
+        ScenarioStep::PumpWatch { .. } => "pump-watch",
         ScenarioStep::ClaimExpectDenied { .. } => "claim-expect-denied",
         ScenarioStep::Redomain { .. } => "redomain",
         ScenarioStep::AssertNoDeadlock { .. } => "assert-no-deadlock",
@@ -402,6 +515,7 @@ fn step_explanation(step: &ScenarioStep) -> &str {
         ScenarioStep::Send { explanation, .. }
         | ScenarioStep::Park { explanation, .. }
         | ScenarioStep::Pump { explanation, .. }
+        | ScenarioStep::PumpWatch { explanation, .. }
         | ScenarioStep::ClaimExpectDenied { explanation, .. }
         | ScenarioStep::Redomain { explanation, .. }
         | ScenarioStep::AssertNoDeadlock { explanation }
@@ -440,10 +554,80 @@ fn wait_for_idle(ctx: &Context, attempts: usize, delay: std::time::Duration) -> 
     ))
 }
 
+fn swarm_quiescent(ctx: &Context) -> Result<bool> {
+    let any_running = crate::store::list_agents(&ctx.conn)?
+        .iter()
+        .any(|agent| crate::commands::is_running(&ctx.conn, agent).unwrap_or(false));
+    if any_running {
+        return Ok(false);
+    }
+
+    let any_inbox = crate::store::list_agents(&ctx.conn)?
+        .iter()
+        .any(|agent| !crate::store::get_unprocessed_messages(&ctx.conn, agent).unwrap_or_default().is_empty());
+    if any_inbox {
+        return Ok(false);
+    }
+
+    Ok(crate::store::list_parked_tasks(&ctx.conn)?.is_empty())
+}
+
 fn default_stub_launcher() -> String {
     std::env::current_exe()
         .map(|path| format!("{} --root {{root}} stub {{agent}}", path.display()))
         .unwrap_or_else(|_| "trelane --root {root} stub {agent}".to_string())
+}
+
+fn validate_interactive_setup(ctx: &Context, scenario: &Scenario) -> Result<()> {
+    for agent in &scenario.agents {
+        let launcher_agent = agent.launcher_agent.as_deref().ok_or_else(|| {
+            TrelaneError::msg(format!(
+                "interactive scenario agent '{}' is missing launcher_agent",
+                agent.name
+            ))
+        })?;
+
+        let template = ctx
+            .config
+            .launcher
+            .profiles
+            .get(launcher_agent)
+            .ok_or_else(|| {
+                TrelaneError::msg(format!(
+                    "interactive scenario agent '{}' requires launcher.profiles.{} in config.json",
+                    agent.name, launcher_agent
+                ))
+            })?;
+
+        let template_lc = template.to_ascii_lowercase();
+        let looks_low_cost = template_lc.contains("haiku")
+            || template_lc.contains("gpt-5-mini")
+            || template_lc.contains("gpt5-mini")
+            || template_lc.contains("stub");
+        if !looks_low_cost {
+            return Err(TrelaneError::msg(format!(
+                "interactive scenario agent '{}' uses launcher profile '{}' that does not appear to be low-cost",
+                agent.name, launcher_agent
+            )));
+        }
+
+        let launch_target = agent.launch_target.as_ref().ok_or_else(|| {
+            TrelaneError::msg(format!(
+                "interactive scenario agent '{}' is missing a launch_target",
+                agent.name
+            ))
+        })?;
+
+        let tmux_target = launch_target.tmux_target.as_deref().ok_or_else(|| {
+            TrelaneError::msg(format!(
+                "interactive scenario agent '{}' needs launch_target.tmux_target for terminal-backed testing",
+                agent.name
+            ))
+        })?;
+        crate::commands::ensure_tmux_target(tmux_target)?;
+    }
+
+    Ok(())
 }
 
 fn send_and_capture(ctx: &Context, input: SendCaptureInput<'_>) -> Result<String> {

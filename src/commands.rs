@@ -307,6 +307,37 @@ fn command_for_launch_target(target: &LaunchTarget) -> String {
     }
 }
 
+fn creatable_tmux_session_name(target: &str) -> Option<&str> {
+    if target.is_empty() || target.starts_with('%') || target.starts_with('@') {
+        return None;
+    }
+    target.split(':').next().filter(|name| !name.is_empty())
+}
+
+pub fn ensure_tmux_target(target: &str) -> Result<()> {
+    let has = Command::new("tmux")
+        .args(["has-session", "-t", target])
+        .status()?;
+    if has.success() {
+        return Ok(());
+    }
+
+    let session_name = creatable_tmux_session_name(target).ok_or_else(|| {
+        TrelaneError::msg(format!(
+            "tmux target '{target}' does not exist and cannot be auto-created"
+        ))
+    })?;
+    let create = Command::new("tmux")
+        .args(["new-session", "-d", "-s", session_name])
+        .status()?;
+    if !create.success() {
+        return Err(TrelaneError::msg(format!(
+            "failed to auto-create tmux session '{session_name}' for target '{target}'"
+        )));
+    }
+    Ok(())
+}
+
 fn launcher_command_for_agent(
     ctx: &Context,
     agent: &str,
@@ -335,6 +366,9 @@ fn launcher_command_for_agent(
 }
 
 fn launch_via_adapter(adapter: &str, target: &str, command: &str) -> Result<()> {
+    if adapter == "tmux" {
+        ensure_tmux_target(target)?;
+    }
     let status = match adapter {
         "tmux" => Command::new("tmux")
             .args(["send-keys", "-t", target, command, "Enter"])
@@ -1001,12 +1035,17 @@ pub fn cmd_wake(
     if launcher_override.is_none()
         && let Some(target) = store::get_launch_target(&ctx.conn, agent)?
     {
-        let command = command_for_launch_target(&LaunchTarget {
-            command: target
+        let resolved_command = if target.command.trim().is_empty() {
+            launcher_command_for_agent(ctx, agent, &prompt_file, None)?
+        } else {
+            target
                 .command
                 .replace("{prompt_file}", &prompt_file.display().to_string())
                 .replace("{agent}", agent)
-                .replace("{root}", &ctx.root.display().to_string()),
+                .replace("{root}", &ctx.root.display().to_string())
+        };
+        let command = command_for_launch_target(&LaunchTarget {
+            command: resolved_command,
             ..target.clone()
         });
         launch_via_adapter(&target.adapter, &target.target, &command)?;
@@ -1073,18 +1112,7 @@ pub fn cmd_set_launch_target(
             "agent '{agent}' is mapped to a disabled session agent/model"
         )));
     }
-    let default_command = format!(
-        "cat {}",
-        shell_single_quote(
-            &ctx.trelane_dir()
-                .join("agents")
-                .join(agent)
-                .join(".prompt.md")
-                .display()
-                .to_string()
-        )
-    );
-    let command = command.map(str::to_string).unwrap_or(default_command);
+    let command = command.map(str::to_string).unwrap_or_default();
     store::upsert_launch_target(
         &ctx.conn,
         agent,
@@ -1116,6 +1144,8 @@ pub fn cmd_relaunch(
             "agent '{agent}' is mapped to a disabled session agent/model"
         )));
     }
+    let prompt_text = prompt::compose_prompt(&ctx.conn, &ctx.root, agent, "manual relaunch")?;
+    let prompt_file = prompt::write_prompt_file(&ctx.trelane_dir(), agent, &prompt_text)?;
 
     let stored = store::get_launch_target(&ctx.conn, agent)?;
     let adapter = adapter
@@ -1129,25 +1159,22 @@ pub fn cmd_relaunch(
     let command = command
         .map(str::to_string)
         .or_else(|| stored.as_ref().map(|t| t.command.clone()))
-        .unwrap_or_else(|| {
-            format!(
-                "cat {}",
-                shell_single_quote(
-                    &ctx.trelane_dir()
-                        .join("agents")
-                        .join(agent)
-                        .join(".prompt.md")
-                        .display()
-                        .to_string()
-                )
-            )
-        });
+        .unwrap_or_default();
+
+    let resolved_command = if command.trim().is_empty() {
+        launcher_command_for_agent(ctx, agent, &prompt_file, None)?
+    } else {
+        command
+            .replace("{prompt_file}", &prompt_file.display().to_string())
+            .replace("{agent}", agent)
+            .replace("{root}", &ctx.root.display().to_string())
+    };
 
     let launch_target = LaunchTarget {
         agent: agent.to_string(),
         adapter: adapter.clone(),
         target: target.clone(),
-        command,
+        command: resolved_command,
         tmux_target: stored.as_ref().and_then(|t| t.tmux_target.clone()),
         updated_at: String::new(),
     };

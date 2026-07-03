@@ -97,8 +97,8 @@ to capture a per-run report.
 | `trelane unpark TASK_ID` | Remove a parked task |
 | `trelane status` | Show full swarm state |
 | `trelane wake AGENT [--why TEXT] [--launcher CMD]` | Launch an agent process |
-| `trelane set-launch-target AGENT --adapter tmux --target pane-or-session [--command TEXT]` | Store a GUI/terminal relaunch target |
-| `trelane relaunch AGENT [--adapter ... --target ... --command ...]` | Inject a wake command into an attached terminal session |
+| `trelane set-launch-target AGENT --adapter tmux --target session[:window[:pane]] [--command TEXT]` | Store a tmux relaunch target |
+| `trelane relaunch AGENT [--adapter tmux --target ... --command ...]` | Inject a wake command into a tmux target |
 | `trelane done AGENT` | Mark an agent as done (release running lock) |
 | `trelane audit AGENT` | Check for out-of-domain file changes |
 | `trelane pump --once \| --watch [--interval SECS]` | The dumb pump |
@@ -164,47 +164,20 @@ Default enabled/disabled agents can also be configured globally:
 Use `trelane attach --no-inject .` when you want to initialize and record
 agent selection without modifying `AGENTS.md`.
 
-## GUI Relaunch
+## tmux Relaunch
 
 Headless relaunch is implemented through `trelane pump` and the launcher
-template. Attached-session relaunch is now available through stored launch
-targets:
+template. Interactive relaunch is tmux-first through stored launch targets:
 
     trelane set-launch-target alpha --adapter tmux --target trelane:alpha
     trelane relaunch alpha
 
-Or, when the visible host is a terminal app but the real agent lives inside
-tmux within that app:
-
-    trelane set-launch-target alpha --adapter ghostty --target frontmost --tmux-target trelane-alpha
-
 `trelane pump` will prefer a stored launch target over the headless launcher.
-Supported adapters are `tmux`, `ghostty`, `iterm2`, `wezterm`, `kitty`, and `terminal.app`.
-The recommended approach for every supported terminal app is to run the agent
-inside `tmux` and have Trelane target the tmux pane/session. That is the only
-deterministic cross-terminal targeting layer Trelane currently supports well.
+The supported interactive control plane is `tmux`, and Trelane is designed to
+target tmux sessions/panes directly.
 
-Examples:
-
-    # inside Ghostty, iTerm2, WezTerm, kitty, or Terminal.app
-    tmux new-session -s trelane-alpha
-    trelane set-launch-target alpha --adapter tmux --target trelane-alpha
-
-Native terminal adapters should be treated as best-effort fallbacks when tmux
-is not available. They are useful for convenience, but they are less precise
-than targeting tmux directly.
-
-When `--tmux-target` is set on a non-`tmux` adapter, Trelane now injects a real
-`tmux send-keys ... Enter` relay into the host terminal instead of typing the
-raw wake command directly.
-
-Without a custom `--command`, terminal relaunch now surfaces the generated
-`.trelane/agents/<agent>/.prompt.md` file by default rather than only printing
-the inbox.
-
-For Ghostty on macOS, `--target frontmost` sends to the active window, and any
-other `--target` value is treated as a window-title substring. This still does
-not choose a specific split; it sends to the currently focused Ghostty split.
+Trelane can auto-create missing tmux sessions for interactive scenarios and can
+then wake agents by sending their resolved launcher commands straight into tmux.
 
 ## Testing Harness
 
@@ -215,6 +188,11 @@ Full usage scenarios live under `tests/` as JSON files. A scenario describes:
 - the ordered coordination steps to run
 - a verbal explanation for each step
 - the metrics to record per run
+
+There are two intended classes of scenario:
+
+- `tests/full-usage-scenario.json`: deterministic stub-driven harness for quick repeatable verification
+- `tests/full-usage-scenario-interactive.json`: real tmux-managed harness for long-running interactive agent sessions
 
 The shipped scenario demonstrates:
 
@@ -233,6 +211,35 @@ Run one directly with:
 
 The runner emits regular debug output as each step executes and appends one
 JSON object per run to the report file.
+
+If you want real tmux-managed agents instead of the fast stub harness,
+launch the interactive scenario and make sure your `config.json` defines low-cost launcher
+profiles matching the scenario's `launcher_agent` labels, for example:
+
+```json
+{
+  "launcher": {
+    "template": "claude -p \"$(cat {prompt_file})\" --permission-mode acceptEdits --allowedTools \"Bash(trelane *)\" --max-turns 50",
+    "profiles": {
+      "claude-haiku": "claude -p \"$(cat {prompt_file})\" --model claude-3-5-haiku --permission-mode acceptEdits --allowedTools \"Bash(trelane *)\" --max-turns 50",
+      "gpt-5-mini": "opencode run --model gpt-5-mini --prompt-file {prompt_file}"
+    }
+  }
+}
+```
+
+When the scenario runs, Trelane will auto-create the tmux sessions it needs and
+keep pumping until the swarm becomes quiescent. Launch the scenario with:
+
+    trelane --testing /Users/jadennation/DEV/01_active_projects/trelane/tests/full-usage-scenario-interactive.json
+
+The shipped `full-usage-scenario.json` is intentionally fast and uses stub
+agents, so it will finish in seconds rather than minutes.
+
+You can then inspect the live sessions directly with commands like:
+
+    tmux ls
+    tmux attach -t trelane-frontend
 
 ## Message format
 

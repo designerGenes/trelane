@@ -1,0 +1,93 @@
+{
+  "name": "full-usage-scenario-interactive",
+  "description": "Interactive multi-agent scenario intended for real tmux-managed agents rather than the stub harness. Requires low-cost launcher profiles such as Claude Haiku or GPT-5 mini and keeps the pump alive until the swarm settles.",
+  "mode": "interactive",
+  "project": {
+    "files": [
+      {
+        "path": "src/ui/app.ts",
+        "contents": "export const usersTable = [];\n"
+      },
+      {
+        "path": "src/api/routes.py",
+        "contents": "def users():\n    return []\n"
+      },
+      {
+        "path": "research/notes.md",
+        "contents": "# Notes\n\nPending schema alignment.\n"
+      }
+    ]
+  },
+  "agents": [
+    {
+      "name": "frontend",
+      "description": "Owns UI implementation",
+      "writable": ["src/ui/**", "design/**"],
+      "forbidden_write": ["src/ui/secrets/**"],
+      "launcher_agent": "claude-haiku",
+      "launch_target": {
+        "adapter": "tmux",
+        "target": "trelane-frontend"
+      }
+    },
+    {
+      "name": "backend",
+      "description": "Owns API implementation",
+      "writable": ["src/api/**"],
+      "launcher_agent": "gpt-5-mini",
+      "launch_target": {
+        "adapter": "tmux",
+        "target": "trelane-backend"
+      }
+    },
+    {
+      "name": "research",
+      "description": "Owns research and notes",
+      "writable": ["research/**", "docs/briefs/**"],
+      "launcher_agent": "claude-haiku",
+      "launch_target": {
+        "adapter": "tmux",
+        "target": "trelane-research"
+      }
+    }
+  ],
+  "steps": [
+    {
+      "type": "Send",
+      "explanation": "Frontend asks backend for the API schema before touching the UI table.",
+      "from": "frontend",
+      "to": "backend",
+      "msg_type": "question",
+      "subject": "Need /users payload schema",
+      "body": "Provide the response shape so the UI table can be wired.",
+      "save_as": "schema-question"
+    },
+    {
+      "type": "Park",
+      "explanation": "Frontend parks until the backend replies so the runner exercises inbox-driven wakeups.",
+      "agent": "frontend",
+      "task": "task-ui-table",
+      "wait_reply_ref": "schema-question",
+      "waiting_on": "backend",
+      "resume_hint": "Resume wiring the UI table once backend answers."
+    },
+    {
+      "type": "Pump",
+      "explanation": "Prime the swarm by waking the first waiting agents through tmux-managed launch targets.",
+      "ticks": 2
+    },
+    {
+      "type": "PumpWatch",
+      "explanation": "Keep the tmux-first swarm alive until all agents have drained their work and the session goes quiet.",
+      "interval_s": 5,
+      "max_ticks": 180,
+      "idle_grace_ticks": 3
+    }
+  ],
+  "metrics": [
+    "messages_sent",
+    "pumps",
+    "redomains",
+    "deadlocks_detected"
+  ]
+}
