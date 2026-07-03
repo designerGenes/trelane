@@ -12,7 +12,7 @@ The first production adapter should be an abstraction over terminal-specific `se
 ```text
 target = terminal/session selector
 payload = command text + newline
-adapter = iterm2 | terminal.app | kitty | wezterm | tmux | custom
+adapter = ghostty | iterm2 | terminal.app | kitty | wezterm | tmux | custom
 ```
 
 The pump should not directly know terminal APIs. It should emit a wake request, and an adapter should deliver the text to the target session.
@@ -92,6 +92,34 @@ Limitations:
 - Requires discovering and storing the pane id.
 - The CLI is best when paired with WezTerm's mux metadata.
 
+## Ghostty
+
+Ghostty does not currently expose a CLI remote-control surface in this repo's
+environment, so the practical adapter path on macOS is GUI scripting.
+
+Useful direction:
+
+```applescript
+tell application "Ghostty" to activate
+tell application "System Events"
+  tell process "Ghostty"
+    keystroke "trelane inbox agent --json"
+    key code 36
+  end tell
+end tell
+```
+
+Useful selectors:
+
+- `frontmost` for the active Ghostty window
+- A recorded window-title substring, used to focus a matching window before typing
+
+Limitations:
+
+- Requires macOS Accessibility permissions for `System Events`.
+- Window targeting is less precise than pane-aware terminals like tmux or WezTerm.
+- Safe automation depends on consistent window naming.
+
 ## tmux
 
 tmux is the most portable terminal-adjacent option when sessions run inside tmux.
@@ -112,9 +140,12 @@ Limitations:
 Implement adapters in this order:
 
 1. `tmux`: simplest, cross-terminal, easiest to test in CI.
-2. `iterm2`: strongest macOS GUI fit via session `write text`.
-3. `wezterm`: solid CLI/mux model.
-4. `kitty`: strong remote-control model, but requires explicit user config.
-5. `terminal.app`: fallback macOS support, less precise targeting.
+2. `ghostty`: practical macOS GUI option via Accessibility scripting.
+3. `iterm2`: strongest macOS GUI fit via session `write text`.
+4. `wezterm`: solid CLI/mux model.
+5. `kitty`: strong remote-control model, but requires explicit user config.
+6. `terminal.app`: fallback macOS support, less precise targeting.
 
-For now, Trelane implements attachment by writing durable project instructions into `AGENTS.md` and recording enabled/disabled session agents. GUI relaunch should be added as adapter work after target identity storage is designed.
+Trelane now implements attached-session relaunch through stored launch targets and
+adapter delivery. Headless launch remains the default, while GUI relaunch is best
+effort and depends on terminal-specific permissions and targeting fidelity.

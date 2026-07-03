@@ -271,6 +271,10 @@ fn relaunch_command_for_agent(ctx: &Context, agent: &str) -> String {
     )
 }
 
+fn applescript_escape(input: &str) -> String {
+    input.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn launch_via_adapter(adapter: &str, target: &str, command: &str) -> Result<()> {
     let status = match adapter {
         "tmux" => Command::new("tmux")
@@ -282,12 +286,43 @@ fn launch_via_adapter(adapter: &str, target: &str, command: &str) -> Result<()> 
         "wezterm" => Command::new("wezterm")
             .args(["cli", "send-text", "--pane-id", target, command])
             .status()?,
+        "ghostty" => {
+            let script = if target == "frontmost" {
+                format!(
+                    "tell application \"Ghostty\" to activate\n\
+                     tell application \"System Events\"\n\
+                     tell process \"Ghostty\"\n\
+                     keystroke \"{}\"\n\
+                     key code 36\n\
+                     end tell\n\
+                     end tell",
+                    applescript_escape(command)
+                )
+            } else {
+                format!(
+                    "tell application \"Ghostty\" to activate\n\
+                     tell application \"System Events\"\n\
+                     tell process \"Ghostty\"\n\
+                     set frontmost to true\n\
+                     try\n\
+                     click (first window whose name contains \"{}\")\n\
+                     end try\n\
+                     keystroke \"{}\"\n\
+                     key code 36\n\
+                     end tell\n\
+                     end tell",
+                    applescript_escape(target),
+                    applescript_escape(command)
+                )
+            };
+            Command::new("osascript").args(["-e", &script]).status()?
+        }
         "iterm2" => Command::new("osascript")
             .args([
                 "-e",
                 &format!(
                     "tell application \"iTerm2\" to tell current session of current window to write text \"{}\"",
-                    command.replace('\\', "\\\\").replace('"', "\\\"")
+                    applescript_escape(command)
                 ),
             ])
             .status()?,
@@ -296,7 +331,7 @@ fn launch_via_adapter(adapter: &str, target: &str, command: &str) -> Result<()> 
                 "-e",
                 &format!(
                     "tell application \"Terminal\" to do script \"{}\" in selected tab of front window",
-                    command.replace('\\', "\\\\").replace('"', "\\\"")
+                    applescript_escape(command)
                 ),
             ])
             .status()?,

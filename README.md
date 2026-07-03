@@ -167,8 +167,12 @@ targets:
     trelane relaunch alpha
 
 `trelane pump` will prefer a stored launch target over the headless launcher.
-Supported adapters are `tmux`, `iterm2`, `wezterm`, `kitty`, and `terminal.app`.
+Supported adapters are `tmux`, `ghostty`, `iterm2`, `wezterm`, `kitty`, and `terminal.app`.
 The most reliable first choice remains `tmux`.
+
+For Ghostty on macOS, use `--target frontmost` to send to the active window, or
+set `--target` to a substring of the window title and Trelane will try to focus
+that window before typing.
 
 ## Message format
 
