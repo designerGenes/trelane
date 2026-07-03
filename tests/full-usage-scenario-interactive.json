@@ -51,6 +51,24 @@
       "save_as": "schema-question"
     },
     {
+      "type": "Wake",
+      "explanation": "Start the frontend pane immediately so the interactive layout visibly contains a live frontend agent.",
+      "agent": "frontend",
+      "why": "interactive test bootstrap: start frontend pane"
+    },
+    {
+      "type": "Wake",
+      "explanation": "Start the backend pane immediately so the interactive layout visibly contains a live backend agent.",
+      "agent": "backend",
+      "why": "interactive test bootstrap: start backend pane"
+    },
+    {
+      "type": "Wake",
+      "explanation": "Start the research pane immediately so the interactive layout visibly contains a live research agent.",
+      "agent": "research",
+      "why": "interactive test bootstrap: start research pane"
+    },
+    {
       "type": "Park",
       "explanation": "Frontend parks until the backend replies so the runner exercises inbox-driven wakeups.",
       "agent": "frontend",

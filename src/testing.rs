@@ -83,6 +83,11 @@ pub enum ScenarioStep {
         explanation: String,
         ticks: u32,
     },
+    Wake {
+        explanation: String,
+        agent: String,
+        why: String,
+    },
     PumpWatch {
         explanation: String,
         interval_s: u64,
@@ -359,6 +364,13 @@ fn run_once(
                     counters.pumps += 1;
                 }
             }
+            ScenarioStep::Wake {
+                explanation: _,
+                agent,
+                why,
+            } => {
+                commands::cmd_wake(&ctx, agent, Some(why.as_str()), None)?;
+            }
             ScenarioStep::PumpWatch {
                 explanation: _,
                 interval_s,
@@ -490,6 +502,7 @@ fn step_name(step: &ScenarioStep) -> &'static str {
         ScenarioStep::Send { .. } => "send",
         ScenarioStep::Park { .. } => "park",
         ScenarioStep::Pump { .. } => "pump",
+        ScenarioStep::Wake { .. } => "wake",
         ScenarioStep::PumpWatch { .. } => "pump-watch",
         ScenarioStep::ClaimExpectDenied { .. } => "claim-expect-denied",
         ScenarioStep::Redomain { .. } => "redomain",
@@ -503,6 +516,7 @@ fn step_explanation(step: &ScenarioStep) -> &str {
         ScenarioStep::Send { explanation, .. }
         | ScenarioStep::Park { explanation, .. }
         | ScenarioStep::Pump { explanation, .. }
+        | ScenarioStep::Wake { explanation, .. }
         | ScenarioStep::PumpWatch { explanation, .. }
         | ScenarioStep::ClaimExpectDenied { explanation, .. }
         | ScenarioStep::Redomain { explanation, .. }
@@ -650,18 +664,42 @@ fn provision_interactive_tmux_layout(ctx: &Context, scenario: &Scenario) -> Resu
     std::process::Command::new("tmux")
         .args(["rename-window", "-t", &session_name, &scenario.name])
         .status()?;
+    std::process::Command::new("tmux")
+        .args(["select-pane", "-t", &controller_pane, "-T", "controller"])
+        .status()?;
 
     let mut pane_ids = Vec::new();
-    for _ in &scenario.agents {
-        let output = std::process::Command::new("tmux")
+    if !scenario.agents.is_empty() {
+        let first = std::process::Command::new("tmux")
             .args([
                 "split-window",
+                "-h",
                 "-d",
                 "-P",
                 "-F",
                 "#{pane_id}",
                 "-t",
                 &controller_pane,
+            ])
+            .output()?;
+        if !first.status.success() {
+            return Err(TrelaneError::msg(
+                "failed to create first tmux pane for interactive scenario",
+            ));
+        }
+        pane_ids.push(String::from_utf8_lossy(&first.stdout).trim().to_string());
+    }
+    for _ in 1..scenario.agents.len() {
+        let output = std::process::Command::new("tmux")
+            .args([
+                "split-window",
+                "-v",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                &pane_ids[0],
             ])
             .output()?;
         if !output.status.success() {
@@ -676,6 +714,9 @@ fn provision_interactive_tmux_layout(ctx: &Context, scenario: &Scenario) -> Resu
         .status()?;
 
     for (agent, pane_id) in scenario.agents.iter().zip(pane_ids.iter()) {
+        std::process::Command::new("tmux")
+            .args(["select-pane", "-t", pane_id, "-T", &agent.name])
+            .status()?;
         commands::cmd_set_launch_target(ctx, &agent.name, "tmux", pane_id, None, None)?;
     }
 

@@ -221,8 +221,8 @@ profiles matching the scenario's `launcher_agent` labels, for example:
   "launcher": {
     "template": "claude -p \"$(cat {prompt_file})\" --permission-mode acceptEdits --allowedTools \"Bash(trelane *)\" --max-turns 50",
     "profiles": {
-      "claude-haiku": "claude -p \"$(cat {prompt_file})\" --model claude-3-5-haiku --permission-mode acceptEdits --allowedTools \"Bash(trelane *)\" --max-turns 50",
-      "gpt-5-mini": "opencode run --model gpt-5-mini --prompt-file {prompt_file}"
+      "claude-haiku": "opencode {root} --model github-copilot/claude-haiku-4.5 --prompt \"$(cat {prompt_file})\"",
+      "gpt-5-mini": "opencode {root} --model github-copilot/gpt-5-mini --prompt \"$(cat {prompt_file})\""
     }
   }
 }
