@@ -78,14 +78,8 @@ pub fn run_biplane_plan(
 }
 
 fn resolve_launcher_template(model: &str) -> Result<String> {
-    let config = crate::load_config()?;
-
-    if let Some(template) = config.launcher.profiles.get(model) {
-        return Ok(template.clone());
-    }
-
     Ok(format!(
-        "opencode {{root}} --model openrouter/{} --prompt \"$(cat {{prompt_file}})\"",
+        "opencode run --model openrouter/{} --dir {{root}} \"$(cat {{prompt_file}})\"",
         model
     ))
 }
