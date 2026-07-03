@@ -341,22 +341,10 @@ fn run_once(
                 explanation: _,
                 ticks,
             } => {
-                let launcher = match scenario.mode {
-                    ScenarioMode::Stub => launcher_override
-                        .map(str::to_string)
-                        .unwrap_or_else(default_stub_launcher),
-                    ScenarioMode::Interactive => launcher_override
-                        .map(str::to_string)
-                        .or_else(|| scenario.launcher.clone())
-                        .unwrap_or_default(),
-                };
+                let launcher = resolve_pump_launcher(scenario, launcher_override);
+                let override_arg = (!launcher.is_empty()).then_some(launcher.as_str());
                 for tick in 0..*ticks {
                     println!("[testing] pump tick {} of {}", tick + 1, ticks);
-                    let override_arg = if launcher.is_empty() {
-                        None
-                    } else {
-                        Some(launcher.as_str())
-                    };
                     crate::pump::tick(&ctx, override_arg)?;
                     if matches!(scenario.mode, ScenarioMode::Stub) {
                         wait_for_idle(&ctx, 40, std::time::Duration::from_millis(250))?;
@@ -377,21 +365,10 @@ fn run_once(
                 max_ticks,
                 idle_grace_ticks,
             } => {
-                let launcher = match scenario.mode {
-                    ScenarioMode::Stub => launcher_override
-                        .map(str::to_string)
-                        .unwrap_or_else(default_stub_launcher),
-                    ScenarioMode::Interactive => launcher_override
-                        .map(str::to_string)
-                        .or_else(|| scenario.launcher.clone())
-                        .unwrap_or_default(),
-                };
-                let override_arg = if launcher.is_empty() {
-                    None
-                } else {
-                    Some(launcher.as_str())
-                };
+                let launcher = resolve_pump_launcher(scenario, launcher_override);
+                let override_arg = (!launcher.is_empty()).then_some(launcher.as_str());
                 let mut idle_ticks = 0u32;
+                let mut quiesced = false;
                 for tick in 0..*max_ticks {
                     println!("[testing] pump watch tick {} of {}", tick + 1, max_ticks);
                     crate::pump::tick(&ctx, override_arg)?;
@@ -406,17 +383,26 @@ fn run_once(
                                 "[testing] swarm quiescent for {} consecutive tick(s); stopping watch loop",
                                 idle_ticks
                             );
+                            quiesced = true;
                             break;
                         }
                     } else {
                         idle_ticks = 0;
                     }
-                    std::thread::sleep(std::time::Duration::from_secs(*interval_s));
-                    if tick + 1 == *max_ticks {
-                        return Err(TrelaneError::msg(
-                            "pump watch exhausted max_ticks before the swarm became quiescent",
-                        ));
+                    // Don't sleep after the final tick -- nothing follows it.
+                    if tick + 1 < *max_ticks {
+                        std::thread::sleep(std::time::Duration::from_secs(*interval_s));
                     }
+                }
+                // Only a genuine failure if, after the whole budget, the swarm is
+                // still not quiescent. Reaching quiescence exactly on the final
+                // tick (before accumulating idle_grace_ticks consecutive idles)
+                // is success, not exhaustion -- the previous code erred here even
+                // when the swarm had actually settled.
+                if !quiesced && !swarm_quiescent(&ctx)? {
+                    return Err(TrelaneError::msg(
+                        "pump watch exhausted max_ticks before the swarm became quiescent",
+                    ));
                 }
             }
             ScenarioStep::ClaimExpectDenied {
@@ -582,6 +568,25 @@ fn default_stub_launcher() -> String {
         .unwrap_or_else(|_| "trelane --root {root} stub {agent}".to_string())
 }
 
+/// Resolve the launcher template a Pump/PumpWatch step should pass to
+/// `pump::tick`. In Stub mode we always fall back to the token-free stub
+/// launcher when nothing was explicitly provided. In Interactive mode we never
+/// force the stub -- an empty string means "no override", so `pump::tick` will
+/// fall through to each agent's own `launcher_agent` -> `launcher.profiles`
+/// resolution in `cmd_wake` (which is what lets different agents run under
+/// different real models). Returns an empty string to mean "no override".
+fn resolve_pump_launcher(scenario: &Scenario, launcher_override: Option<&str>) -> String {
+    match scenario.mode {
+        ScenarioMode::Stub => launcher_override
+            .map(str::to_string)
+            .unwrap_or_else(default_stub_launcher),
+        ScenarioMode::Interactive => launcher_override
+            .map(str::to_string)
+            .or_else(|| scenario.launcher.clone())
+            .unwrap_or_default(),
+    }
+}
+
 fn launch_interactive_tmux_supervisor(
     scenario_path: &Path,
     runs: u32,
@@ -602,7 +607,7 @@ fn launch_interactive_tmux_supervisor(
         .unwrap_or_else(|| std::env::temp_dir().join("trelane-testing"));
 
     let mut worker_cmd = vec![
-        format!("TRELANE_TESTING_WORKER=1"),
+        "TRELANE_TESTING_WORKER=1".to_string(),
         format!("TRELANE_TESTING_SESSION={}", shell_env_quote(&session_name)),
         shell_path_quote(&exe),
         "--testing".to_string(),
@@ -668,14 +673,15 @@ fn provision_interactive_tmux_layout(ctx: &Context, scenario: &Scenario) -> Resu
         .args(["select-pane", "-t", &controller_pane, "-T", "controller"])
         .status()?;
 
-    crate::splash::set_session_status_bar(&session_name, &scenario.name, true).ok();
-    crate::splash::bind_diagnostic_toggle(&session_name).ok();
-
+    // Write the per-session root marker BEFORE binding the diagnostic keys, since
+    // those bindings read it at trigger time.
     std::fs::write(
         format!("/tmp/trelane-{}-root", session_name),
         ctx.root.display().to_string(),
-    )
-    .ok();
+    )?;
+
+    crate::splash::set_session_status_bar(&session_name, &scenario.name, true)?;
+    crate::splash::bind_diagnostic_toggle(&session_name)?;
 
     let mut pane_ids = Vec::new();
     if !scenario.agents.is_empty() {
@@ -731,8 +737,7 @@ fn provision_interactive_tmux_layout(ctx: &Context, scenario: &Scenario) -> Resu
             &agent.name,
             "interactive test bootstrap",
             &ctx.root.display().to_string(),
-        )
-        .ok();
+        )?;
         commands::cmd_set_launch_target(ctx, &agent.name, "tmux", pane_id, None, None)?;
     }
 

@@ -36,11 +36,3 @@ pub const LOGO_SMALL: &str = r#"
 pub fn print_logo() {
     println!("{}", LOGO);
 }
-
-pub fn print_splash(agent: &str, reason: &str, root: &str) {
-    println!("\n{}", LOGO_SMALL);
-    println!("  Agent   : {}", agent);
-    println!("  Reason  : {}", reason);
-    println!("  Project : {}", root);
-    println!("  Status  : launching...\n");
-}

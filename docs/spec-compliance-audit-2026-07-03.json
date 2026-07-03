@@ -1,0 +1,451 @@
+{
+  "audit": {
+    "schema_version": "1.0",
+    "artifact_type": "spec_compliance_audit",
+    "project": "trelane",
+    "project_description": "Park-and-pump multi-agent coordination protocol (Rust, v0.2.1)",
+    "project_root": "/Users/jadennation/DEV/01_active_projects/trelane",
+    "audit_date": "2026-07-03",
+    "auditor": "Claude (Anthropic)",
+    "source_snapshot": {
+      "format": "soupify .soup.md bundle, uploaded to chat",
+      "source_files_reviewed": [
+        "Cargo.toml",
+        "Cargo.lock (dependency list only, not line-audited)",
+        "README.md",
+        "prompts/bootstrap.md",
+        "demo-rust.sh",
+        "install.sh",
+        ".env",
+        ".gitignore",
+        "src/cli.rs",
+        "src/commands.rs",
+        "src/crypto.rs",
+        "src/db.rs",
+        "src/domain.rs",
+        "src/error.rs",
+        "src/lib.rs",
+        "src/main.rs",
+        "src/models.rs",
+        "src/prompt.rs",
+        "src/pump.rs",
+        "src/store.rs",
+        "docs/terminal-relaunch.md"
+      ],
+      "feature_spec_files_reviewed": [
+        ".safe_pocket/c92b2eb092e7/FEATURES/00.md",
+        ".safe_pocket/c92b2eb092e7/FEATURES/dailies/2026_07_03_api.md",
+        ".safe_pocket/c92b2eb092e7/FEATURES/dailies/2026_07_03_baseline.md",
+        ".safe_pocket/c92b2eb092e7/FEATURES/dailies/2026_07_03_more.md",
+        ".safe_pocket/c92b2eb092e7/FEATURES/external/brainstorm_00.md"
+      ],
+      "excluded_as_non_requirement": {
+        "path": ".safe_pocket/c92b2eb092e7/FEATURES/00.md",
+        "reason": "empty placeholder template, contains no actionable requirement text"
+      }
+    },
+    "methodology": {
+      "static_trace": "Every source file read in full; every CLI command traced from clap definition (cli.rs) through lib.rs::handle() dispatch to its commands.rs implementation and store.rs persistence calls.",
+      "cross_reference_check": "grep-verified every `module::function()` call and every `config.field` access across all source files against their actual definitions. Zero dangling references found (no typos/missing functions that would fail to compile, no Config struct field mismatches).",
+      "compile_attempted": true,
+      "compile_result": "blocked - sandbox network allowlist does not include static.rust-lang.org, so `rustup toolchain install stable` could not fetch a toolchain. apt-get only provides rustc/cargo 1.75.0, but Cargo.toml declares `edition = \"2024\"` which requires Rust 1.85+ (also stated in the project's own README). Did not force-build with the mismatched 1.75 compiler to avoid reporting spurious edition/syntax errors that reflect the sandbox, not the code.",
+      "confidence": "High for structural/referential correctness and for feature-presence/absence claims (each is backed by a specific file+function citation). Not verified: type-checker/borrow-checker-level correctness, actual runtime behavior, concurrency correctness under real parallel load."
+    },
+    "verdict": {
+      "overall": "partial_compliance",
+      "summary": "The core coordination protocol (domains, claims, messaging, park/pump, attach-and-inject-AGENTS.md) is faithfully implemented and closely mirrors the design theorized in baseline.md and brainstorm_00.md, including the deadlock-breaking cycle-detection algorithm. Five distinct gaps were found: two explicit unbuilt features (terminal/GUI relaunch, test-harness automation), two partially-built features (domain reassignment, domain visibility), and one feature that is implemented but operationally disconnected from the rest of the system (model/agent selection)."
+    },
+    "requirements": [
+      {
+        "id": "api-01",
+        "source": "FEATURES/dailies/2026_07_03_api.md",
+        "requirement": "config.json should be able to set which agents are used by default",
+        "status": "implemented",
+        "evidence": [
+          "src/models.rs:AgentConfig.default",
+          "src/commands.rs:selected_agents()"
+        ]
+      },
+      {
+        "id": "api-02",
+        "source": "FEATURES/dailies/2026_07_03_api.md",
+        "requirement": "--agents / --no-agents flags to specify which models/agents are enabled per session, e.g. `trelane --agents \"claude-2, gpt-4, gpt-4-32k\" --no-agents \"gpt-3.5-turbo, gpt-3.5-turbo-16k\" .`",
+        "status": "implemented",
+        "evidence": [
+          "src/cli.rs:Cli.agents / Cli.no_agents (global args)",
+          "src/commands.rs:selected_agents(), cmd_attach_project()"
+        ],
+        "note": "syntax matches the spec's example verbatim; see gap 'model-selection-disconnected' for a caveat on what this flag actually affects downstream"
+      },
+      {
+        "id": "api-03",
+        "source": "FEATURES/dailies/2026_07_03_api.md",
+        "requirement": "launch a trelane session on an existing project folder; agents can read and write files there (like safe_pocket)",
+        "status": "implemented",
+        "evidence": [
+          "src/commands.rs:cmd_init(), cmd_attach_project()",
+          "src/domain.rs: per-agent writable globs enforced via CompiledDomain"
+        ]
+      },
+      {
+        "id": "api-04",
+        "source": "FEATURES/dailies/2026_07_03_api.md",
+        "requirement": "hook Trelane into already-running agents/sessions rather than being an entry point on its own, e.g. via injecting into local AGENTS.md — described in the source note as \"probably the most important feature to add to Trelane\"",
+        "status": "implemented",
+        "evidence": [
+          "src/commands.rs:inject_agents_md() writes an idempotent block between '<!-- BEGIN TRELANE -->' / '<!-- END TRELANE -->' markers",
+          "README.md:'Attach Mode' section"
+        ],
+        "priority_note": "source material calls this the most important feature; it is solidly built"
+      },
+      {
+        "id": "api-05",
+        "source": "FEATURES/dailies/2026_07_03_api.md",
+        "requirement": "terminal relaunch: identify open terminal tabs/windows by title and send input (incl. hitting Return) to relaunch GUI-embedded agents; research needed",
+        "status": "not_implemented",
+        "evidence": [
+          "docs/terminal-relaunch.md is research notes only (AppleScript/CLI snippets for Terminal.app, iTerm2, kitty, WezTerm, tmux) with no corresponding adapter code",
+          "src/cli.rs has no relaunch/adapter subcommand"
+        ],
+        "gap_ref": "gap-terminal-relaunch"
+      },
+      {
+        "id": "api-06",
+        "source": "FEATURES/dailies/2026_07_03_api.md",
+        "requirement": "account for various terminal emulators possibly having unique command inputs",
+        "status": "partial",
+        "evidence": [
+          "docs/terminal-relaunch.md catalogs Terminal.app/iTerm2/kitty/WezTerm/tmux quirks in prose, but none of it is codified"
+        ],
+        "gap_ref": "gap-terminal-relaunch"
+      },
+      {
+        "id": "baseline-01",
+        "source": "FEATURES/dailies/2026_07_03_baseline.md",
+        "requirement": "define what a 'Trelane session' is, including agents added mid-session that need to get up to speed and be detected by others",
+        "status": "implemented",
+        "evidence": [
+          "src/db.rs: agents + session_agents tables",
+          "src/pump.rs:wake_candidates() iterates store::list_agents() fresh every tick, so newly add-agent'd agents are auto-detected on the next pump tick",
+          "src/prompt.rs:compose_prompt() gives a newly-woken agent its full current domain/inbox/parked state"
+        ]
+      },
+      {
+        "id": "baseline-02",
+        "source": "FEATURES/dailies/2026_07_03_baseline.md",
+        "requirement": "use Rust, not Python, at /Users/jadennation/DEV/01_active_projects/trelane",
+        "status": "implemented",
+        "evidence": [
+          "Cargo.toml: name=\"trelane\", edition 2024",
+          "full src/*.rs implementation"
+        ]
+      },
+      {
+        "id": "baseline-03",
+        "source": "FEATURES/dailies/2026_07_03_baseline.md",
+        "requirement": "Domains: area of responsibility per agent (files/tasks/research area)",
+        "status": "implemented",
+        "evidence": [
+          "src/models.rs:Domain{writable, forbidden_write}",
+          "src/domain.rs:CompiledDomain::is_writable() (globset-based, forbidden overrides writable)"
+        ]
+      },
+      {
+        "id": "baseline-04",
+        "source": "FEATURES/dailies/2026_07_03_baseline.md",
+        "requirement": "Quest: agent working outside its domain needs permission from the domain owner",
+        "status": "implemented",
+        "evidence": [
+          "src/commands.rs:cmd_claim() denies cross-domain writes unless a claim-grant message id is presented via --grant",
+          "src/commands.rs:grant_covers()"
+        ]
+      },
+      {
+        "id": "baseline-05",
+        "source": "FEATURES/dailies/2026_07_03_baseline.md",
+        "requirement": "Action / no internal cron — agent checks state between actions, not on a timer",
+        "status": "implemented",
+        "evidence": [
+          "the external `trelane pump` process fills exactly this role, as theorized"
+        ]
+      },
+      {
+        "id": "baseline-06",
+        "source": "FEATURES/dailies/2026_07_03_baseline.md",
+        "requirement": "Shutdown is normal, not failure; agent cannot relaunch itself",
+        "status": "implemented",
+        "evidence": [
+          "src/commands.rs:cmd_done()",
+          "README.md:'Core inversion' / 'three invariants' section",
+          "src/prompt.rs:BOOTSTRAP_TEMPLATE exit checklist"
+        ]
+      },
+      {
+        "id": "baseline-07",
+        "source": "FEATURES/dailies/2026_07_03_baseline.md",
+        "requirement": "avoid deadlock via parking instead of waiting; a dumb pump does cycle detection and breaks ties (matches the 'three rules' in brainstorm_00.md nearly verbatim)",
+        "status": "implemented",
+        "evidence": [
+          "src/commands.rs:cmd_park()/cmd_unpark()",
+          "src/pump.rs:wait_graph(), dfs_cycle(), wake_candidates() (breaks ties via cycle.iter().min() = lexicographically-first agent, matching README's stated algorithm)"
+        ]
+      },
+      {
+        "id": "baseline-08",
+        "source": "FEATURES/dailies/2026_07_03_baseline.md",
+        "requirement": "Launch/Relaunch via a cron-like watcher checking agents' message queues/ledger",
+        "status": "implemented",
+        "evidence": [
+          "src/pump.rs:tick() — `trelane pump --once` (cron-friendly) or `--watch` (looping)"
+        ]
+      },
+      {
+        "id": "baseline-09",
+        "source": "FEATURES/dailies/2026_07_03_baseline.md",
+        "requirement": "for GUI-embedded agents, type directly into the terminal (incl. hitting Return) to relaunch them; needs research",
+        "status": "not_implemented",
+        "evidence": [
+          "same as api-05"
+        ],
+        "gap_ref": "gap-terminal-relaunch"
+      },
+      {
+        "id": "baseline-10",
+        "source": "FEATURES/dailies/2026_07_03_baseline.md",
+        "requirement": "messaging between agents with type/urgency/body fields",
+        "status": "implemented",
+        "evidence": [
+          "src/models.rs:Message, MSG_TYPES (question/answer/info/claim-request/claim-grant/claim-deny/handoff/system), URGENCIES (low/normal/high/critical)",
+          "src/crypto.rs: HMAC-SHA256 signing over canonical JSON"
+        ],
+        "note": "claim-deny and handoff types are defined and accepted by cmd_send but never produced by the stub agent or exercised by demo-rust.sh — only untested via the automated demo, not necessarily broken"
+      },
+      {
+        "id": "baseline-11",
+        "source": "FEATURES/dailies/2026_07_03_baseline.md",
+        "requirement": "domains are not permanent and can be shifted or replaced entirely during or between agent runs; shifting requires messaging between agents",
+        "status": "not_implemented",
+        "evidence": [
+          "src/cli.rs has no update-domain/redomain/set-domain command",
+          "src/commands.rs:cmd_add_agent() hard-errors 'agent already exists' if called twice",
+          "src/store.rs:insert_agent() is a plain INSERT, not an upsert"
+        ],
+        "gap_ref": "gap-domain-reassignment"
+      },
+      {
+        "id": "baseline-12",
+        "source": "FEATURES/dailies/2026_07_03_baseline.md",
+        "requirement": "agents should be able to review existing domain boundaries in the current session",
+        "status": "partial",
+        "evidence": [
+          "src/prompt.rs:compose_prompt() gives an agent its OWN domain via [[DOMAIN_JSON]]",
+          "src/commands.rs:cmd_status() lists agents/inbox/running-state but does NOT print any agent's writable/forbidden_write globs",
+          "other agents' domains are only discoverable indirectly, one path at a time, via a claim denial message"
+        ],
+        "gap_ref": "gap-domain-visibility"
+      },
+      {
+        "id": "more-01",
+        "source": "FEATURES/dailies/2026_07_03_more.md",
+        "requirement": "complex, thorough test harness: a somewhat complicated project testing two agents operating in individual domains with different message types passed between them",
+        "status": "partial",
+        "evidence": [
+          "demo-rust.sh sets up 2 agents (alpha/beta) with disjoint single-glob domains and one file each; exercises question/answer and claim-request/claim-grant flows",
+          "claim-deny, handoff, and system message types are not exercised by the demo"
+        ],
+        "gap_ref": "gap-test-harness"
+      },
+      {
+        "id": "more-02",
+        "source": "FEATURES/dailies/2026_07_03_more.md",
+        "requirement": "include dangerous deadlock-causing conditions to test that the relaunch script detects and resolves deadlocks",
+        "status": "implemented",
+        "evidence": [
+          "demo-rust.sh scenario C: manufactures a total deadlock (alpha waits on beta, beta waits on alpha), then shows the pump detect the cycle, wake the designated breaker, and resolve it"
+        ]
+      },
+      {
+        "id": "more-03",
+        "source": "FEATURES/dailies/2026_07_03_more.md",
+        "requirement": "run the test harness multiple times and generate a report of results per run, to see whether changes improve or worsen agent cooperation over time",
+        "status": "not_implemented",
+        "evidence": [
+          "demo-rust.sh is a single deterministic pass (`set -euo pipefail`); no repetition flag, no structured report output, no persisted run history"
+        ],
+        "gap_ref": "gap-test-harness"
+      },
+      {
+        "id": "more-04",
+        "source": "FEATURES/dailies/2026_07_03_more.md",
+        "requirement": "select low-cost AI models for testing so the harness can run repeatedly without high cost",
+        "status": "not_implemented",
+        "evidence": [
+          "demo-rust.sh uses `trelane stub`, a zero-token scripted fake agent, instead of any real (even cheap) AI model; no code path exercises real LLM behavior against the protocol"
+        ],
+        "gap_ref": "gap-test-harness"
+      },
+      {
+        "id": "more-05",
+        "source": "FEATURES/dailies/2026_07_03_more.md",
+        "requirement": "provide agents with a set of tasks to complete and measure their performance completing those tasks",
+        "status": "not_implemented",
+        "evidence": [
+          "src/commands.rs:cmd_stub() only auto-answers questions and auto-grants claims formulaically; it never performs or scores real work product",
+          "no task-assignment or scoring data model exists anywhere in src/"
+        ],
+        "gap_ref": "gap-test-harness"
+      },
+      {
+        "id": "cross-01",
+        "source": "inferred from FEATURES/dailies/2026_07_03_api.md example syntax + code tracing (not a literal quote)",
+        "requirement": "selected agents/models (--agents/--no-agents/config.json defaults) should actually govern which model an agent identity runs as and/or gate what the pump launches",
+        "status": "not_implemented / disconnected",
+        "evidence": [
+          "src/db.rs: `session_agents` table is entirely separate from the `agents` table used by add-agent/claim/send/park/wake/pump",
+          "src/commands.rs: `session_agents` is written only by cmd_attach_project (upsert_session_agent) and read only by cmd_status (display) — grep-confirmed zero references to session_agent(s) in pump.rs, and inject_agents_md() receives the enabled/disabled lists as plain function args rather than reading them back from the table",
+          "no code anywhere maps a domain-owning agent identity (e.g. 'frontend') to a specific enabled model"
+        ],
+        "gap_ref": "gap-model-selection-disconnected"
+      }
+    ],
+    "gaps": [
+      {
+        "id": "gap-terminal-relaunch",
+        "severity": "high",
+        "title": "GUI/terminal relaunch is unimplemented (research-only)",
+        "source_requirements": [
+          "api-05",
+          "api-06",
+          "baseline-09"
+        ],
+        "description": "Headless relaunch works (trelane pump spawns agents as subprocesses via the launcher template). Relaunching an agent that is running inside an already-open GUI terminal/TUI session does not: there is no code that identifies a terminal tab/window/pane and injects text + Enter into it.",
+        "evidence": [
+          "docs/terminal-relaunch.md covers Terminal.app (osascript), iTerm2 ('write text'), kitty ('kitty @ send-text'), WezTerm ('wezterm cli send-text'), and tmux ('send-keys'), each with example commands and limitations, and recommends implementation order tmux -> iTerm2 -> WezTerm -> kitty -> Terminal.app",
+          "the document's own closing line: 'For now, Trelane implements attachment by writing durable project instructions into AGENTS.md and recording enabled/disabled session agents. GUI relaunch should be added as adapter work after target identity storage is designed.'",
+          "src/cli.rs defines no relaunch/adapter subcommand"
+        ],
+        "recommendation": "Build the tmux adapter first per the doc's own recommendation (simplest, cross-terminal, CI-testable): a `trelane relaunch <agent> --adapter tmux --target <session:window>` command that stores the target identifier at attach/add-agent time and is invoked from pump.rs as an alternative launch path alongside the existing sh -c launcher-template path."
+      },
+      {
+        "id": "gap-domain-reassignment",
+        "severity": "medium",
+        "title": "No way to change an agent's domain after creation",
+        "source_requirements": [
+          "baseline-11"
+        ],
+        "description": "baseline.md explicitly frames domains as impermanent and shiftable during a session, but the CLI only supports creating a domain once. There is no update path.",
+        "evidence": [
+          "src/cli.rs: Command enum has AddAgent but no UpdateDomain/Redomain/SetDomain variant",
+          "src/commands.rs:cmd_add_agent() returns TrelaneError::msg(\"agent '{name}' already exists\") if the agent is already registered",
+          "src/store.rs:insert_agent() executes a plain `INSERT INTO agents` (no ON CONFLICT/REPLACE), so even bypassing the CLI check would hit a primary-key violation"
+        ],
+        "recommendation": "Add a `trelane redomain AGENT --writable GLOB [--desc TEXT]` command backed by an UPDATE (or DELETE+INSERT) in store.rs, and have it emit an `info`-type broadcast message to affected/overlapping agents per baseline.md's 'shifting domains requires messaging between all agents'."
+      },
+      {
+        "id": "gap-domain-visibility",
+        "severity": "low",
+        "title": "No command surfaces all agents' domains together",
+        "source_requirements": [
+          "baseline-12"
+        ],
+        "description": "An agent can see its own writable/forbidden globs (substituted into its bootstrap prompt), but there is no way to see the whole swarm's domain map at once; other agents' domains are only inferable one file at a time via a claim-denial error message.",
+        "evidence": [
+          "src/commands.rs:cmd_status() prints agent name / running state / inbox count / session agents / parked tasks / claims / deadlock cycle, but never each agent's writable/forbidden_write globs"
+        ],
+        "recommendation": "Cheap fix: have cmd_status() also print each agent's writable globs (store::get_domain() is already available and used elsewhere)."
+      },
+      {
+        "id": "gap-test-harness",
+        "severity": "high",
+        "title": "Test harness covers protocol mechanics but not repeatability, real models, or task performance",
+        "source_requirements": [
+          "more-01",
+          "more-03",
+          "more-04",
+          "more-05"
+        ],
+        "description": "demo-rust.sh is a genuine, working single-shot smoke test (including a real manufactured-and-resolved deadlock), but more.md asked for a repeatable, report-generating harness that runs real (low-cost) AI models against measurable tasks — none of that exists.",
+        "evidence": [
+          "demo-rust.sh has no loop/repeat flag, no report file output, and no persisted run-to-run history",
+          "demo-rust.sh uses `trelane stub` (src/commands.rs:cmd_stub) — a zero-token scripted agent — never a real model",
+          "no data model anywhere for assigning agents concrete tasks or scoring completion quality"
+        ],
+        "additional_note": "src/pump.rs's cycle-detection algorithm (wait_graph/dfs_cycle) — arguably the single most safety-critical piece of the protocol — has zero #[test] coverage, and neither does src/store.rs. Existing unit tests (13 total) are in src/crypto.rs (6), src/domain.rs (5), src/commands.rs (2) only. All confidence in the deadlock-breaking guarantee currently rests on the one manual demo-rust.sh run.",
+        "recommendation": "Short term: add #[test] cases for wait_graph/dfs_cycle (multi-node cycles, no-cycle case, cycle-among-non-running-agents-only). Longer term: wrap demo-rust.sh with a --repeat N and a JSON/CSV results emitter, and add an opt-in scenario that swaps the stub launcher for a real low-cost-model launcher template against a small fixed task list with pass/fail criteria."
+      },
+      {
+        "id": "gap-model-selection-disconnected",
+        "severity": "medium",
+        "title": "--agents/--no-agents/config.json default-agents selection is display-only, not operational",
+        "source_requirements": [
+          "cross-01"
+        ],
+        "description": "The CLI syntax and config schema for selecting which models/agents are enabled per session match FEATURES/dailies/2026_07_03_api.md's example exactly, but tracing the data flow shows the selection is never consulted by anything that actually launches or gates an agent.",
+        "evidence": [
+          "src/db.rs: `session_agents` table is structurally separate from the `agents` table (the one add-agent/claim/send/park/wake/pump operate on) with no foreign key or join between them",
+          "grep across src/*.rs: session_agents is written only in src/commands.rs:cmd_attach_project() (via store::upsert_session_agent) and read only in src/commands.rs:cmd_status() (for display) and indirectly copied into the AGENTS.md text by inject_agents_md()",
+          "src/pump.rs contains zero references to session_agents, selected_agents, or AgentConfig — the wake/launch path is entirely unaware of which models were enabled/disabled"
+        ],
+        "recommendation": "Decide the intended scope: either (a) wire session_agents into cmd_add_agent validation and/or the launcher-template substitution so 'disabled' models genuinely cannot be woken, or (b) if it's meant to stay purely informational (a note to whichever human/AI reads AGENTS.md), document that explicitly in README.md's 'Attach Mode' section so it isn't mistaken for enforcement."
+      }
+    ],
+    "minor_issues": [
+      {
+        "id": "stale-bootstrap-doc",
+        "title": "prompts/bootstrap.md at the project root is a stale duplicate",
+        "description": "The checked-in prompts/bootstrap.md still instructs agents to run `python3 swarmctl.py <command>` and references a `.swarm/` directory — leftovers from before this became the Rust `trelane` CLI. The actual runtime template is the BOOTSTRAP_TEMPLATE constant in src/prompt.rs, which correctly uses `trelane <command>` / `.trelane/`, and is what cmd_init() writes to .trelane/prompts/bootstrap.md and what compose_prompt() actually sends to agents.",
+        "impact": "no functional bug (nothing in src/ reads the root-level file), but it will mislead a future contributor who opens it expecting it to be current",
+        "evidence": [
+          "prompts/bootstrap.md line ~9: 'python3 swarmctl.py <command> ...'",
+          "src/prompt.rs:BOOTSTRAP_TEMPLATE line ~10: 'trelane <command> ...'"
+        ],
+        "recommendation": "Delete prompts/bootstrap.md from the repo root, or replace it with a comment pointing to src/prompt.rs as the source of truth, or have cmd_init() write from a shared template file instead of duplicating the string as a Rust constant."
+      },
+      {
+        "id": "unused-env-var",
+        "title": ".env's SPOCKET_ROOT is unreferenced",
+        "description": "`.env` sets SPOCKET_ROOT=/Users/jadennation/.safe_pocket/c92b2eb092e7 but no src/*.rs file reads it (grep-confirmed).",
+        "impact": "cosmetic; likely a leftover dev convenience variable",
+        "evidence": [
+          ".env: SPOCKET_ROOT=..."
+        ]
+      },
+      {
+        "id": "dead-code-get-all-messages",
+        "title": "store::get_all_messages_for_agent is defined but never called",
+        "description": "Looks like scaffolding for a future 'message history' command (as opposed to get_unprocessed_messages, which is used everywhere) that doesn't exist yet in cli.rs.",
+        "impact": "none functionally; flagged for awareness only",
+        "evidence": [
+          "src/store.rs:get_all_messages_for_agent()"
+        ]
+      }
+    ],
+    "recommended_priority": [
+      {
+        "rank": 1,
+        "gap_ref": "gap-domain-reassignment",
+        "reason": "small surface area; baseline.md treats domain shifting as core to the model, not optional"
+      },
+      {
+        "rank": 2,
+        "gap_ref": "gap-model-selection-disconnected",
+        "reason": "cheap to resolve either direction (wire it up or document it as informational), but leaving it ambiguous risks someone relying on 'disabled' models actually being blocked when they aren't"
+      },
+      {
+        "rank": 3,
+        "gap_ref": "gap-domain-visibility",
+        "reason": "cheap win — store::get_domain() already exists and is used elsewhere; just needs to be added to cmd_status() output"
+      },
+      {
+        "rank": 4,
+        "gap_ref": "gap-terminal-relaunch",
+        "reason": "largest remaining greenfield feature; doc's own recommended order (tmux first) is a reasonable starting scope"
+      },
+      {
+        "rank": 5,
+        "gap_ref": "gap-test-harness",
+        "reason": "largest remaining greenfield feature; start with unit tests for pump.rs::wait_graph/dfs_cycle before building out the full repeat+report+real-model harness"
+      }
+    ]
+  }
+}
