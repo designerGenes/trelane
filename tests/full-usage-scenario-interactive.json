@@ -1,6 +1,6 @@
 {
   "name": "full-usage-scenario-interactive",
-  "description": "Interactive multi-agent scenario intended for real tmux-managed agents rather than the stub harness. Requires low-cost launcher profiles such as Claude Haiku or GPT-5 mini and keeps the pump alive until the swarm settles.",
+  "description": "Interactive multi-agent scenario intended for real tmux-managed agents rather than the stub harness. Requires low-cost launcher profiles such as Claude Haiku or GPT-5 mini. Trelane creates the tmux testing session and agent panes automatically and keeps the pump alive until the swarm settles.",
   "mode": "interactive",
   "project": {
     "files": [
@@ -24,31 +24,19 @@
       "description": "Owns UI implementation",
       "writable": ["src/ui/**", "design/**"],
       "forbidden_write": ["src/ui/secrets/**"],
-      "launcher_agent": "claude-haiku",
-      "launch_target": {
-        "adapter": "tmux",
-        "target": "trelane-frontend"
-      }
+      "launcher_agent": "claude-haiku"
     },
     {
       "name": "backend",
       "description": "Owns API implementation",
       "writable": ["src/api/**"],
-      "launcher_agent": "gpt-5-mini",
-      "launch_target": {
-        "adapter": "tmux",
-        "target": "trelane-backend"
-      }
+      "launcher_agent": "gpt-5-mini"
     },
     {
       "name": "research",
       "description": "Owns research and notes",
       "writable": ["research/**", "docs/briefs/**"],
-      "launcher_agent": "claude-haiku",
-      "launch_target": {
-        "adapter": "tmux",
-        "target": "trelane-research"
-      }
+      "launcher_agent": "claude-haiku"
     }
   ],
   "steps": [
@@ -77,11 +65,110 @@
       "ticks": 2
     },
     {
+      "type": "ClaimExpectDenied",
+      "explanation": "Backend should not be allowed to claim a frontend-owned UI file without a grant.",
+      "agent": "backend",
+      "path": "src/ui/app.ts"
+    },
+    {
+      "type": "Send",
+      "explanation": "Backend requests permission to temporarily cross domains for a shared import update.",
+      "from": "backend",
+      "to": "frontend",
+      "msg_type": "claim-request",
+      "subject": "Need UI file for API import update",
+      "body": "Please grant a temporary claim for src/ui/app.ts.",
+      "paths": ["src/ui/app.ts"],
+      "save_as": "ui-claim-request"
+    },
+    {
+      "type": "Park",
+      "explanation": "Backend parks until frontend grants the contested claim.",
+      "agent": "backend",
+      "task": "task-fix-import",
+      "wait_reply_ref": "ui-claim-request",
+      "waiting_on": "frontend",
+      "resume_hint": "Use the grant to update the shared import."
+    },
+    {
+      "type": "Pump",
+      "explanation": "Wake frontend to grant the claim, then backend to act on it.",
+      "ticks": 2
+    },
+    {
+      "type": "Redomain",
+      "explanation": "Research expands its writable scope to include UI copy review, simulating a mid-session domain shift.",
+      "agent": "research",
+      "writable": ["research/**", "src/ui/**"],
+      "desc": "Expands into UI copy review after cross-team agreement."
+    },
+    {
+      "type": "Send",
+      "explanation": "Research informs frontend that the domain shift happened so all agents have the same mental model.",
+      "from": "research",
+      "to": "frontend",
+      "msg_type": "info",
+      "subject": "Research expanding into UI copy review",
+      "body": "I have shifted domain to include src/ui/** for copy review and text updates."
+    },
+    {
+      "type": "Pump",
+      "explanation": "Wake any agent with inbox work created by the domain-shift broadcast.",
+      "ticks": 1
+    },
+    {
+      "type": "Send",
+      "explanation": "Create a real parked-task cycle: frontend waits on backend and backend waits on frontend with no natural reply coming.",
+      "from": "frontend",
+      "to": "backend",
+      "msg_type": "info",
+      "subject": "deadlock seed one",
+      "body": "This is a seed message for the deadlock test.",
+      "save_as": "deadlock-seed-1"
+    },
+    {
+      "type": "Send",
+      "explanation": "Mirror the seed in the opposite direction so each side can park on the other.",
+      "from": "backend",
+      "to": "frontend",
+      "msg_type": "info",
+      "subject": "deadlock seed two",
+      "body": "This is the counterpart seed message for the deadlock test.",
+      "save_as": "deadlock-seed-2"
+    },
+    {
+      "type": "Park",
+      "explanation": "Frontend parks on backend's seed message so it appears blocked on backend.",
+      "agent": "frontend",
+      "task": "task-deadlock-frontend",
+      "wait_reply_ref": "deadlock-seed-1",
+      "waiting_on": "backend",
+      "resume_hint": "Break the cycle with a documented assumption if designated."
+    },
+    {
+      "type": "Park",
+      "explanation": "Backend parks on frontend's seed message so it appears blocked on frontend.",
+      "agent": "backend",
+      "task": "task-deadlock-backend",
+      "wait_reply_ref": "deadlock-seed-2",
+      "waiting_on": "frontend",
+      "resume_hint": "Break the cycle with a documented assumption if designated."
+    },
+    {
       "type": "PumpWatch",
-      "explanation": "Keep the tmux-first swarm alive until all agents have drained their work and the session goes quiet.",
+      "explanation": "Keep the tmux-first swarm alive until all agents have drained their work, resolved the deadlock, and the session goes quiet.",
       "interval_s": 5,
       "max_ticks": 180,
       "idle_grace_ticks": 3
+    },
+    {
+      "type": "AssertParkedCount",
+      "explanation": "After the deadlock breaker path runs, no parked tasks should remain.",
+      "count": 0
+    },
+    {
+      "type": "AssertNoDeadlock",
+      "explanation": "The scenario should end without any residual wait-cycle in the ledger."
     }
   ],
   "metrics": [

@@ -4,6 +4,7 @@ use crate::crypto;
 use crate::error::{Result, TrelaneError};
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::IsTerminal;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,8 +42,6 @@ pub struct ScenarioAgent {
     pub forbidden_write: Vec<String>,
     #[serde(default)]
     pub launcher_agent: Option<String>,
-    #[serde(default)]
-    pub launch_target: Option<ScenarioLaunchTarget>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -51,16 +50,6 @@ pub enum ScenarioMode {
     #[default]
     Stub,
     Interactive,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScenarioLaunchTarget {
-    pub adapter: String,
-    pub target: String,
-    #[serde(default)]
-    pub command: Option<String>,
-    #[serde(default)]
-    pub tmux_target: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +152,18 @@ pub fn run_testing(
     launcher_override: Option<&str>,
 ) -> Result<()> {
     let scenario = load_scenario(scenario_path)?;
+    if matches!(scenario.mode, ScenarioMode::Interactive)
+        && std::env::var("TRELANE_TESTING_WORKER").ok().as_deref() != Some("1")
+    {
+        return launch_interactive_tmux_supervisor(
+            scenario_path,
+            runs,
+            report_path,
+            sandbox_root,
+            launcher_override,
+        );
+    }
+
     let report_path = report_path
         .map(Path::to_path_buf)
         .unwrap_or_else(|| scenario_path.with_extension("report.jsonl"));
@@ -259,20 +260,11 @@ fn run_once(
                 &crypto::now_iso(),
             )?;
         }
-        if let Some(target) = &agent.launch_target {
-            commands::cmd_set_launch_target(
-                &ctx,
-                &agent.name,
-                &target.adapter,
-                &target.target,
-                target.command.as_deref(),
-                target.tmux_target.as_deref(),
-            )?;
-        }
     }
 
     if matches!(scenario.mode, ScenarioMode::Interactive) {
         validate_interactive_setup(&ctx, scenario)?;
+        provision_interactive_tmux_layout(&ctx, scenario)?;
     }
 
     let started_at = chrono::Utc::now();
@@ -576,6 +568,120 @@ fn default_stub_launcher() -> String {
         .unwrap_or_else(|_| "trelane --root {root} stub {agent}".to_string())
 }
 
+fn launch_interactive_tmux_supervisor(
+    scenario_path: &Path,
+    runs: u32,
+    report_path: Option<&Path>,
+    sandbox_root: Option<&Path>,
+    launcher_override: Option<&str>,
+) -> Result<()> {
+    let session_name = format!(
+        "trelane-testing-{}",
+        chrono::Utc::now().format("%Y%m%d%H%M%S")
+    );
+    let exe = std::env::current_exe()?;
+    let report_path = report_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| scenario_path.with_extension("report.jsonl"));
+    let sandbox_root = sandbox_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::temp_dir().join("trelane-testing"));
+
+    let mut worker_cmd = vec![
+        format!("TRELANE_TESTING_WORKER=1"),
+        format!("TRELANE_TESTING_SESSION={}", shell_env_quote(&session_name)),
+        shell_path_quote(&exe),
+        "--testing".to_string(),
+        shell_path_quote(scenario_path),
+        "--testing-runs".to_string(),
+        runs.max(1).to_string(),
+        "--testing-report".to_string(),
+        shell_path_quote(&report_path),
+        "--testing-sandbox-root".to_string(),
+        shell_path_quote(&sandbox_root),
+    ];
+    if let Some(launcher) = launcher_override {
+        worker_cmd.push("--testing-launcher".to_string());
+        worker_cmd.push(shell_env_quote(launcher));
+    }
+    let worker_cmd = worker_cmd.join(" ");
+
+    let create = std::process::Command::new("tmux")
+        .args(["new-session", "-d", "-s", &session_name, &worker_cmd])
+        .status()?;
+    if !create.success() {
+        return Err(TrelaneError::msg(format!(
+            "failed to create tmux testing session '{session_name}'"
+        )));
+    }
+
+    if std::io::stdout().is_terminal() {
+        let attach = std::process::Command::new("tmux")
+            .args(["attach-session", "-t", &session_name])
+            .status()?;
+        if !attach.success() {
+            return Err(TrelaneError::msg(format!(
+                "failed to attach to tmux testing session '{session_name}'"
+            )));
+        }
+    } else {
+        println!("interactive tmux session created: {session_name}");
+        println!("attach with: tmux attach-session -t {session_name}");
+    }
+
+    Ok(())
+}
+
+fn shell_path_quote(path: &Path) -> String {
+    shell_env_quote(&path.display().to_string())
+}
+
+fn shell_env_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn provision_interactive_tmux_layout(ctx: &Context, scenario: &Scenario) -> Result<()> {
+    let session_name = std::env::var("TRELANE_TESTING_SESSION").map_err(|_| {
+        TrelaneError::msg("interactive testing worker missing TRELANE_TESTING_SESSION")
+    })?;
+    let controller_pane = std::env::var("TMUX_PANE")
+        .map_err(|_| TrelaneError::msg("interactive testing worker must run inside tmux"))?;
+
+    std::process::Command::new("tmux")
+        .args(["rename-window", "-t", &session_name, &scenario.name])
+        .status()?;
+
+    let mut pane_ids = Vec::new();
+    for _ in &scenario.agents {
+        let output = std::process::Command::new("tmux")
+            .args([
+                "split-window",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-t",
+                &controller_pane,
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(TrelaneError::msg(
+                "failed to create tmux pane for interactive scenario",
+            ));
+        }
+        pane_ids.push(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    }
+    std::process::Command::new("tmux")
+        .args(["select-layout", "-t", &session_name, "tiled"])
+        .status()?;
+
+    for (agent, pane_id) in scenario.agents.iter().zip(pane_ids.iter()) {
+        commands::cmd_set_launch_target(ctx, &agent.name, "tmux", pane_id, None, None)?;
+    }
+
+    Ok(())
+}
+
 fn validate_interactive_setup(ctx: &Context, scenario: &Scenario) -> Result<()> {
     for agent in &scenario.agents {
         let launcher_agent = agent.launcher_agent.as_deref().ok_or_else(|| {
@@ -609,24 +715,7 @@ fn validate_interactive_setup(ctx: &Context, scenario: &Scenario) -> Result<()> 
             )));
         }
 
-        let launch_target = agent.launch_target.as_ref().ok_or_else(|| {
-            TrelaneError::msg(format!(
-                "interactive scenario agent '{}' is missing a launch_target",
-                agent.name
-            ))
-        })?;
-
-        let tmux_target = if launch_target.adapter == "tmux" {
-            launch_target.target.as_str()
-        } else {
-            launch_target.tmux_target.as_deref().ok_or_else(|| {
-                TrelaneError::msg(format!(
-                    "interactive scenario agent '{}' needs launch_target.tmux_target for terminal-backed testing",
-                    agent.name
-                ))
-            })?
-        };
-        crate::commands::ensure_tmux_target(tmux_target)?;
+        crate::commands::ensure_tmux_target(&format!("trelane-{}", agent.name))?;
     }
 
     Ok(())
