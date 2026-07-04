@@ -7,3 +7,4 @@ AGENTS.md
 CLAUDE.md
 copilot-instructions.md
 tests/*.report.jsonl
+*.db
