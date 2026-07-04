@@ -290,4 +290,20 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+
+    /// Show aggregate metrics from OpenTelemetry traces
+    Metrics {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Rate another agent's run (inter-agent consensus)
+    Rate {
+        agent: String,
+        rating: u8,
+        #[arg(long)]
+        rationale: String,
+        #[arg(long)]
+        rater: String,
+    },
 }

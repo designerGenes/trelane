@@ -12,6 +12,7 @@ pub mod prop;
 pub mod pump;
 pub mod splash;
 pub mod store;
+pub mod telemetry;
 pub mod testing;
 
 use crate::cli::{Cli, Command};
@@ -696,5 +697,125 @@ pub fn handle(cli: Cli) -> Result<()> {
                 std::thread::sleep(std::time::Duration::from_secs(interval_s));
             }
         }
+        Some(Command::Metrics { json }) => {
+            let ctx = Context::open(cli.root.as_deref())?;
+            let trace_dir = telemetry::trace_dir_for(&ctx.trelane_dir());
+            let metrics = telemetry::compute_metrics(&trace_dir)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&metrics)?);
+            } else {
+                print_metrics(&metrics);
+            }
+            Ok(())
+        }
+        Some(Command::Rate {
+            agent,
+            rating,
+            rationale,
+            rater,
+        }) => {
+            let ctx = Context::open(cli.root.as_deref())?;
+            let tracer =
+                telemetry::Tracer::ephemeral(&ctx.trelane_dir(), &ctx.root.display().to_string())?;
+            // Find the most recent agent.run span for the rated agent
+            let trace_dir = telemetry::trace_dir_for(&ctx.trelane_dir());
+            let spans = telemetry::Tracer::read_all_spans(&trace_dir)?;
+            let last_run = spans
+                .iter()
+                .filter(|s| s.name == format!("agent.run:{agent}"))
+                .max_by_key(|s| s.start_time_unix_nano);
+            let run_span_id = last_run.map(|s| s.span_id.clone()).unwrap_or_default();
+            tracer.record_rating(&rater, &agent, &run_span_id, rating, &rationale)?;
+            println!("rating recorded: {rater} rated {agent} = {rating}/10");
+            Ok(())
+        }
     }
+}
+
+fn print_metrics(m: &telemetry::MetricsSummary) {
+    use std::fmt::Write as _;
+    println!();
+    crate::logo::print_logo();
+    println!("  Trelane Metrics Summary");
+    println!("  ========================");
+    println!();
+
+    let fmt_ms = |ms: u64| -> String {
+        if ms < 1000 {
+            format!("{ms}ms")
+        } else if ms < 60_000 {
+            format!("{:.1}s", ms as f64 / 1000.0)
+        } else {
+            format!("{:.1}m", ms as f64 / 60_000.0)
+        }
+    };
+
+    println!("  Overview:");
+    println!("    Total agent runs      : {}", m.total_runs);
+    println!("    Total wait events     : {}", m.total_wait_events);
+    println!("    Total prop ticks      : {}", m.total_prop_ticks);
+    println!(
+        "    Total run time        : {}",
+        fmt_ms(m.total_run_duration_ms)
+    );
+    println!(
+        "    Total wait time       : {}",
+        fmt_ms(m.total_wait_duration_ms)
+    );
+    println!(
+        "    Avg run duration      : {}",
+        fmt_ms(m.avg_run_duration_ms as u64)
+    );
+    println!(
+        "    Avg wait duration     : {}",
+        fmt_ms(m.avg_wait_duration_ms as u64)
+    );
+    println!(
+        "    Efficiency ratio      : {:.1}% (run / (run+wait))",
+        m.efficiency_ratio * 100.0
+    );
+    println!();
+
+    println!("  Code Production:");
+    println!("    Files changed         : {}", m.total_files_changed);
+    println!("    Lines added           : {}", m.total_lines_added);
+    println!("    Lines removed         : {}", m.total_lines_removed);
+    println!("    Messages processed    : {}", m.total_messages_processed);
+    println!("    Messages sent         : {}", m.total_messages_sent);
+    println!("    Deadlocks detected    : {}", m.total_deadlocks_detected);
+    println!();
+
+    if m.total_run_duration_ms > 0 {
+        let lines_per_min =
+            m.total_lines_added as f64 / (m.total_run_duration_ms as f64 / 60_000.0);
+        println!("    Lines/min (added)     : {lines_per_min:.1}");
+    }
+
+    println!();
+    println!("  Per-Agent Breakdown:");
+    println!(
+        "    {:<16} {:>5} {:>5} {:>8} {:>8} {:>6} {:>6} {:>6} {:>6}",
+        "Agent", "Runs", "Waits", "RunTime", "WaitTime", "Files", "Add", "Del", "Rating"
+    );
+    for a in &m.per_agent {
+        let rating = a
+            .avg_rating
+            .map(|r| format!("{r:.1}"))
+            .unwrap_or("-".to_string());
+        println!(
+            "    {:<16} {:>5} {:>5} {:>8} {:>8} {:>6} {:>6} {:>6} {:>6}",
+            a.agent,
+            a.runs,
+            a.wait_events,
+            fmt_ms(a.run_duration_ms),
+            fmt_ms(a.wait_duration_ms),
+            a.files_changed,
+            a.lines_added,
+            a.lines_removed,
+            rating
+        );
+    }
+    println!();
+
+    let _ = write!(String::new(), ""); // suppress unused import warning
 }

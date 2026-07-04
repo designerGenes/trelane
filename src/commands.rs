@@ -938,7 +938,7 @@ pub fn cmd_park(
     let entry = ParkedTask {
         task: task_id.clone(),
         agent: agent.to_string(),
-        wait_type,
+        wait_type: wait_type.clone(),
         wait_re,
         wait_path,
         waiting_on: waiting_on.to_string(),
@@ -946,6 +946,24 @@ pub fn cmd_park(
         created_at: crypto::now_iso(),
     };
     store::insert_parked_task(&ctx.conn, &entry)?;
+
+    // Write park metadata for telemetry (read by cmd_unpark).
+    let park_meta = ctx
+        .trelane_dir()
+        .join("agents")
+        .join(agent)
+        .join("park.json");
+    if let Some(parent) = park_meta.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let park_data = serde_json::json!({
+        "parked_at_ns": crate::telemetry::now_nanos(),
+        "task_id": task_id,
+        "wait_type": wait_type,
+        "waiting_on": waiting_on,
+    });
+    let _ = std::fs::write(&park_meta, serde_json::to_string(&park_data)?);
+
     println!("{task_id}");
     Ok(())
 }
@@ -953,7 +971,53 @@ pub fn cmd_park(
 // ---------------------------------------------------------------- unpark
 
 pub fn cmd_unpark(ctx: &Context, task: &str) -> Result<()> {
+    // Read park metadata for telemetry before deleting.
+    let park_meta = ctx.trelane_dir().join("agents").join("park.json");
+
     store::delete_parked_task(&ctx.conn, task)?;
+
+    // Record wait span if we have park metadata.
+    if park_meta.exists()
+        && let Ok(text) = std::fs::read_to_string(&park_meta)
+        && let Ok(data) = serde_json::from_str::<serde_json::Value>(&text)
+    {
+        let parked_ns = data["parked_at_ns"].as_u64().unwrap_or(0);
+        let agent = data.get("agent").and_then(|v| v.as_str()).unwrap_or("");
+        let wait_type = data["wait_type"].as_str().unwrap_or("unknown");
+        let waiting_on = data["waiting_on"].as_str().unwrap_or("unknown");
+        let now_ns = crate::telemetry::now_nanos();
+
+        // Find which agent's park.json this is by searching agents dir.
+        let agents_dir = ctx.trelane_dir().join("agents");
+        let mut found_agent = String::new();
+        if let Ok(entries) = std::fs::read_dir(&agents_dir) {
+            for entry in entries.flatten() {
+                let candidate = entry.path().join("park.json");
+                if candidate == park_meta {
+                    found_agent = entry.file_name().to_string_lossy().to_string();
+                    break;
+                }
+            }
+        }
+        let agent_name = if found_agent.is_empty() {
+            agent
+        } else {
+            found_agent.as_str()
+        };
+
+        if !agent_name.is_empty()
+            && let Ok(tracer) = crate::telemetry::Tracer::ephemeral(
+                &ctx.trelane_dir(),
+                &ctx.root.display().to_string(),
+            )
+        {
+            let _ = tracer.record_agent_wait(
+                agent_name, task, waiting_on, wait_type, parked_ns, now_ns, true,
+            );
+        }
+        let _ = std::fs::remove_file(&park_meta);
+    }
+
     println!("unparked {task}");
     Ok(())
 }
@@ -1080,9 +1144,27 @@ pub fn cmd_wake(
     let prompt_text = prompt::compose_prompt(&ctx.conn, &ctx.root, agent, reason)?;
     let prompt_file = prompt::write_prompt_file(&ctx.trelane_dir(), agent, &prompt_text)?;
 
-    if let Some(dirty) = git_dirty(&ctx.root) {
-        store::save_audit_baseline(&ctx.conn, agent, &dirty)?;
+    // Record the git baseline before the run for diff computation on done.
+    let baseline = git_dirty(&ctx.root);
+    if let Some(ref dirty) = baseline {
+        store::save_audit_baseline(&ctx.conn, agent, dirty)?;
     }
+
+    // Write wake metadata for telemetry (read by cmd_done).
+    let wake_meta = ctx
+        .trelane_dir()
+        .join("agents")
+        .join(agent)
+        .join("wake.json");
+    if let Some(parent) = wake_meta.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let wake_data = serde_json::json!({
+        "started_at_ns": crate::telemetry::now_nanos(),
+        "started_at_iso": crypto::now_iso(),
+        "reason": reason,
+    });
+    std::fs::write(&wake_meta, serde_json::to_string(&wake_data)?)?;
 
     if launcher_override.is_none()
         && let Some(target) = store::get_launch_target(&ctx.conn, agent)?
@@ -1279,6 +1361,38 @@ pub fn cmd_relaunch(
 
 pub fn cmd_done(ctx: &Context, agent: &str) -> Result<()> {
     store::delete_running_lock(&ctx.conn, agent)?;
+
+    // Record telemetry: read wake metadata, compute diff, emit span.
+    let wake_meta = ctx
+        .trelane_dir()
+        .join("agents")
+        .join(agent)
+        .join("wake.json");
+    if wake_meta.exists()
+        && let Ok(text) = std::fs::read_to_string(&wake_meta)
+        && let Ok(data) = serde_json::from_str::<serde_json::Value>(&text)
+    {
+        let started_ns = data["started_at_ns"].as_u64().unwrap_or(0);
+        let reason = data["reason"].as_str().unwrap_or("unknown");
+        let now_ns = crate::telemetry::now_nanos();
+        let (files, added, removed) = crate::telemetry::git_diff_stats(&ctx.root);
+
+        let msg_proc = crate::store::get_unprocessed_messages(&ctx.conn, agent)
+            .unwrap_or_default()
+            .len();
+        let msg_sent = 0;
+
+        if let Ok(tracer) =
+            crate::telemetry::Tracer::ephemeral(&ctx.trelane_dir(), &ctx.root.display().to_string())
+        {
+            let _ = tracer.record_agent_run(
+                agent, reason, started_ns, now_ns, files, added, removed, msg_proc, msg_sent,
+                "done",
+            );
+        }
+        let _ = std::fs::remove_file(&wake_meta);
+    }
+
     println!("{agent} marked done");
     Ok(())
 }
