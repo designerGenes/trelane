@@ -202,7 +202,7 @@ pub fn cmd_init(project: Option<PathBuf>) -> Result<()> {
 
     std::fs::write(
         trelane_dir.join(".gitignore"),
-        "secret\nagents/*/.prompt.md\nagents/*/logs/\npump.log\n*.db-wal\n*.db-shm\n",
+        "secret\nagents/*/.prompt.md\nagents/*/logs/\nprop.log\npump.log\n*.db-wal\n*.db-shm\n",
     )?;
 
     let db_path = trelane_dir.join("trelane.db");
@@ -303,6 +303,19 @@ fn list_or_none(items: &[String]) -> String {
 
 fn is_agent_enabled(ctx: &Context, agent: &str) -> Result<bool> {
     Ok(store::session_agent_enabled(&ctx.conn, agent)?.unwrap_or(true))
+}
+
+/// Agents whose launcher mapping is enabled for this session, i.e. agents
+/// that `cmd_wake` would not refuse. Launch uses this so frames are only
+/// provisioned for agents that can actually run.
+pub fn launch_enabled_agents(ctx: &Context) -> Result<Vec<String>> {
+    let mut enabled = Vec::new();
+    for agent in store::list_agents(&ctx.conn)? {
+        if domain_launch_enabled(ctx, &agent)? {
+            enabled.push(agent);
+        }
+    }
+    Ok(enabled)
 }
 
 fn domain_launch_enabled(ctx: &Context, domain_agent: &str) -> Result<bool> {
@@ -1031,7 +1044,7 @@ pub fn cmd_status(ctx: &Context) -> Result<()> {
         println!("  {}  held by {} until {exp}", l.path, l.holder);
     }
 
-    let (_, cycle) = crate::pump::wait_graph(&ctx.conn)?;
+    let (_, cycle) = crate::prop::wait_graph(&ctx.conn)?;
     if let Some(cycle) = cycle {
         let mut display = cycle.clone();
         display.push(cycle[0].clone());
@@ -1129,7 +1142,7 @@ pub fn cmd_wake(
         let inserted =
             store::insert_running_lock(&ctx.conn, agent, -1, &crypto::now_iso(), reason)?;
         if !inserted {
-            eprintln!("warning: {agent} was already launched by another pump");
+            eprintln!("warning: {agent} was already launched by another prop");
         }
         println!(
             "relaunched {agent} via {} target={} reason={reason}",
@@ -1167,7 +1180,7 @@ pub fn cmd_wake(
 
     let inserted = store::insert_running_lock(&ctx.conn, agent, pid, &crypto::now_iso(), reason)?;
     if !inserted {
-        eprintln!("warning: {agent} was already launched by another pump");
+        eprintln!("warning: {agent} was already launched by another prop");
     }
     println!("launched {agent} pid={pid} reason={reason}");
     Ok(())

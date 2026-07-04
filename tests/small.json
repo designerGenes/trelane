@@ -1,0 +1,67 @@
+{
+  "name": "small",
+  "description": "Small benchmark project: two agents, one question/answer exchange, one park/resume cycle. Establishes the baseline cost of the inbox-first protocol.",
+  "launcher": "trelane --root {root} stub {agent}",
+  "project": {
+    "files": [
+      {
+        "path": "src/story.md",
+        "contents": "# Story\n\nDraft pending editorial guidance.\n"
+      },
+      {
+        "path": "style/guide.md",
+        "contents": "# Style Guide\n\nVoice: direct, warm.\n"
+      }
+    ]
+  },
+  "agents": [
+    {
+      "name": "writer",
+      "description": "Owns story drafting",
+      "writable": ["src/**"],
+      "launcher_agent": "stub-low-cost"
+    },
+    {
+      "name": "editor",
+      "description": "Owns the style guide and editorial calls",
+      "writable": ["style/**"],
+      "launcher_agent": "stub-low-cost"
+    }
+  ],
+  "steps": [
+    {
+      "type": "Send",
+      "explanation": "Writer asks editor for a voice ruling before drafting.",
+      "from": "writer",
+      "to": "editor",
+      "msg_type": "question",
+      "subject": "Voice ruling for chapter one",
+      "body": "First or third person for the opening chapter?",
+      "save_as": "voice-question"
+    },
+    {
+      "type": "Park",
+      "explanation": "Writer parks until the editor answers, exercising the never-wait-while-running invariant.",
+      "agent": "writer",
+      "task": "task-draft-ch1",
+      "wait_reply_ref": "voice-question",
+      "waiting_on": "editor",
+      "resume_hint": "Draft chapter one using the ruled voice."
+    },
+    {
+      "type": "Prop",
+      "explanation": "Tick one wakes editor to answer; tick two wakes writer to resume from the reply.",
+      "ticks": 2
+    },
+    {
+      "type": "AssertParkedCount",
+      "explanation": "The park must be resumed after the answer arrives.",
+      "count": 0
+    },
+    {
+      "type": "AssertNoDeadlock",
+      "explanation": "A single directed wait can never cycle."
+    }
+  ],
+  "metrics": ["messages_sent", "prop_ticks"]
+}

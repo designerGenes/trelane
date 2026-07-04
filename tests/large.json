@@ -1,0 +1,227 @@
+{
+  "name": "large",
+  "description": "Large benchmark project: four agents across three phases -- fan-out Q&A with parallel parks, contested cross-domain claims, and a genuine wait-cycle that must be detected and broken by the prop's cycle detector (not by message side effects). Ends with a PropWatch quiescence check.",
+  "launcher": "trelane --root {root} stub {agent}",
+  "project": {
+    "files": [
+      {
+        "path": "src/ui/dashboard.tsx",
+        "contents": "export const Dashboard = () => null;\n"
+      },
+      {
+        "path": "src/api/server.py",
+        "contents": "def serve():\n    pass\n"
+      },
+      {
+        "path": "src/data/pipeline.sql",
+        "contents": "-- pipeline pending\n"
+      },
+      {
+        "path": "qa/plan.md",
+        "contents": "# QA Plan\n\nCoverage targets pending.\n"
+      },
+      {
+        "path": "docs/architecture.md",
+        "contents": "# Architecture\n\nDraft.\n"
+      }
+    ]
+  },
+  "agents": [
+    {
+      "name": "ui",
+      "description": "Owns the dashboard frontend",
+      "writable": ["src/ui/**"],
+      "forbidden_write": ["src/ui/secrets/**"],
+      "launcher_agent": "stub-low-cost"
+    },
+    {
+      "name": "api",
+      "description": "Owns the API server",
+      "writable": ["src/api/**"],
+      "launcher_agent": "stub-low-cost"
+    },
+    {
+      "name": "data",
+      "description": "Owns data pipelines and schemas",
+      "writable": ["src/data/**"],
+      "launcher_agent": "stub-low-cost"
+    },
+    {
+      "name": "qa",
+      "description": "Owns test plans and QA assets",
+      "writable": ["qa/**", "tests/**"],
+      "launcher_agent": "stub-low-cost"
+    }
+  ],
+  "steps": [
+    {
+      "type": "Send",
+      "explanation": "Phase 1: UI asks API for the dashboard endpoint contract.",
+      "from": "ui",
+      "to": "api",
+      "msg_type": "question",
+      "subject": "Dashboard endpoint contract",
+      "body": "What does /dashboard return?",
+      "save_as": "q-ui-api"
+    },
+    {
+      "type": "Send",
+      "explanation": "Phase 1: Data asks API which tables the server reads, creating fan-in load on one agent.",
+      "from": "data",
+      "to": "api",
+      "msg_type": "question",
+      "subject": "Tables read by server",
+      "body": "Which tables does the server query so the pipeline can populate them?",
+      "save_as": "q-data-api"
+    },
+    {
+      "type": "Park",
+      "explanation": "UI parks on its question, one of two parallel parks against the same counterpart.",
+      "agent": "ui",
+      "task": "task-dashboard",
+      "wait_reply_ref": "q-ui-api",
+      "waiting_on": "api",
+      "resume_hint": "Wire the dashboard once the contract arrives."
+    },
+    {
+      "type": "Park",
+      "explanation": "Data parks on its question in parallel with UI's park.",
+      "agent": "data",
+      "task": "task-pipeline",
+      "wait_reply_ref": "q-data-api",
+      "waiting_on": "api",
+      "resume_hint": "Build the pipeline once table names arrive."
+    },
+    {
+      "type": "Prop",
+      "explanation": "Tick one wakes API (two inbox items); tick two wakes UI and Data together (both parks satisfied, exercising the concurrency budget); tick three drains the answer messages.",
+      "ticks": 3
+    },
+    {
+      "type": "AssertParkedCount",
+      "explanation": "Both parallel parks must be resumed after API answers.",
+      "count": 0
+    },
+    {
+      "type": "ClaimExpectDenied",
+      "explanation": "Phase 2: QA must not be able to claim a UI-owned file without a grant.",
+      "agent": "qa",
+      "path": "src/ui/dashboard.tsx"
+    },
+    {
+      "type": "Send",
+      "explanation": "Phase 2: QA requests a temporary grant to instrument the dashboard for testing.",
+      "from": "qa",
+      "to": "ui",
+      "msg_type": "claim-request",
+      "subject": "Need dashboard.tsx for test hooks",
+      "body": "Please grant a temporary claim for src/ui/dashboard.tsx.",
+      "paths": ["src/ui/dashboard.tsx"],
+      "save_as": "qa-claim-request"
+    },
+    {
+      "type": "Park",
+      "explanation": "QA parks until UI grants the contested claim.",
+      "agent": "qa",
+      "task": "task-test-hooks",
+      "wait_reply_ref": "qa-claim-request",
+      "waiting_on": "ui",
+      "resume_hint": "Add test hooks under the grant, then release."
+    },
+    {
+      "type": "Prop",
+      "explanation": "Wake UI to grant, then QA to claim under the grant, edit, and release.",
+      "ticks": 2
+    },
+    {
+      "type": "Send",
+      "explanation": "Phase 3: seed message API->Data. The subject deliberately does NOT start with 'deadlock', so the stub's counterpart-broke-deadlock handler cannot clear the coming cycle as a side effect -- the prop's cycle detector must do it.",
+      "from": "api",
+      "to": "data",
+      "msg_type": "info",
+      "subject": "cycle seed one",
+      "body": "Seed message for the wait-cycle test.",
+      "save_as": "cycle-seed-1"
+    },
+    {
+      "type": "Send",
+      "explanation": "Mirror seed Data->API so each side has a message to park against.",
+      "from": "data",
+      "to": "api",
+      "msg_type": "info",
+      "subject": "cycle seed two",
+      "body": "Counterpart seed message for the wait-cycle test.",
+      "save_as": "cycle-seed-2"
+    },
+    {
+      "type": "Prop",
+      "explanation": "Drain the seed messages first so the inbox-first rule cannot mask the cycle: after this tick both inboxes are empty.",
+      "ticks": 1
+    },
+    {
+      "type": "Park",
+      "explanation": "API parks waiting on Data. No reply to the seed will ever come.",
+      "agent": "api",
+      "task": "task-cycle-api",
+      "wait_reply_ref": "cycle-seed-1",
+      "waiting_on": "data",
+      "resume_hint": "Break the cycle with a documented assumption if designated."
+    },
+    {
+      "type": "Park",
+      "explanation": "Data parks waiting on API, closing a genuine two-node wait-cycle with empty inboxes.",
+      "agent": "data",
+      "task": "task-cycle-data",
+      "wait_reply_ref": "cycle-seed-2",
+      "waiting_on": "api",
+      "resume_hint": "Break the cycle with a documented assumption if designated."
+    },
+    {
+      "type": "Prop",
+      "explanation": "With no inbox work and no ready parks, the prop must detect the wait-cycle and wake the designated breaker (lexicographic minimum: api).",
+      "ticks": 1
+    },
+    {
+      "type": "Prop",
+      "explanation": "The counterpart wakes on the breaker's notification and clears its remaining parked task.",
+      "ticks": 1
+    },
+    {
+      "type": "AssertNoDeadlock",
+      "explanation": "The cycle must be gone from the ledger after the breaker path runs."
+    },
+    {
+      "type": "Redomain",
+      "explanation": "QA expands into docs to write the test-coverage chapter, simulating a late domain shift.",
+      "agent": "qa",
+      "writable": ["qa/**", "tests/**", "docs/**"],
+      "desc": "Expands into documentation for the coverage chapter."
+    },
+    {
+      "type": "Send",
+      "explanation": "QA broadcasts the shift so the domain map stays shared.",
+      "from": "qa",
+      "to": "ui",
+      "msg_type": "info",
+      "subject": "QA expanding into docs",
+      "body": "I have shifted domain to include docs/** for the coverage chapter."
+    },
+    {
+      "type": "PropWatch",
+      "explanation": "Run the prop as it runs in production until the swarm is quiescent: no running agents, empty inboxes, no parked tasks.",
+      "interval_s": 1,
+      "max_ticks": 6,
+      "idle_grace_ticks": 2
+    },
+    {
+      "type": "AssertParkedCount",
+      "explanation": "Nothing may remain parked at the end of the project.",
+      "count": 0
+    },
+    {
+      "type": "AssertNoDeadlock",
+      "explanation": "The scenario must end with a clean ledger."
+    }
+  ],
+  "metrics": ["messages_sent", "prop_ticks", "redomains", "deadlocks_detected"]
+}

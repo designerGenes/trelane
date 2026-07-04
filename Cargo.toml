@@ -1,8 +1,8 @@
 [package]
 name = "trelane"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
-description = "Park-and-pump multi-agent coordination protocol"
+description = "Park-and-prop multi-agent coordination protocol"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

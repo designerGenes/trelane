@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "trelane",
     version,
-    about = "Park-and-pump multi-agent coordination protocol"
+    about = "Park-and-prop multi-agent coordination protocol"
 )]
 pub struct Cli {
     #[arg(long, global = true, help = "project root (default: walk up from cwd)")]
@@ -60,7 +60,7 @@ pub struct Cli {
     #[arg(
         long = "testing-launcher",
         global = true,
-        help = "launcher template override for testing pumps"
+        help = "launcher template override for testing props"
     )]
     pub testing_launcher: Option<String>,
 
@@ -232,8 +232,10 @@ pub enum Command {
     /// Mark an agent as done (release running lock)
     Done { agent: String },
 
-    /// The dumb pump — relaunches agents that have a reason to wake
-    Pump {
+    /// The dumb prop — relaunches agents that have a reason to wake
+    /// (formerly `pump`, which still works as an alias)
+    #[command(alias = "pump")]
+    Prop {
         #[arg(long = "once")]
         once: bool,
         #[arg(long = "watch")]
@@ -242,6 +244,12 @@ pub enum Command {
         interval: Option<u64>,
         #[arg(long = "launcher")]
         launcher: Option<String>,
+        #[arg(
+            long = "verbose",
+            short = 'v',
+            help = "narrate normally-quiet events (e.g. concurrency-budget deferrals)"
+        )]
+        verbose: bool,
     },
 
     /// Token-free scripted agent for demos and testing

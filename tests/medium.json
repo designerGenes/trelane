@@ -1,0 +1,134 @@
+{
+  "name": "medium",
+  "description": "Medium benchmark project: three agents covering Q&A park/resume, cross-domain claim denial, grant negotiation, and a mid-session domain shift.",
+  "launcher": "trelane --root {root} stub {agent}",
+  "project": {
+    "files": [
+      {
+        "path": "src/ui/app.ts",
+        "contents": "export const usersTable = [];\n"
+      },
+      {
+        "path": "src/api/routes.py",
+        "contents": "def users():\n    return []\n"
+      },
+      {
+        "path": "docs/handbook.md",
+        "contents": "# Handbook\n\nAPI documentation pending.\n"
+      }
+    ]
+  },
+  "agents": [
+    {
+      "name": "frontend",
+      "description": "Owns UI implementation",
+      "writable": ["src/ui/**"],
+      "launcher_agent": "stub-low-cost"
+    },
+    {
+      "name": "backend",
+      "description": "Owns API implementation",
+      "writable": ["src/api/**"],
+      "launcher_agent": "stub-low-cost"
+    },
+    {
+      "name": "docs",
+      "description": "Owns documentation",
+      "writable": ["docs/**"],
+      "launcher_agent": "stub-low-cost"
+    }
+  ],
+  "steps": [
+    {
+      "type": "Send",
+      "explanation": "Frontend asks backend for the API schema before wiring the UI table.",
+      "from": "frontend",
+      "to": "backend",
+      "msg_type": "question",
+      "subject": "Need /users payload schema",
+      "body": "Provide the response shape so the UI table can be wired.",
+      "save_as": "schema-question"
+    },
+    {
+      "type": "Park",
+      "explanation": "Frontend parks until backend replies.",
+      "agent": "frontend",
+      "task": "task-ui-table",
+      "wait_reply_ref": "schema-question",
+      "waiting_on": "backend",
+      "resume_hint": "Resume wiring the UI table once backend answers."
+    },
+    {
+      "type": "Prop",
+      "explanation": "Wake backend to answer, then frontend to resume.",
+      "ticks": 2
+    },
+    {
+      "type": "AssertParkedCount",
+      "explanation": "The schema park must be cleared before the claim phase begins.",
+      "count": 0
+    },
+    {
+      "type": "ClaimExpectDenied",
+      "explanation": "Docs must not be able to claim a backend-owned source file without a grant.",
+      "agent": "docs",
+      "path": "src/api/routes.py"
+    },
+    {
+      "type": "Send",
+      "explanation": "Docs requests a temporary grant to annotate the API source with doc comments.",
+      "from": "docs",
+      "to": "backend",
+      "msg_type": "claim-request",
+      "subject": "Need routes.py for docstring pass",
+      "body": "Please grant a temporary claim for src/api/routes.py.",
+      "paths": ["src/api/routes.py"],
+      "save_as": "api-claim-request"
+    },
+    {
+      "type": "Park",
+      "explanation": "Docs parks until backend grants the contested claim.",
+      "agent": "docs",
+      "task": "task-docstring-pass",
+      "wait_reply_ref": "api-claim-request",
+      "waiting_on": "backend",
+      "resume_hint": "Use the grant to add docstrings, then release."
+    },
+    {
+      "type": "Prop",
+      "explanation": "Wake backend to grant, then docs to claim under the grant, edit, and release.",
+      "ticks": 2
+    },
+    {
+      "type": "Redomain",
+      "explanation": "Docs expands its writable scope to include UI copy review, simulating a mid-session domain shift.",
+      "agent": "docs",
+      "writable": ["docs/**", "src/ui/**"],
+      "desc": "Expands into UI copy review after cross-team agreement."
+    },
+    {
+      "type": "Send",
+      "explanation": "Docs informs frontend of the shift so every agent shares the same domain map.",
+      "from": "docs",
+      "to": "frontend",
+      "msg_type": "info",
+      "subject": "Docs expanding into UI copy review",
+      "body": "I have shifted domain to include src/ui/** for copy review."
+    },
+    {
+      "type": "Prop",
+      "explanation": "Wake any agent with inbox work created by the domain-shift broadcast.",
+      "ticks": 1
+    },
+    {
+      "type": "AssertParkedCount",
+      "explanation": "All parks must be resolved by the end of the scenario.",
+      "count": 0
+    },
+    {
+      "type": "AssertNoDeadlock",
+      "explanation": "No residual wait-cycle may remain in the ledger."
+    }
+  ],
+  "metrics": ["messages_sent", "prop_ticks", "redomains"]
+}

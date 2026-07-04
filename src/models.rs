@@ -21,26 +21,49 @@ pub struct Config {
     #[serde(default)]
     pub agents: AgentConfig,
     pub launcher: LauncherConfig,
-    pub pump: PumpConfig,
+    /// The prop (formerly "pump"). `alias = "pump"` keeps pre-0.3 config
+    /// files loading without migration.
+    #[serde(alias = "pump")]
+    pub prop: PropConfig,
     pub claims: ClaimsConfig,
+    #[serde(default)]
+    pub ui: UiConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
+        let mut profiles = HashMap::new();
+        // Ready-to-use headless launcher profiles. Select one per agent with
+        // `trelane add-agent <name> --launcher-agent <profile>`, or override
+        // any of these in config.json.
+        profiles.insert(
+            "claude-code".to_string(),
+            r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50"#
+                .to_string(),
+        );
+        profiles.insert(
+            "opencode".to_string(),
+            r#"opencode run "$(cat {prompt_file})""#.to_string(),
+        );
+        profiles.insert(
+            "copilot".to_string(),
+            r#"copilot -p "$(cat {prompt_file})" --allow-all-tools"#.to_string(),
+        );
         Self {
             agents: AgentConfig::default(),
             launcher: LauncherConfig {
                 template: r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50"#
                     .to_string(),
-                profiles: HashMap::new(),
+                profiles,
             },
-            pump: PumpConfig {
+            prop: PropConfig {
                 interval_s: 20,
                 max_concurrent: 2,
             },
             claims: ClaimsConfig {
                 default_ttl_s: 900,
             },
+            ui: UiConfig::default(),
         }
     }
 }
@@ -61,9 +84,56 @@ pub struct LauncherConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PumpConfig {
+pub struct PropConfig {
     pub interval_s: u64,
     pub max_concurrent: usize,
+}
+
+/// Deprecated name for [`PropConfig`], kept so external code compiles.
+pub type PumpConfig = PropConfig;
+
+/// Session UI configuration: tmux key bindings and pane-navigation behaviour.
+/// All keys use tmux key syntax (`F2`, `M-Left`, `C-b`, ...). Bindings land
+/// in tmux's root key table, so they work without a prefix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    pub keys: UiKeys,
+    /// Bind Alt+arrow keys to move focus between tmux panes. This is a
+    /// tmux-level binding that works in any terminal emulator; matching the
+    /// host terminal's native pane shortcuts (e.g. Ghostty's cmd-option
+    /// arrows) is intentionally out of scope for now.
+    pub pane_navigation: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            keys: UiKeys::default(),
+            pane_navigation: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiKeys {
+    /// Pop a diagnostic split showing `trelane status` for the session.
+    pub diagnostics: String,
+    /// Pop a diagnostic split showing the focused pane's agent inbox.
+    pub inbox: String,
+    /// Toggle verbose prop output for the session frame.
+    pub verbose_toggle: String,
+}
+
+impl Default for UiKeys {
+    fn default() -> Self {
+        Self {
+            diagnostics: "F2".to_string(),
+            inbox: "F3".to_string(),
+            verbose_toggle: "F4".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

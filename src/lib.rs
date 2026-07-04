@@ -8,6 +8,7 @@ pub mod error;
 pub mod logo;
 pub mod models;
 pub mod prompt;
+pub mod prop;
 pub mod pump;
 pub mod splash;
 pub mod store;
@@ -233,7 +234,7 @@ fn cmd_launch(cli: Cli) -> Result<()> {
             );
         } else if stuck_parks > 0 {
             println!(
-                "[launch] {} parked task(s) still waiting (no ready replies). Pump will attempt deadlock breaking if needed.",
+                "[launch] {} parked task(s) still waiting (no ready replies). The prop will attempt deadlock breaking if needed.",
                 stuck_parks
             );
         } else {
@@ -259,10 +260,36 @@ fn cmd_launch(cli: Cli) -> Result<()> {
     let exe = std::env::current_exe()?;
     let session_name = format!("trelane-{}", chrono::Utc::now().format("%Y%m%d%H%M%S"));
 
-    // Count agents for the script
+    // Frames are provisioned only for agents that can actually run in this
+    // session: session-disabled agents (via --agents/--no-agents or
+    // config.json) get no pane, and an explicit --max-agents caps the count.
+    // Previously every registered agent got a frame, so a session limited to
+    // two runnable agents could still open four panes.
     let ctx = Context::open(Some(&root))?;
-    let agents = crate::store::list_agents(&ctx.conn)?;
-    let agent_list = agents.join(" ");
+    let all_agents = crate::store::list_agents(&ctx.conn)?;
+    let enabled_agents = crate::commands::launch_enabled_agents(&ctx)?;
+    let skipped: Vec<String> = all_agents
+        .iter()
+        .filter(|a| !enabled_agents.contains(a))
+        .cloned()
+        .collect();
+    let mut frame_agents = enabled_agents;
+    if let Some(cap) = cli.max_agents {
+        frame_agents.truncate(cap as usize);
+    }
+    if !skipped.is_empty() {
+        println!(
+            "[launch] Skipping frame(s) for {} session-disabled agent(s): {}",
+            skipped.len(),
+            skipped.join(", ")
+        );
+    }
+    println!(
+        "[launch] Creating {} frame(s): {}",
+        frame_agents.len(),
+        frame_agents.join(", ")
+    );
+    let agent_list = frame_agents.join(" ");
 
     let script_path = root.join(".trelane").join("launch-session.sh");
     let script_content = format!(
@@ -280,6 +307,9 @@ sleep 1
 
 CONTROLLER=$(tmux list-panes -t "$SESSION" -F "#{{pane_id}}" | head -1)
 
+# Per-session root marker: the diagnostic key bindings read it at trigger time.
+echo "$ROOT" > "/tmp/trelane-$SESSION-root"
+
 # Create one pane per agent
 for AGENT in {agent_list}; do
     PANE=$(tmux split-window -d -P -F "#{{pane_id}}" -t "$CONTROLLER" 2>/dev/null || true)
@@ -292,8 +322,9 @@ done
 
 tmux select-layout -t "$SESSION" tiled
 
-# Start the pump in the controller pane
-tmux send-keys -t "$CONTROLLER" "TRELANE_PUMP_SESSION=1 '$EXE' --root '$ROOT' pump --watch" Enter
+# Start the prop in the controller pane. TRELANE_SESSION lets the prop own
+# the session UI: status bar refresh, key bindings, verbose marker.
+tmux send-keys -t "$CONTROLLER" "TRELANE_SESSION='$SESSION' '$EXE' --root '$ROOT' prop --watch" Enter
 
 echo ""
 echo "Session $SESSION is ready."
@@ -331,7 +362,7 @@ exec tmux attach-session -t "$SESSION"
         "[launch] Terminal.app window opened with session: {}",
         session_name
     );
-    println!("[launch] The pump and agents will start automatically.");
+    println!("[launch] The prop and agents will start automatically.");
 
     Ok(())
 }
@@ -339,6 +370,34 @@ exec tmux attach-session -t "$SESSION"
 #[allow(dead_code)]
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+/// Compute the live session state and push it to the tmux status bar.
+/// Called by the prop on every watch tick.
+fn refresh_session_status(ctx: &Context, session: &str) -> Result<()> {
+    let agents = store::list_agents(&ctx.conn)?;
+    let running = agents
+        .iter()
+        .filter(|a| commands::is_running(&ctx.conn, a).unwrap_or(false))
+        .count();
+    let (_, cycle) = prop::wait_graph(&ctx.conn)?;
+    let state = if let Some(cycle) = cycle {
+        let mut display = cycle.clone();
+        display.push(cycle[0].clone());
+        splash::SessionState::Deadlock {
+            cycle: display.join(" -> "),
+        }
+    } else if running > 0 {
+        splash::SessionState::Active { running }
+    } else {
+        splash::SessionState::Idle
+    };
+    let project = ctx
+        .root
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| ctx.root.display().to_string());
+    splash::set_session_status(session, &project, &state)
 }
 
 pub fn handle(cli: Cli) -> Result<()> {
@@ -512,24 +571,50 @@ pub fn handle(cli: Cli) -> Result<()> {
             let ctx = Context::open(cli.root.as_deref())?;
             commands::cmd_stub(&ctx, &agent)
         }
-        Some(Command::Pump {
+        Some(Command::Prop {
             once,
             watch,
             interval,
             launcher,
+            verbose,
         }) => {
             let ctx = Context::open(cli.root.as_deref())?;
+            // The launch script exports TRELANE_SESSION so the prop can own
+            // the session UI (status bar, key bindings, verbose marker).
+            let session = std::env::var("TRELANE_SESSION")
+                .ok()
+                .filter(|s| !s.is_empty());
+
             if once || !watch {
-                pump::tick(&ctx, launcher.as_deref())?;
+                let v = verbose || splash::verbose_enabled(session.as_deref());
+                prop::tick(&ctx, launcher.as_deref(), v)?;
                 return Ok(());
             }
-            let interval_s = interval.unwrap_or(ctx.config.pump.interval_s);
+
+            let interval_s = interval.unwrap_or(ctx.config.prop.interval_s);
+
+            // The controller frame is the prop's home: identify it.
+            logo::print_logo();
             eprintln!(
-                "{} pump watching every {interval_s}s (ctrl-c to stop)",
+                "{} prop watching every {interval_s}s (ctrl-c to stop)",
                 crypto::now_iso()
             );
+            if let Some(session) = session.as_deref() {
+                eprintln!("  session : {session}");
+                eprintln!(
+                    "  verbose : press {} to toggle (marker: {})",
+                    ctx.config.ui.keys.verbose_toggle,
+                    splash::verbose_marker_path(session)
+                );
+                // Best-effort: a broken tmux server must not kill the prop.
+                if let Err(e) = splash::setup_session_ui(session, &ctx.config.ui) {
+                    eprintln!("warning: session UI setup failed: {e:?}");
+                }
+            }
+
             loop {
-                match pump::tick(&ctx, launcher.as_deref()) {
+                let v = verbose || splash::verbose_enabled(session.as_deref());
+                match prop::tick(&ctx, launcher.as_deref(), v) {
                     Ok(n) => {
                         if n > 0 {
                             eprintln!("{} launched {n} agent(s)", crypto::now_iso());
@@ -538,6 +623,15 @@ pub fn handle(cli: Cli) -> Result<()> {
                     Err(e) => {
                         eprintln!("{} tick error: {e:?}", crypto::now_iso());
                     }
+                }
+                // Refresh the status bar from the real session state on every
+                // tick, so ACTIVE/IDLE/DEADLOCK tracks reality instead of the
+                // value set once at bootstrap.
+                if let Some(session) = session.as_deref()
+                    && let Err(e) = refresh_session_status(&ctx, session)
+                    && v
+                {
+                    eprintln!("warning: status bar refresh failed: {e:?}");
                 }
                 std::thread::sleep(std::time::Duration::from_secs(interval_s));
             }
