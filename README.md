@@ -1,13 +1,4 @@
-# trelane -- park-and-pump multi-agent coordination
-
-```
-      
-----------------    
-/-\---   ---/-\- \___________   
-\*/ --_ _-- \*/ -  [TRELANE]  
-----------------
-
-```
+# trelane -- park-and-prop multi-agent coordination
 
 A coordination protocol for running multiple single-shot AI agents (Claude
 Code, opencode, or any headless CLI agent) on one project without deadlock.
@@ -26,13 +17,13 @@ wake, drain inbox, work, park anything blocked, exit.
 2. **Inbox first.** Every run begins by draining the inbox. Responsiveness
    happens at run boundaries; run boundaries are frequent because runs are
    deliberately short.
-3. **The pump is the only restarter.** A dumb watcher (`trelane pump`) with
-   zero intelligence: if an agent has unread mail, a ready parked task, or
-   sits in a wait-cycle nobody else will break, relaunch it. Cron-friendly
-   (`--once`) or looping (`--watch`).
+3. **The prop is the only restarter.** A dumb watcher (`trelane prop`, formerly
+   `trelane pump`) with zero intelligence: if an agent has unread mail, a
+   ready parked task, or sits in a wait-cycle nobody else will break,
+   relaunch it. Cron-friendly (`--once`) or looping (`--watch`).
 
 Deadlock changes character: a wait-cycle can still form, but only in the
-ledger, where it is inspectable data. The pump runs cycle detection on the
+ledger, where it is inspectable data. The prop runs cycle detection on the
 wait-for graph and, when a cycle has no other way to move, wakes the
 lexicographically-first member as designated breaker (documented assumption
 + notify counterpart). Total silent deadlock is impossible.
@@ -43,22 +34,25 @@ All state lives in SQLite (`.trelane/trelane.db`) with WAL mode for
 concurrent reads. No daemons, no external services, no message queues --
 just one file.
 
-Global configuration (launcher template, pump settings, claim TTL) lives
-at `~/.config/trelane/config.json` (respects `XDG_CONFIG_HOME`). This is
-shared across all projects -- each project session only needs its own
-database, secret, and prompts.
+Global configuration (launcher template, prop settings, claim TTL, UI,
+biplane) lives at `~/.config/trelane/config.json` (respects
+`XDG_CONFIG_HOME`). This is shared across all projects -- each project
+session only needs its own database, secret, and prompts.
 
     ~/.config/trelane/
-      config.json             global: default agents, launcher, pump settings, claim TTL
+      config.json             global: launcher profiles, prop settings, claim TTL, UI, biplane
 
     <project>/.trelane/
       trelane.db              SQLite: agents, messages, claims, parked tasks, running locks
       secret                  HMAC key for message signing (gitignored)
       prompts/bootstrap.md    wake-up prompt template ([[TOKENS]] substituted)
+      biplane-description.json  structured project description (optional, from --describe)
+      biplane-plan.json       derived agent plan (optional, from --emit-plan)
       agents/<id>/
         state.json            agent-owned scratch state (optional)
         logs/                 stdout of each run
         .prompt.md            generated prompt for the current run (gitignored)
+        launch.sh             per-agent tmux launch script (gitignored)
 
 ## Install
 
@@ -71,329 +65,251 @@ Requires Rust 1.85+ (edition 2024). SQLite is compiled in via
 
     trelane init --project /path/to/repo
     cd /path/to/repo
-    trelane --agents "claude,gpt-4" --no-agents "expensive-model" .
     trelane add-agent frontend --writable 'src/ui/**'  --desc 'owns the UI layer'
     trelane add-agent backend  --writable 'src/api/**' --desc 'owns the API layer'
     trelane send --from user --to frontend --type question \
         --subject "build the login page" --body "..."
-    trelane pump --watch          # or: --once from cron
+    trelane prop --watch          # or: --once from cron
 
-Dry-run the full lifecycle with zero tokens first:
+Or launch everything at once with Biplane:
 
-    bash demo-rust.sh
+    trelane /path/to/repo --models glm-5.2 --max-agents 3 --with-biplane
 
-This exercises message flow, claim negotiation, a manufactured parked-task
-deadlock and its recovery, domain shifting, and repeated pump-driven wakeups,
-all driven by `trelane stub` (a scripted no-AI agent). Set
-`TRELANE_DEMO_REPEAT=N` to run it repeatedly and `TRELANE_DEMO_REPORT=/path/report.jsonl`
-to capture a per-run report.
+Dry-run the full lifecycle with zero tokens:
+
+    trelane --testing tests/small.json
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `trelane [--agents A,B] [--no-agents C,D] PROJECT` | Attach/init Trelane for an existing project and inject `AGENTS.md` instructions |
+| `trelane PROJECT --models M --max-agents N [--with-biplane]` | Launch interactive tmux session with agents |
 | `trelane init [--project DIR]` | Initialize a new trelane session |
-| `trelane attach [PROJECT] [--no-inject]` | Attach/init a project and optionally skip `AGENTS.md` injection |
-| `trelane add-agent NAME --writable GLOB [--desc TEXT] [--launcher-agent MODEL]` | Register an agent with a domain and optional session-model binding |
+| `trelane add-agent NAME --writable GLOB [--desc TEXT] [--launcher-agent MODEL]` | Register an agent with a domain |
 | `trelane redomain AGENT --writable GLOB [--desc TEXT]` | Update an agent's domain and notify peers |
 | `trelane send --from A --to B --type TYPE --subject TEXT [--body ...]` | Send a signed message |
 | `trelane inbox AGENT [--json]` | List unprocessed messages |
 | `trelane ack AGENT MSG_ID` | Mark a message as processed |
 | `trelane claim AGENT PATH [--grant MSG_ID] [--ttl SECS]` | Acquire a file lease |
 | `trelane release AGENT PATH [--force]` | Release a file lease |
-| `trelane park AGENT --wait-reply MSG_ID \| --wait-claim PATH --waiting-on AGENT [--resume-hint TEXT]` | Park a blocked task |
+| `trelane park AGENT --wait-reply MSG_ID \| --wait-claim PATH --waiting-on AGENT` | Park a blocked task |
 | `trelane unpark TASK_ID` | Remove a parked task |
 | `trelane status` | Show full swarm state |
-| `trelane biplane [--safe-pocket DIR] [--json]` | Analyze the project and generate a state report (Biplane) |
+| `trelane biplane [--json] [--safe-pocket DIR] [--describe FILE] [--next-steps] [--emit-plan] [--interactive] [--accept-defaults]` | Analyze project, generate reports, plan domains |
 | `trelane wake AGENT [--why TEXT] [--launcher CMD]` | Launch an agent process |
-| `trelane set-launch-target AGENT --adapter tmux --target session[:window[:pane]] [--command TEXT]` | Store a tmux relaunch target |
-| `trelane relaunch AGENT [--adapter tmux --target ... --command ...]` | Inject a wake command into a tmux target |
+| `trelane set-launch-target AGENT --adapter tmux --target PANE [--command TEXT]` | Store a tmux relaunch target |
+| `trelane relaunch AGENT` | Inject a wake command into a tmux target |
 | `trelane done AGENT` | Mark an agent as done (release running lock) |
 | `trelane audit AGENT` | Check for out-of-domain file changes |
-| `trelane pump --once \| --watch [--interval SECS]` | The dumb pump |
+| `trelane prop --once \| --watch [--interval SECS] [--launcher L] [--verbose\|-v]` | The dumb prop (`pump` still works as an alias) |
 | `trelane stub AGENT` | Token-free scripted agent for demos |
-| `trelane --testing tests/full-usage-scenario.json [--testing-runs N]` | Run a full usage scenario harness and write a JSONL report |
+| `trelane --testing tests/scenario.json [--testing-runs N]` | Run a scenario harness |
 
 ## Launcher
 
 `~/.config/trelane/config.json > launcher.template` is any shell command
-with placeholders `{prompt_file}`, `{agent}`, `{root}`. Default targets
-Claude Code headless mode:
+with placeholders `{prompt_file}`, `{agent}`, `{root}`. Three built-in
+profiles ship in the default config:
 
-    claude -p "$(cat {prompt_file})" --permission-mode acceptEdits \
-      --allowedTools "Bash(trelane *)" --max-turns 50
+| Profile | Template | Notes |
+|---------|----------|-------|
+| `claude-code` | `claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50` | Default; targets Claude Code headless |
+| `opencode` | `opencode run "$(cat {prompt_file})"` | Targets opencode CLI |
+| `copilot` | `copilot -p "$(cat {prompt_file})" --allow-all-tools` | Targets GitHub Copilot CLI |
 
-Swap in any agent CLI that accepts a prompt non-interactively; the
-protocol only assumes "reads prompt, can run trelane, exits."
+Antigravity has no headless CLI; it must be driven via a custom tmux/adapter
+command.
 
-## Attach Mode
+Select a profile per agent with `--launcher-agent <profile>` at registration,
+or override any template in config.json.
 
-Trelane is designed to be attachable to existing projects and already-open
-agent sessions. The shortest attach form is:
+## Session UI
 
-    trelane --agents "claude,gpt-4,gpt-4-32k" --no-agents "gpt-3.5" .
+When running inside a tmux session, Trelane provides a live status bar and
+configurable keybindings.
 
-This does three things:
+**Status bar states** (displayed at the top of the tmux window):
 
-1. Initializes `.trelane/` for the project if needed.
-2. Records enabled/disabled session agents in `.trelane/trelane.db`.
-3. Inserts a managed Trelane block into the project's `AGENTS.md`, giving
-   already-running agents the protocol, commands, and exit checklist.
+| State | Color | Meaning |
+|-------|-------|---------|
+| ACTIVE | green | At least one agent is running |
+| IDLE | grey (colour 240) | No agent is running, but work may still be pending |
+| DEADLOCK | red | A wait-cycle has been detected in the ledger |
 
-Session agent selection is now operational, not just informational: if a
-domain agent is registered with `--launcher-agent <model>`, Trelane will
-refuse to wake or relaunch it when that session model is disabled, and it can
-also pick a launcher command from `launcher.profiles.<model>` when configured.
+Note: green-for-active is a change from pre-0.3, where red meant active.
 
-Default enabled/disabled agents can also be configured globally:
+**Keybindings** (configurable via `config.json > ui.keys`):
+
+| Key | Default | Action |
+|-----|---------|--------|
+| `diagnostics` | `F2` | Pop a split showing `trelane status` |
+| `inbox` | `F3` | Pop a split showing the focused pane's agent inbox |
+| `verbose_toggle` | `F4` | Toggle verbose prop output (also settable via `TRELANE_VERBOSE=1` env) |
+
+**Pane navigation** (`config.json > ui.pane_navigation`, `ui.match_host_terminal`):
+
+When `match_host_terminal` is true, Trelane reads `~/.config/ghostty/config`
+and mirrors any `goto_split` bindings whose modifiers tmux can actually
+receive (Alt/Ctrl/Shift). Cmd/Super-based bindings can't be forwarded to
+tmux on macOS, so those fall back to Alt+arrows with a printed note. Other
+terminals use Alt+arrows directly.
+
+## Biplane
+
+Biplane is Trelane's analysis and planning tool.
+
+### Plain report
+
+    trelane biplane
+    trelane biplane --json | jq .
+    trelane biplane --safe-pocket ~/.safe_pocket
+
+Shows all agents, domains, running state, inbox counts, parked tasks,
+claims, deadlock detection, safe_pocket features, and recommendations.
+
+### Structured project description (offline, no model call)
+
+    trelane biplane --describe tests/space_rogue.describe.json
+
+Analyzes a structured JSON file defining domains, their writable globs,
+dependencies, and planned work. Validates the description, detects
+dependency cycles, and topologically orders the domains.
+
+### Next-steps phased scheduling
+
+    trelane biplane --describe tests/space_rogue.describe.json --next-steps
+
+Produces a phased schedule that respects domain dependencies: domains in
+the same phase can start in parallel; domains in later phases wait for
+earlier ones to be underway.
+
+### Emit plan
+
+    trelane biplane --describe tests/space_rogue.describe.json --emit-plan
+
+Writes the derived agent plan to `.trelane/biplane-plan.json`.
+
+### Interactive biplane
+
+    trelane biplane --interactive
+    trelane biplane --interactive --describe tests/space_rogue.describe.json
+    trelane biplane --interactive --accept-defaults
+
+Walks through proposed domains, lets you select which to register, and
+optionally applies them to the live session. `--json` is analysis-only
+(never applies to a live session) to keep stdout parseable.
+
+### Biplane re-analysis on all-stop
+
+When `biplane.reanalyze_on_all_stop` is set to `true` in config.json, the
+prop watch loop checks for uncovered domains each time the swarm becomes
+fully quiescent (no running agents, empty inboxes, no parked tasks) and
+auto-registers agents for any new domains found. This is additive-only:
+existing agents are never removed or re-assigned.
+
+## Testing Harness
+
+Full usage scenarios live under `tests/` as JSON files.
+
+| Scenario | Purpose |
+|----------|---------|
+| `tests/small.json` | Small project, fast verification |
+| `tests/medium.json` | Medium complexity, multiple domains |
+| `tests/large.json` | Large project; engineers a genuine wait-cycle to exercise the real prop cycle detector (not a stub side-effect) |
+| `tests/full-usage-scenario.json` | Full lifecycle: messaging, claims, deadlock, redomaining |
+
+Run one directly:
+
+    trelane --testing tests/small.json --testing-runs 3
+
+The runner emits regular debug output and appends one JSON object per run
+to a JSONL report file. Report fields include `messages_sent`,
+`prop_ticks` (renamed from `pumps` in pre-0.3), `redomains`, and
+`deadlocks_detected`.
+
+## Configuration
 
 ```json
 {
   "agents": {
-    "default": ["claude", "gpt-4"],
-    "disabled": ["expensive-experimental-model"]
+    "default": [],
+    "disabled": []
   },
   "launcher": {
     "template": "claude -p \"$(cat {prompt_file})\" --permission-mode acceptEdits --allowedTools \"Bash(trelane *)\" --max-turns 50",
     "profiles": {
-      "stub-low-cost": "trelane --root {root} stub {agent}",
-      "claude-haiku": "opencode {root} --model github-copilot/claude-haiku-4.5 --prompt \"$(cat {prompt_file})\"",
-      "gpt-5-mini": "opencode {root} --model github-copilot/gpt-5-mini --prompt \"$(cat {prompt_file})\""
+      "claude-code": "claude -p \"$(cat {prompt_file})\" --permission-mode acceptEdits --allowedTools \"Bash(trelane *)\" --max-turns 50",
+      "opencode": "opencode run \"$(cat {prompt_file})\"",
+      "copilot": "copilot -p \"$(cat {prompt_file})\" --allow-all-tools"
     }
   },
-  "pump": {
+  "prop": {
     "interval_s": 20,
-    "max_concurrent": 2
+    "max_concurrent": 4
   },
   "claims": {
     "default_ttl_s": 900
+  },
+  "ui": {
+    "keys": {
+      "diagnostics": "F2",
+      "inbox": "F3",
+      "verbose_toggle": "F4"
+    },
+    "pane_navigation": true,
+    "match_host_terminal": true
+  },
+  "biplane": {
+    "reanalyze_on_all_stop": false
   }
 }
 ```
 
-Use `trelane attach --no-inject .` when you want to initialize and record
-agent selection without modifying `AGENTS.md`.
-
-## tmux Relaunch
-
-Headless relaunch is implemented through `trelane pump` and the launcher
-template. Interactive relaunch is tmux-first through stored launch targets:
-
-    trelane set-launch-target alpha --adapter tmux --target trelane:alpha
-    trelane relaunch alpha
-
-`trelane pump` will prefer a stored launch target over the headless launcher.
-The supported interactive control plane is `tmux`, and Trelane is designed to
-target tmux sessions/panes directly.
-
-Trelane can auto-create missing tmux sessions for interactive scenarios and can
-then wake agents by sending their resolved launcher commands straight into tmux.
-
-### Interactive tmux testing UX
-
-When you launch an interactive testing scenario, Trelane:
-
-1. Creates a dedicated tmux session with a top status bar
-2. Creates controller and agent panes with splash screens
-3. Labels each pane with the agent name
-4. Binds `F2` to show a diagnostic status split
-5. Binds `F3` to show the current pane's inbox
-
-The top bar shows `Trelane | <scenario> | ACTIVE` in red while running,
-and turns green when the swarm becomes idle.
-
-## Biplane
-
-Biplane is Trelane's analysis tool. It scans the current project session and
-generates a report of the current state, including:
-
-- All agents, their domains, running state, and inbox counts
-- All parked tasks and whether they are ready
-- All active claims and their expiry
-- Deadlock detection in the wait-for graph
-- Safe_pocket feature files found in the pocket directory
-- Actionable recommendations
-
-Run it with:
-
-    trelane biplane
-
-Or with safe_pocket scanning:
-
-    trelane biplane --safe-pocket ~/.safe_pocket
-
-Or as JSON for scripting:
-
-    trelane biplane --json | jq .
-
-## Testing Harness
-
-Full usage scenarios live under `tests/` as JSON files. A scenario describes:
-
-- the project files to create
-- the participating agents and their domains
-- the ordered coordination steps to run
-- a verbal explanation for each step
-- the metrics to record per run
-
-There are two intended classes of scenario:
-
-- `tests/full-usage-scenario.json`: deterministic stub-driven harness for quick repeatable verification
-- `tests/full-usage-scenario-interactive.json`: real tmux-managed harness for long-running interactive agent sessions
-
-The shipped scenario demonstrates:
-
-- multiple domain shapes, including multi-glob domains
-- a forbidden-write carve-out
-- cross-domain claim negotiation
-- mid-session redomaining
-- a manufactured parked-task deadlock and pump-driven recovery
-
-Run one directly with:
-
-    trelane --testing /Users/jadennation/DEV/01_active_projects/trelane/tests/full-usage-scenario.json \
-      --testing-runs 3 \
-      --testing-report /tmp/trelane-scenario-report.jsonl \
-      --testing-sandbox-root /tmp/trelane-scenarios
-
-The runner emits regular debug output as each step executes and appends one
-JSON object per run to the report file.
-
-If you want real tmux-managed agents instead of the fast stub harness,
-launch the interactive scenario and make sure your `config.json` defines low-cost launcher
-profiles matching the scenario's `launcher_agent` labels, for example:
-
-```json
-{
-  "launcher": {
-    "template": "claude -p \"$(cat {prompt_file})\" --permission-mode acceptEdits --allowedTools \"Bash(trelane *)\" --max-turns 50",
-    "profiles": {
-      "claude-haiku": "opencode {root} --model github-copilot/claude-haiku-4.5 --prompt \"$(cat {prompt_file})\"",
-      "gpt-5-mini": "opencode {root} --model github-copilot/gpt-5-mini --prompt \"$(cat {prompt_file})\""
-    }
-  }
-}
-```
-
-When the scenario runs, Trelane will auto-create the tmux sessions it needs and
-keep pumping until the swarm becomes quiescent. Launch the scenario with:
-
-    trelane --testing /Users/jadennation/DEV/01_active_projects/trelane/tests/full-usage-scenario-interactive.json
-
-The shipped `full-usage-scenario.json` is intentionally fast and uses stub
-agents, so it will finish in seconds rather than minutes.
-
-You can then inspect the live sessions directly with commands like:
-
-    tmux ls
-    tmux attach -t trelane-testing-<timestamp>
+The `prop` key accepts `pump` as a serde alias for pre-0.3 config
+compatibility. The CLI command `pump` remains as an alias for `prop`.
 
 ## Command Sequence Examples
 
-### Scenario 1: Two agents building a web app
+### Launch a new project with Biplane
 
-    # 1. Initialize Trelane on your project
-    trelane init --project ~/myapp
-    cd ~/myapp
+    trelane /path/to/project --models glm-5.2 --max-agents 3 --with-biplane
 
-    # 2. Attach and select models
-    trelane --agents "claude-haiku,gpt-5-mini" --no-agents "gpt-4" .
+Biplane analyzes the project, proposes domains, registers agents, sends
+initial work, opens a Terminal.app window with a tmux session, and starts
+the prop. All in one command.
 
-    # 3. Register agents with disjoint domains
-    trelane add-agent frontend --writable 'src/ui/**' --desc 'owns the UI layer' --launcher-agent claude-haiku
-    trelane add-agent backend  --writable 'src/api/**' --desc 'owns the API layer' --launcher-agent gpt-5-mini
+### Resume an existing session
 
-    # 4. Assign initial work
-    trelane send --from user --to frontend --type question \
-        --subject "build the login page" --body "Create a login form with email/password fields."
-    trelane send --from user --to backend --type question \
-        --subject "create the auth endpoint" --body "POST /api/auth/login that validates credentials."
+    trelane /path/to/project --models glm-5.2 --max-agents 4
 
-    # 5. Start the pump
-    trelane pump --watch
+Finds existing agents, clears stale locks, reports pending work, and
+relaunches the tmux session. All previous context (messages, claims,
+parked tasks) is preserved.
 
-    # 6. Check on progress
-    trelane status
-    trelane biplane
+### Cross-domain claim negotiation
 
-### Scenario 2: Cross-domain claim negotiation
-
-    # Frontend needs to edit a backend-owned file
     trelane send --from frontend --to backend --type claim-request \
-        --subject "need src/api/auth.py for import update" \
-        --path src/api/auth.py
+        --subject "need src/api/auth.py" --path src/api/auth.py
+    trelane park frontend --wait-reply msg-XXXX --waiting-on backend
+    trelane prop --once
 
-    # Frontend parks while waiting
-    trelane park frontend --task task-fix-import --wait-reply msg-XXXX \
-        --waiting-on backend --resume-hint "fix the import in auth.py"
+### Deadlock resolution
 
-    # Pump wakes backend, which grants the claim
-    trelane pump --once
-
-    # Frontend wakes, uses the grant to claim the file
-    # (the pump handles this automatically)
-
-    # Frontend releases when done and exits
-    trelane release frontend src/api/auth.py
-    trelane done frontend
-
-### Scenario 3: Resolving a deadlock
-
-    # Two agents parked on each other -- neither can proceed
-    trelane park alpha --task task-a --wait-reply msg-never-a --waiting-on beta \
-        --resume-hint "blocked on beta forever"
-    trelane park beta --task task-b --wait-reply msg-never-b --waiting-on alpha \
-        --resume-hint "blocked on alpha forever"
-
-    # The pump detects the cycle and wakes the designated breaker
-    trelane pump --once
-
-    # Check that the deadlock was resolved
+    trelane park alpha --wait-reply msg-never-a --waiting-on beta
+    trelane park beta --wait-reply msg-never-b --waiting-on alpha
+    trelane prop --once
     trelane status
-    trelane biplane
 
-### Scenario 4: Domain shifting mid-session
+### Domain shifting mid-session
 
-    # Research agent expands into UI copy review
-    trelane redomain research --writable 'research/**' 'src/ui/**' \
-        --desc 'Expands into UI copy review after cross-team agreement.'
+    trelane redomain research --writable 'research/**' 'src/ui/**'
+    trelane prop --once
 
-    # Other agents are notified automatically via info messages.
-    # The pump will wake them to process the notification.
+### Interactive testing with real AI
 
-    trelane pump --once
-
-### Scenario 5: Interactive tmux testing with real AI
-
-    # 1. Configure low-cost models in ~/.config/trelane/config.json
-    #    (see the Testing Harness section above)
-
-    # 2. Run the interactive scenario
-    trelane --testing /Users/jadennation/DEV/01_active_projects/trelane/tests/full-usage-scenario-interactive.json
-
-    # 3. Attach to the created tmux session
-    tmux attach-session -t trelane-testing-<timestamp>
-
-    # 4. Watch the agents work in their panes.
-    #    Press F2 for a diagnostic status overlay.
-    #    Press F3 for the current pane's inbox.
-
-    # 5. Run Biplane for a full analysis
-    trelane biplane
-
-### Scenario 6: Safe_pocket project analysis
-
-    # Analyze a project that has a safe_pocket with feature files
-    trelane biplane --safe-pocket ~/.safe_pocket
-
-    # Get JSON output for scripting
-    trelane biplane --safe-pocket ~/.safe_pocket --json > report.json
+    trelane --testing tests/full-usage-scenario-interactive.json
 
 ## Message format
-
-Messages are stored as rows in SQLite, HMAC-SHA256 signed over the
-canonical JSON (sorted keys, `sig` excluded) with the session secret.
 
 | field      | req | notes                                          |
 |------------|-----|------------------------------------------------|
@@ -410,9 +326,6 @@ canonical JSON (sorted keys, `sig` excluded) with the session secret.
 | schema     | yes | integer, currently 1                           |
 | sig        | yes | HMAC-SHA256 hex                                 |
 
-Lifecycle: unprocessed -> (handled) -> processed. An unacked message keeps
-its recipient on the pump's wake list -- messages cannot sit unnoticed.
-
 ## Domains and claims
 
 `domain.json` globs (`**` spans directories) define what an agent may
@@ -422,11 +335,10 @@ write. Enforcement is three layers:
 2. **Claim gate**: `trelane claim` refuses paths in another agent's domain
    unless a `claim-grant` message id is presented (`--grant`). Leases are
    acquired via SQLite `INSERT OR IGNORE` -- one winner even under a true
-   race -- and expire on TTL (the pump reaps and notifies).
+   race -- and expire on TTL (the prop reaps and notifies).
 3. **Audit**: at wake, trelane snapshots content hashes of all dirty files;
    `trelane audit <agent>` flags out-of-domain files changed *during that
-   run*. Violations are recorded in the database and the run fails its exit
-   checklist.
+   run*.
 
 ## Security model (honest edition)
 
@@ -435,17 +347,16 @@ prompt-injected forgery by anything that lacks the session secret. It is
 not inter-agent authentication: all agents run as the same OS user and
 could read the secret. Same for domains: the claim gate and audit are
 guardrails against confused or prompt-injected agents, not sandboxes
-against adversarial code. If you need hard isolation, run each agent as
-its own OS user or container and mount only its domain read-write; the
-protocol above is unchanged.
+against adversarial code.
 
 ## Development
 
-    cargo build          # compile
-    cargo clippy -- -D warnings   # lint
-    cargo test           # run unit tests
-    TRELANE_DEMO_REPEAT=3 bash demo-rust.sh    # repeatable full-usage scenario demo (no tokens)
-    trelane --testing /Users/jadennation/DEV/01_active_projects/trelane/tests/full-usage-scenario.json --testing-runs 3
+    cargo build                              # compile
+    cargo clippy -- -D warnings              # lint
+    cargo test                               # run unit tests (46 passing)
+    trelane --testing tests/small.json       # quick scenario test
+    trelane --testing tests/medium.json      # medium scenario
+    trelane --testing tests/large.json       # large scenario with real deadlock
 
 ## License
 
