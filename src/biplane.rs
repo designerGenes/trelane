@@ -482,7 +482,7 @@ pub fn generate_biplane_report(
         });
     }
 
-    let (_, cycle) = crate::pump::wait_graph(&ctx.conn)?;
+    let (_, cycle) = crate::prop::wait_graph(&ctx.conn)?;
     let deadlock = cycle.clone();
 
     let safe_pocket_features = scan_safe_pocket_features(safe_pocket_dir);
@@ -497,7 +497,7 @@ pub fn generate_biplane_report(
     for a in &agent_summaries {
         if a.inbox_count > 0 && !a.running {
             recommendations.push(format!(
-                "Agent '{}' has {} unprocessed message(s) but is not running. Consider 'trelane wake {}' or 'trelane pump --once'.",
+                "Agent '{}' has {} unprocessed message(s) but is not running. Consider 'trelane wake {}' or 'trelane prop --once'.",
                 a.name, a.inbox_count, a.name
             ));
         }
@@ -511,7 +511,7 @@ pub fn generate_biplane_report(
         }
     }
     if deadlock.is_some() {
-        recommendations.push("Deadlock detected in the wait-for graph. Run 'trelane pump --once' to trigger the designated breaker.".to_string());
+        recommendations.push("Deadlock detected in the wait-for graph. Run 'trelane prop --once' to trigger the designated breaker.".to_string());
     }
     if !safe_pocket_features.is_empty() {
         recommendations.push(format!(
@@ -636,7 +636,7 @@ pub fn cmd_welcome(project: Option<PathBuf>) -> Result<()> {
         println!(
             "    trelane send --from user --to AGENT --type question --subject '...'  -- assign work"
         );
-        println!("    trelane pump --watch        -- start the pump");
+        println!("    trelane prop --watch        -- start the prop");
         println!("    trelane --testing tests/full-usage-scenario.json  -- run the test harness");
         println!();
     } else {
@@ -781,9 +781,1070 @@ fn scan_feature_dir(dir: &Path) -> Vec<String> {
     found
 }
 
+// ==================== Structured project-description format ====================
+//
+// A human- (or safe_pocket-) authored "high-level project description": the
+// intended domain split for a project, its planned work, and the dependency
+// edges between domains. This is the deterministic, offline counterpart to the
+// LLM-driven `run_biplane_plan` above -- no model call, fully reproducible, and
+// safe to run before a project has ever been analyzed.
+
+/// The top-level structured description a user hands to Biplane via
+/// `trelane biplane --describe <file.json>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectDescription {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub domains: Vec<DomainSpec>,
+    /// Optional cap on total agents. The effective cap is the min of this and
+    /// any `--max-agents` passed on the CLI.
+    #[serde(default)]
+    pub max_agents: Option<usize>,
+    #[serde(default)]
+    pub default_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainSpec {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub writable: Vec<String>,
+    #[serde(default)]
+    pub forbidden_write: Vec<String>,
+    /// Names of other domains that must be underway before this one. Used only
+    /// for ordering the work -- never for write permissions.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    #[serde(default)]
+    pub planned_work: Vec<PlannedWork>,
+    /// Desired number of agents for this domain (default 1). Plan derivation
+    /// keeps exactly one agent per domain so writable globs never overlap; the
+    /// next-steps scheduler honours the requested count when allocating the
+    /// agent budget across phases.
+    #[serde(default = "default_agent_count")]
+    pub agents: usize,
+}
+
+fn default_agent_count() -> usize {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedWork {
+    pub subject: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default = "default_work_priority")]
+    pub priority: String,
+}
+
+fn default_work_priority() -> String {
+    "normal".to_string()
+}
+
+/// Read and validate a project-description JSON file.
+pub fn load_project_description(path: &Path) -> Result<ProjectDescription> {
+    let text = fs::read_to_string(path).map_err(|e| {
+        TrelaneError::msg(format!(
+            "cannot read project description {}: {e}",
+            path.display()
+        ))
+    })?;
+    let desc: ProjectDescription = serde_json::from_str(&text).map_err(|e| {
+        TrelaneError::msg(format!(
+            "invalid project description JSON in {}: {e}",
+            path.display()
+        ))
+    })?;
+    validate_description(&desc)?;
+    Ok(desc)
+}
+
+/// Validate structural invariants: non-empty names, unique domains, at least
+/// one writable glob per domain, dependency targets that exist, and -- most
+/// importantly -- no dependency cycle among domains (which would make the work
+/// impossible to order).
+pub fn validate_description(desc: &ProjectDescription) -> Result<()> {
+    if desc.name.trim().is_empty() {
+        return Err(TrelaneError::msg(
+            "project description: 'name' must not be empty",
+        ));
+    }
+    if desc.domains.is_empty() {
+        return Err(TrelaneError::msg(
+            "project description: at least one domain is required",
+        ));
+    }
+
+    let names: std::collections::HashSet<&str> =
+        desc.domains.iter().map(|d| d.name.as_str()).collect();
+    if names.len() != desc.domains.len() {
+        return Err(TrelaneError::msg(
+            "project description: domain names must be unique",
+        ));
+    }
+
+    for d in &desc.domains {
+        if d.name.trim().is_empty() {
+            return Err(TrelaneError::msg(
+                "project description: a domain has an empty name",
+            ));
+        }
+        if d.writable.is_empty() {
+            return Err(TrelaneError::msg(format!(
+                "project description: domain '{}' has no writable globs",
+                d.name
+            )));
+        }
+        if d.agents == 0 {
+            return Err(TrelaneError::msg(format!(
+                "project description: domain '{}' requests 0 agents (must be >= 1)",
+                d.name
+            )));
+        }
+        for dep in &d.depends_on {
+            if dep == &d.name {
+                return Err(TrelaneError::msg(format!(
+                    "project description: domain '{}' depends on itself",
+                    d.name
+                )));
+            }
+            if !names.contains(dep.as_str()) {
+                return Err(TrelaneError::msg(format!(
+                    "project description: domain '{}' depends_on unknown domain '{}'",
+                    d.name, dep
+                )));
+            }
+        }
+    }
+
+    if let Some(cycle) = domain_dependency_cycle(desc) {
+        let mut display = cycle.clone();
+        display.push(cycle[0].clone());
+        return Err(TrelaneError::msg(format!(
+            "project description: dependency cycle among domains: {}",
+            display.join(" -> ")
+        )));
+    }
+    Ok(())
+}
+
+/// DFS cycle detection over the domain `depends_on` graph. Mirrors the wait-for
+/// graph detector in `prop.rs`; returns the nodes on the first cycle found.
+fn domain_dependency_cycle(desc: &ProjectDescription) -> Option<Vec<String>> {
+    use std::collections::{HashMap, HashSet};
+    let edges: HashMap<&str, &Vec<String>> = desc
+        .domains
+        .iter()
+        .map(|d| (d.name.as_str(), &d.depends_on))
+        .collect();
+
+    let mut visited = HashSet::new();
+    let mut names: Vec<&str> = desc.domains.iter().map(|d| d.name.as_str()).collect();
+    names.sort();
+    for start in names {
+        let mut stack = Vec::new();
+        let mut on_stack = HashSet::new();
+        if let Some(cycle) = dep_dfs(start, &edges, &mut visited, &mut stack, &mut on_stack) {
+            return Some(cycle);
+        }
+    }
+    None
+}
+
+fn dep_dfs(
+    node: &str,
+    edges: &std::collections::HashMap<&str, &Vec<String>>,
+    visited: &mut std::collections::HashSet<String>,
+    stack: &mut Vec<String>,
+    on_stack: &mut std::collections::HashSet<String>,
+) -> Option<Vec<String>> {
+    if on_stack.contains(node) {
+        let start = stack.iter().position(|n| n == node).unwrap();
+        return Some(stack[start..].to_vec());
+    }
+    if visited.contains(node) {
+        return None;
+    }
+    visited.insert(node.to_string());
+    stack.push(node.to_string());
+    on_stack.insert(node.to_string());
+
+    if let Some(deps) = edges.get(node) {
+        for d in deps.iter() {
+            if let Some(cycle) = dep_dfs(d, edges, visited, stack, on_stack) {
+                return Some(cycle);
+            }
+        }
+    }
+
+    stack.pop();
+    on_stack.remove(node);
+    None
+}
+
+/// Topological order of domains, dependencies first, ties broken
+/// lexicographically for determinism. Errors if a cycle prevents ordering
+/// (validate_description catches this earlier, but the guard is kept so this is
+/// safe to call directly).
+pub fn topo_order_domains(desc: &ProjectDescription) -> Result<Vec<String>> {
+    use std::collections::HashMap;
+    let mut indeg: HashMap<&str, usize> = desc
+        .domains
+        .iter()
+        .map(|d| (d.name.as_str(), d.depends_on.len()))
+        .collect();
+
+    let mut order: Vec<String> = Vec::new();
+    loop {
+        let mut ready: Vec<&str> = indeg
+            .iter()
+            .filter(|(_, deg)| **deg == 0)
+            .map(|(n, _)| *n)
+            .collect();
+        if ready.is_empty() {
+            break;
+        }
+        ready.sort();
+        for n in ready {
+            order.push(n.to_string());
+            indeg.remove(n);
+            for d in &desc.domains {
+                if d.depends_on.iter().any(|x| x == n)
+                    && let Some(deg) = indeg.get_mut(d.name.as_str())
+                {
+                    *deg = deg.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    if order.len() != desc.domains.len() {
+        return Err(TrelaneError::msg(
+            "project description: dependency cycle prevents ordering",
+        ));
+    }
+    Ok(order)
+}
+
+/// Derive a concrete, sound agent plan from a description: exactly one agent per
+/// domain (so writable globs never overlap), domains taken in dependency order,
+/// truncated to the effective agent cap. Planned work becomes each agent's
+/// initial tasks.
+pub fn plan_from_description(desc: &ProjectDescription, max_agents: usize) -> Result<BiplanePlan> {
+    let order = topo_order_domains(desc)?;
+    let by_name: std::collections::HashMap<&str, &DomainSpec> =
+        desc.domains.iter().map(|d| (d.name.as_str(), d)).collect();
+
+    let cap = desc
+        .max_agents
+        .unwrap_or(max_agents)
+        .min(max_agents)
+        .max(1);
+
+    let mut agents = Vec::new();
+    let mut initial_tasks = Vec::new();
+    for name in &order {
+        if agents.len() >= cap {
+            break;
+        }
+        let d = by_name[name.as_str()];
+        agents.push(BiplanePlanAgent {
+            name: d.name.clone(),
+            description: d.description.clone(),
+            writable: d.writable.clone(),
+        });
+        for w in &d.planned_work {
+            initial_tasks.push(BiplanePlanTask {
+                agent: d.name.clone(),
+                subject: w.subject.clone(),
+                body: w.body.clone(),
+            });
+        }
+    }
+
+    let kept: std::collections::HashSet<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+    initial_tasks.retain(|t| kept.contains(t.agent.as_str()));
+    Ok(BiplanePlan {
+        agents,
+        initial_tasks,
+    })
+}
+
+// ----------------------------- next-steps analysis -----------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NextStepsPlan {
+    pub agent_budget: usize,
+    pub total_domains: usize,
+    pub phases: Vec<NextStepsPhase>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NextStepsPhase {
+    pub phase: usize,
+    pub assignments: Vec<NextStepsAssignment>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NextStepsAssignment {
+    pub domain: String,
+    pub agents: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_task: Option<String>,
+}
+
+/// Given an agent budget, schedule the domains into phases: each phase runs the
+/// domains whose dependencies are already satisfied, greedily spending the
+/// budget (honouring each domain's requested agent count). When there are more
+/// domains than agents, the work spills into later phases -- modelling agents
+/// hopping to the next unblocked domain as they finish.
+pub fn next_steps_plan(desc: &ProjectDescription, agent_budget: usize) -> Result<NextStepsPlan> {
+    use std::collections::HashSet;
+    let budget = agent_budget.max(1);
+    let by_name: std::collections::HashMap<&str, &DomainSpec> =
+        desc.domains.iter().map(|d| (d.name.as_str(), d)).collect();
+
+    let total = desc.domains.len();
+    let mut completed: HashSet<String> = HashSet::new();
+    let mut phases: Vec<NextStepsPhase> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+
+    let mut guard = 0;
+    while completed.len() < total {
+        guard += 1;
+        if guard > total + 1 {
+            return Err(TrelaneError::msg(
+                "next-steps: failed to schedule domains (possible dependency cycle)",
+            ));
+        }
+
+        let mut available: Vec<&str> = desc
+            .domains
+            .iter()
+            .filter(|d| !completed.contains(&d.name))
+            .filter(|d| d.depends_on.iter().all(|dep| completed.contains(dep)))
+            .map(|d| d.name.as_str())
+            .collect();
+        available.sort();
+        if available.is_empty() {
+            return Err(TrelaneError::msg(
+                "next-steps: work remains but no domain is unblocked (dependency cycle)",
+            ));
+        }
+
+        let mut remaining = budget;
+        let mut assignments = Vec::new();
+        for name in &available {
+            if remaining == 0 {
+                break;
+            }
+            let d = by_name[*name];
+            let want = d.agents.max(1).min(remaining);
+            assignments.push(NextStepsAssignment {
+                domain: d.name.clone(),
+                agents: want,
+                first_task: d.planned_work.first().map(|w| w.subject.clone()),
+            });
+            remaining -= want;
+            completed.insert(d.name.clone());
+        }
+        phases.push(NextStepsPhase {
+            phase: phases.len() + 1,
+            assignments,
+        });
+    }
+
+    if total > budget {
+        notes.push(format!(
+            "{total} domains, {budget} agent(s): work runs in {} phase(s). As an agent finishes its domain, it hops to the next domain whose dependencies are met.",
+            phases.len()
+        ));
+    } else {
+        notes.push(format!(
+            "{total} domains within a budget of {budget} agent(s): every startable domain can run in parallel."
+        ));
+    }
+    Ok(NextStepsPlan {
+        agent_budget: budget,
+        total_domains: total,
+        phases,
+        notes,
+    })
+}
+
+/// `trelane biplane --describe <file>` entry point. Validates the description,
+/// prints the analysis (or JSON), and optionally writes the derived plan.
+pub fn cmd_describe(
+    root: &Path,
+    desc_path: &Path,
+    next_steps: bool,
+    emit_plan: bool,
+    agent_budget: Option<usize>,
+    json: bool,
+) -> Result<()> {
+    let desc = load_project_description(desc_path)?;
+    let budget = agent_budget
+        .or(desc.max_agents)
+        .unwrap_or(desc.domains.len())
+        .max(1);
+
+    let order = topo_order_domains(&desc)?;
+    let plan = plan_from_description(&desc, budget)?;
+    let steps = if next_steps {
+        Some(next_steps_plan(&desc, budget)?)
+    } else {
+        None
+    };
+
+    if emit_plan {
+        let out = root.join(".trelane").join("biplane-plan.json");
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&out, serde_json::to_string_pretty(&plan)?)?;
+        if !json {
+            println!("  Derived plan written to {}", out.display());
+        }
+    }
+
+    if json {
+        let mut obj = serde_json::json!({
+            "description": desc,
+            "dependency_order": order,
+            "derived_plan": plan,
+        });
+        if let Some(steps) = &steps {
+            obj["next_steps"] = serde_json::to_value(steps)?;
+        }
+        println!("{}", serde_json::to_string_pretty(&obj)?);
+    } else {
+        print_description_analysis(&desc, &order, &plan, steps.as_ref(), budget);
+    }
+    Ok(())
+}
+
+fn print_description_analysis(
+    desc: &ProjectDescription,
+    order: &[String],
+    plan: &BiplanePlan,
+    steps: Option<&NextStepsPlan>,
+    budget: usize,
+) {
+    println!();
+    crate::logo::print_logo();
+    println!("  Biplane Project Description");
+    println!("  ==========================");
+    println!("  Project : {}", desc.name);
+    if !desc.description.is_empty() {
+        println!("  Summary : {}", desc.description);
+    }
+    println!("  Domains : {}", desc.domains.len());
+    println!("  Budget  : {budget} agent(s)");
+    println!();
+
+    println!("  Domains (dependency order):");
+    for name in order {
+        if let Some(d) = desc.domains.iter().find(|d| &d.name == name) {
+            let deps = if d.depends_on.is_empty() {
+                "none".to_string()
+            } else {
+                d.depends_on.join(", ")
+            };
+            println!(
+                "    {:<16} agents={} depends_on={}",
+                d.name, d.agents, deps
+            );
+            if !d.description.is_empty() {
+                println!("      {}", d.description);
+            }
+            println!("      writable : {}", d.writable.join(", "));
+            if !d.planned_work.is_empty() {
+                println!("      work ({}):", d.planned_work.len());
+                for w in &d.planned_work {
+                    println!("        - [{}] {}", w.priority, w.subject);
+                }
+            }
+        }
+    }
+    println!();
+
+    println!("  Derived plan ({} agent(s)):", plan.agents.len());
+    for a in &plan.agents {
+        println!("    {:<16} {}", a.name, a.description);
+    }
+    if plan.agents.len() < desc.domains.len() {
+        println!(
+            "    (note: {} domain(s) exceed the agent budget and were left out of the",
+            desc.domains.len() - plan.agents.len()
+        );
+        println!("     derived plan; see the next-steps schedule for how to phase them.)");
+    }
+    println!();
+
+    if let Some(steps) = steps {
+        println!("  Next steps ({} phase(s)):", steps.phases.len());
+        for phase in &steps.phases {
+            let summary: Vec<String> = phase
+                .assignments
+                .iter()
+                .map(|a| format!("{} x{}", a.domain, a.agents))
+                .collect();
+            println!("    Phase {}: {}", phase.phase, summary.join(", "));
+            for a in &phase.assignments {
+                if let Some(task) = &a.first_task {
+                    println!("      {} -> start: {}", a.domain, task);
+                }
+            }
+        }
+        for note in &steps.notes {
+            println!("    - {note}");
+        }
+        println!();
+    }
+}
+
+// ----------------------------- interactive biplane -----------------------------
+
+/// One user decision about a proposed domain in the interactive flow.
+#[derive(Debug, Clone)]
+pub struct DomainSelection {
+    pub name: String,
+    pub include: bool,
+    pub agents: usize,
+}
+
+/// Apply a set of include/agent-count decisions to a base description,
+/// producing a refined, validated description. Dependency edges pointing at
+/// excluded domains are pruned so the result stays valid. Domains with no
+/// explicit selection default to kept. This is the pure core of the
+/// interactive flow -- the stdin loop just gathers `DomainSelection`s and calls
+/// this.
+pub fn apply_domain_selection(
+    base: &ProjectDescription,
+    selections: &[DomainSelection],
+) -> Result<ProjectDescription> {
+    use std::collections::HashMap;
+    let sel: HashMap<&str, &DomainSelection> =
+        selections.iter().map(|s| (s.name.as_str(), s)).collect();
+
+    let kept = |name: &str| -> bool {
+        match sel.get(name) {
+            Some(s) => s.include,
+            None => true,
+        }
+    };
+
+    let mut domains = Vec::new();
+    for d in &base.domains {
+        if !kept(&d.name) {
+            continue;
+        }
+        let mut nd = d.clone();
+        if let Some(s) = sel.get(d.name.as_str()) {
+            nd.agents = s.agents.max(1);
+        }
+        // Drop dependency edges to domains that were excluded, so validation
+        // does not fail on a now-missing dependency target.
+        nd.depends_on.retain(|dep| kept(dep));
+        domains.push(nd);
+    }
+
+    let refined = ProjectDescription {
+        name: base.name.clone(),
+        description: base.description.clone(),
+        domains,
+        max_agents: base.max_agents,
+        default_model: base.default_model.clone(),
+    };
+    validate_description(&refined)?;
+    Ok(refined)
+}
+
+/// Propose a starter description by inspecting the project's source layout:
+/// one domain per immediate subdirectory of a recognized source root. Purely
+/// deterministic -- no model call -- so the interactive flow can suggest a
+/// sensible split even for a project that has never been analyzed.
+pub fn scaffold_description_from_structure(root: &Path) -> ProjectDescription {
+    let project_name = root
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "project".to_string());
+
+    let mut domains: Vec<DomainSpec> = Vec::new();
+    let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for src_root in ["src", "lib", "app", "packages", "crates"] {
+        let dir = root.join(src_root);
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Ok(entries) = fs::read_dir(&dir) {
+            let mut subdirs: Vec<String> = entries
+                .flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| {
+                    !n.starts_with('.')
+                        && !matches!(
+                            n.as_str(),
+                            "target" | "node_modules" | "__pycache__" | "dist" | "build"
+                        )
+                })
+                .collect();
+            subdirs.sort();
+            for sub in subdirs {
+                let mut name = sub.clone();
+                let mut n = 2;
+                while used_names.contains(&name) {
+                    name = format!("{sub}-{n}");
+                    n += 1;
+                }
+                used_names.insert(name.clone());
+                domains.push(DomainSpec {
+                    name,
+                    description: format!("Owns {src_root}/{sub}"),
+                    writable: vec![format!("{src_root}/{sub}/**")],
+                    forbidden_write: vec![],
+                    depends_on: vec![],
+                    planned_work: vec![],
+                    agents: 1,
+                });
+            }
+        }
+    }
+
+    if domains.is_empty() {
+        // Nothing recognizable -- propose a single catch-all domain.
+        let writable = if root.join("src").is_dir() {
+            vec!["src/**".to_string()]
+        } else {
+            vec!["**".to_string()]
+        };
+        domains.push(DomainSpec {
+            name: "core".to_string(),
+            description: "Owns the whole project".to_string(),
+            writable,
+            forbidden_write: vec![],
+            depends_on: vec![],
+            planned_work: vec![],
+            agents: 1,
+        });
+    }
+
+    ProjectDescription {
+        name: project_name,
+        description: "Scaffolded from the project's source layout.".to_string(),
+        domains,
+        max_agents: None,
+        default_model: None,
+    }
+}
+
+fn normalize_urgency(priority: &str) -> String {
+    match priority {
+        "low" | "normal" | "high" | "critical" => priority.to_string(),
+        _ => "normal".to_string(),
+    }
+}
+
+/// Register the plan's agents in a live session and queue their planned work as
+/// initial questions from `user`. Existing agents are left untouched. Returns
+/// the number of agents newly registered.
+fn apply_plan_to_session(
+    ctx: &crate::Context,
+    desc: &ProjectDescription,
+    plan: &BiplanePlan,
+) -> Result<usize> {
+    let model = desc.default_model.as_deref();
+    let existing = crate::store::list_agents(&ctx.conn)?;
+    let spec: std::collections::HashMap<&str, &DomainSpec> =
+        desc.domains.iter().map(|d| (d.name.as_str(), d)).collect();
+
+    let mut added = 0;
+    for a in &plan.agents {
+        if existing.contains(&a.name) {
+            continue;
+        }
+        crate::commands::cmd_add_agent(ctx, &a.name, &a.writable, Some(&a.description), model)?;
+        // Apply forbidden_write globs if the domain declares any (cmd_add_agent
+        // only sets writable; this mirrors the testing harness's upsert path).
+        if let Some(d) = spec.get(a.name.as_str())
+            && !d.forbidden_write.is_empty()
+        {
+            crate::store::upsert_agent(
+                &ctx.conn,
+                &a.name,
+                &a.description,
+                &a.writable,
+                model,
+                &d.forbidden_write,
+                &crate::crypto::now_iso(),
+            )?;
+        }
+        added += 1;
+    }
+
+    for t in &plan.initial_tasks {
+        let urgency = spec
+            .get(t.agent.as_str())
+            .and_then(|d| d.planned_work.iter().find(|w| w.subject == t.subject))
+            .map(|w| normalize_urgency(&w.priority))
+            .unwrap_or_else(|| "normal".to_string());
+        crate::commands::cmd_send(
+            ctx, "user", &t.agent, "question", &urgency, &t.subject, &t.body, &None, &None, &[],
+        )?;
+    }
+    Ok(added)
+}
+
+fn prompt_line(prompt: &str) -> Result<String> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut s = String::new();
+    io::stdin().read_line(&mut s)?;
+    Ok(s.trim().to_string())
+}
+
+fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
+    let ans = prompt_line(prompt)?.to_lowercase();
+    if ans.is_empty() {
+        return Ok(default_yes);
+    }
+    Ok(ans == "y" || ans == "yes")
+}
+
+/// `trelane biplane --interactive` entry point. Seeds from a `--describe` file
+/// if given, otherwise scaffolds from the source layout; lets the user pick
+/// domains and agent counts; shows the derived phased plan; writes it to
+/// `.trelane/`; and optionally applies it to a live session.
+#[allow(clippy::too_many_arguments)]
+pub fn cmd_biplane_interactive(
+    root: &Path,
+    describe_path: Option<&Path>,
+    budget_opt: Option<usize>,
+    accept_defaults: bool,
+    json: bool,
+) -> Result<()> {
+    let base = match describe_path {
+        Some(p) => load_project_description(p)?,
+        None => scaffold_description_from_structure(root),
+    };
+    validate_description(&base)?;
+
+    let default_budget = budget_opt
+        .or(base.max_agents)
+        .unwrap_or_else(|| base.domains.len().min(4).max(1));
+
+    if !accept_defaults && !json {
+        println!();
+        crate::logo::print_logo();
+        println!("  Interactive Biplane");
+        println!("  ===================");
+        println!("  Project : {}", base.name);
+        println!("  Source  : {}", if describe_path.is_some() {
+            "project-description file"
+        } else {
+            "scaffolded from source layout"
+        });
+        println!("  Proposed domains: {}", base.domains.len());
+        println!();
+    }
+
+    let order = topo_order_domains(&base)?;
+
+    let budget = if accept_defaults {
+        default_budget
+    } else {
+        let ans = prompt_line(&format!("  Agent budget [{default_budget}]: "))?;
+        if ans.is_empty() {
+            default_budget
+        } else {
+            ans.parse().unwrap_or(default_budget).max(1)
+        }
+    };
+
+    let mut selections = Vec::new();
+    for name in &order {
+        let d = base.domains.iter().find(|d| &d.name == name).unwrap();
+        if accept_defaults {
+            selections.push(DomainSelection {
+                name: d.name.clone(),
+                include: true,
+                agents: d.agents,
+            });
+            continue;
+        }
+        let include = prompt_yes_no(
+            &format!(
+                "  Include domain '{}' (writable: {})? [Y/n] ",
+                d.name,
+                d.writable.join(", ")
+            ),
+            true,
+        )?;
+        let agents = if include {
+            let ans = prompt_line(&format!("    agents for '{}' [{}]: ", d.name, d.agents))?;
+            if ans.is_empty() {
+                d.agents
+            } else {
+                ans.parse().unwrap_or(d.agents).max(1)
+            }
+        } else {
+            d.agents
+        };
+        selections.push(DomainSelection {
+            name: d.name.clone(),
+            include,
+            agents,
+        });
+    }
+
+    let refined = apply_domain_selection(&base, &selections)?;
+    if refined.domains.is_empty() {
+        return Err(TrelaneError::msg("interactive biplane: no domains selected"));
+    }
+
+    let order2 = topo_order_domains(&refined)?;
+    let plan = plan_from_description(&refined, budget)?;
+    let steps = next_steps_plan(&refined, budget)?;
+
+    let dir = root.join(".trelane");
+    fs::create_dir_all(&dir)?;
+    let desc_out = dir.join("biplane-description.json");
+    let plan_out = dir.join("biplane-plan.json");
+    fs::write(&desc_out, serde_json::to_string_pretty(&refined)?)?;
+    fs::write(&plan_out, serde_json::to_string_pretty(&plan)?)?;
+
+    let db_exists = dir.join("trelane.db").exists();
+    // JSON mode is analysis-only: applying would print agent/message progress
+    // to stdout and corrupt the JSON document. Consumers get the plan file path
+    // and can apply with a non-JSON invocation.
+    let want_apply = if json || !db_exists {
+        false
+    } else if accept_defaults {
+        true
+    } else {
+        prompt_yes_no(
+            "  Apply now: register agents and queue their initial tasks? [y/N] ",
+            false,
+        )?
+    };
+
+    let mut applied = 0usize;
+    if want_apply {
+        let ctx = crate::Context::open(Some(root))?;
+        applied = apply_plan_to_session(&ctx, &refined, &plan)?;
+    }
+
+    if json {
+        let obj = serde_json::json!({
+            "description": refined,
+            "dependency_order": order2,
+            "derived_plan": plan,
+            "next_steps": steps,
+            "applied_agents": applied,
+            "plan_file": plan_out.display().to_string(),
+        });
+        println!("{}", serde_json::to_string_pretty(&obj)?);
+    } else {
+        print_description_analysis(&refined, &order2, &plan, Some(&steps), budget);
+        println!("  Plan written to {}", plan_out.display());
+        if applied > 0 {
+            println!("  Registered {applied} agent(s) and queued their initial task(s).");
+            println!("  Start the swarm with:  trelane prop --watch");
+        } else if db_exists {
+            println!("  Not applied. Re-run and confirm apply, or launch with the written plan.");
+        } else {
+            println!("  No trelane session here yet. Run 'trelane init', then re-run to apply.");
+        }
+        println!();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn domain(name: &str, deps: &[&str], agents: usize) -> DomainSpec {
+        DomainSpec {
+            name: name.to_string(),
+            description: format!("owns {name}"),
+            writable: vec![format!("src/{name}/**")],
+            forbidden_write: vec![],
+            depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            planned_work: vec![PlannedWork {
+                subject: format!("build {name}"),
+                body: String::new(),
+                priority: "normal".to_string(),
+            }],
+            agents,
+        }
+    }
+
+    fn desc(domains: Vec<DomainSpec>, max_agents: Option<usize>) -> ProjectDescription {
+        ProjectDescription {
+            name: "test-project".to_string(),
+            description: "a test".to_string(),
+            domains,
+            max_agents,
+            default_model: None,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_dependency_cycle() {
+        let d = desc(
+            vec![
+                domain("a", &["b"], 1),
+                domain("b", &["a"], 1),
+            ],
+            None,
+        );
+        let err = validate_description(&d).unwrap_err();
+        assert!(format!("{err:?}").contains("cycle"));
+    }
+
+    #[test]
+    fn validate_rejects_unknown_dependency() {
+        let d = desc(vec![domain("a", &["ghost"], 1)], None);
+        let err = validate_description(&d).unwrap_err();
+        assert!(format!("{err:?}").contains("unknown domain"));
+    }
+
+    #[test]
+    fn topo_order_puts_dependencies_first() {
+        // c depends on b depends on a  =>  a, b, c
+        let d = desc(
+            vec![
+                domain("c", &["b"], 1),
+                domain("b", &["a"], 1),
+                domain("a", &[], 1),
+            ],
+            None,
+        );
+        let order = topo_order_domains(&d).unwrap();
+        assert_eq!(order, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn plan_from_description_respects_cap_and_order() {
+        let d = desc(
+            vec![
+                domain("c", &["b"], 1),
+                domain("b", &["a"], 1),
+                domain("a", &[], 1),
+            ],
+            None,
+        );
+        let plan = plan_from_description(&d, 2).unwrap();
+        // Cap of 2 keeps the two earliest in dependency order: a, b.
+        let names: Vec<&str> = plan.agents.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b"]);
+        // Tasks for the dropped domain 'c' must not survive.
+        assert!(plan.initial_tasks.iter().all(|t| t.agent != "c"));
+    }
+
+    #[test]
+    fn next_steps_phases_when_domains_exceed_agents() {
+        // Four independent domains, budget of 2  =>  two phases of two.
+        let d = desc(
+            vec![
+                domain("a", &[], 1),
+                domain("b", &[], 1),
+                domain("c", &[], 1),
+                domain("d", &[], 1),
+            ],
+            None,
+        );
+        let steps = next_steps_plan(&d, 2).unwrap();
+        assert_eq!(steps.phases.len(), 2);
+        assert_eq!(steps.phases[0].assignments.len(), 2);
+        assert_eq!(steps.phases[1].assignments.len(), 2);
+    }
+
+    #[test]
+    fn next_steps_honours_requested_agent_count() {
+        // 'heavy' wants 2 agents; with budget 3 it and one more run in phase 1.
+        let d = desc(
+            vec![
+                domain("heavy", &[], 2),
+                domain("light", &[], 1),
+            ],
+            None,
+        );
+        let steps = next_steps_plan(&d, 3).unwrap();
+        assert_eq!(steps.phases.len(), 1);
+        let heavy = steps.phases[0]
+            .assignments
+            .iter()
+            .find(|a| a.domain == "heavy")
+            .unwrap();
+        assert_eq!(heavy.agents, 2);
+    }
+
+    #[test]
+    fn apply_domain_selection_excludes_and_prunes_dependencies() {
+        // a  <- b  <- c   ; exclude b  =>  c's depends_on [b] must be pruned.
+        let base = desc(
+            vec![
+                domain("a", &[], 1),
+                domain("b", &["a"], 1),
+                domain("c", &["b"], 1),
+            ],
+            None,
+        );
+        let selections = vec![
+            DomainSelection { name: "a".into(), include: true, agents: 1 },
+            DomainSelection { name: "b".into(), include: false, agents: 1 },
+            DomainSelection { name: "c".into(), include: true, agents: 1 },
+        ];
+        let refined = apply_domain_selection(&base, &selections).unwrap();
+        let names: Vec<&str> = refined.domains.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "c"]);
+        let c = refined.domains.iter().find(|d| d.name == "c").unwrap();
+        assert!(c.depends_on.is_empty(), "dangling dep on excluded 'b' must be pruned");
+    }
+
+    #[test]
+    fn apply_domain_selection_sets_agent_counts() {
+        let base = desc(vec![domain("a", &[], 1)], None);
+        let selections = vec![DomainSelection {
+            name: "a".into(),
+            include: true,
+            agents: 3,
+        }];
+        let refined = apply_domain_selection(&base, &selections).unwrap();
+        assert_eq!(refined.domains[0].agents, 3);
+    }
+
+    #[test]
+    fn scaffold_proposes_one_domain_per_source_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src").join("ui")).unwrap();
+        std::fs::create_dir_all(root.join("src").join("api")).unwrap();
+        std::fs::create_dir_all(root.join("src").join("data")).unwrap();
+
+        let scaffolded = scaffold_description_from_structure(root);
+        let mut names: Vec<&str> = scaffolded.domains.iter().map(|d| d.name.as_str()).collect();
+        names.sort();
+        assert_eq!(names, vec!["api", "data", "ui"]);
+        // Every scaffolded domain must be independently valid.
+        validate_description(&scaffolded).unwrap();
+    }
+
+    #[test]
+    fn scaffold_falls_back_to_core_when_no_source_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scaffolded = scaffold_description_from_structure(tmp.path());
+        assert_eq!(scaffolded.domains.len(), 1);
+        assert_eq!(scaffolded.domains[0].name, "core");
+    }
 
     #[test]
     fn extract_model_arg_reads_full_model_id() {

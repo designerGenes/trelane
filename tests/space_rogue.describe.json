@@ -1,0 +1,75 @@
+{
+  "name": "space_rogue",
+  "description": "A roguelike where you pilot a ship through procedurally generated sectors. Example project-description for Biplane's --describe mode.",
+  "max_agents": 3,
+  "default_model": "glm-5.2",
+  "domains": [
+    {
+      "name": "engine",
+      "description": "Core simulation: turn loop, RNG, entity/component storage. Everything else builds on this.",
+      "writable": ["src/engine/**"],
+      "depends_on": [],
+      "agents": 1,
+      "planned_work": [
+        {
+          "subject": "Turn loop and scheduler",
+          "body": "Implement the deterministic turn scheduler that advances entities in initiative order.",
+          "priority": "high"
+        },
+        {
+          "subject": "Seedable RNG",
+          "body": "Wrap a seedable PRNG so sector generation is reproducible from a seed.",
+          "priority": "high"
+        }
+      ]
+    },
+    {
+      "name": "worldgen",
+      "description": "Procedural sector, map, and encounter generation.",
+      "writable": ["src/worldgen/**"],
+      "depends_on": ["engine"],
+      "agents": 1,
+      "planned_work": [
+        {
+          "subject": "Sector graph generator",
+          "body": "Generate a connected graph of sectors with jump lanes between them.",
+          "priority": "high"
+        }
+      ]
+    },
+    {
+      "name": "combat",
+      "description": "Ship-to-ship combat rules, weapons, and damage resolution.",
+      "writable": ["src/combat/**"],
+      "depends_on": ["engine"],
+      "agents": 2,
+      "planned_work": [
+        {
+          "subject": "Weapon and damage model",
+          "body": "Model weapons, cooldowns, shields, and hull damage resolution.",
+          "priority": "normal"
+        }
+      ]
+    },
+    {
+      "name": "ui",
+      "description": "Terminal rendering and input handling for the map and combat views.",
+      "writable": ["src/ui/**"],
+      "forbidden_write": ["src/ui/secrets/**"],
+      "depends_on": ["worldgen", "combat"],
+      "agents": 1,
+      "planned_work": [
+        {
+          "subject": "Sector map view",
+          "body": "Render the current sector graph and the player's position.",
+          "priority": "normal"
+        },
+        {
+          "subject": "Combat HUD",
+          "body": "Show shields, hull, and weapon cooldowns during combat.",
+          "priority": "low"
+        }
+      ]
+    }
+  ]
+}

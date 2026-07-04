@@ -262,6 +262,31 @@ pub enum Command {
     Biplane {
         #[arg(long = "safe-pocket")]
         safe_pocket_dir: Option<PathBuf>,
+        #[arg(
+            long = "describe",
+            help = "analyze a structured project-description JSON file (offline, no model call)"
+        )]
+        describe: Option<PathBuf>,
+        #[arg(
+            long = "next-steps",
+            help = "include a phased next-steps schedule (use with --describe)"
+        )]
+        next_steps: bool,
+        #[arg(
+            long = "emit-plan",
+            help = "write the derived agent plan to .trelane/biplane-plan.json (use with --describe)"
+        )]
+        emit_plan: bool,
+        #[arg(
+            long = "interactive",
+            help = "interactively choose domains and agent assignment, then optionally apply"
+        )]
+        interactive: bool,
+        #[arg(
+            long = "accept-defaults",
+            help = "non-interactive: accept all proposed domains and defaults (use with --interactive)"
+        )]
+        accept_defaults: bool,
         #[arg(long)]
         json: bool,
     },

@@ -99,11 +99,19 @@ pub type PumpConfig = PropConfig;
 #[serde(default)]
 pub struct UiConfig {
     pub keys: UiKeys,
-    /// Bind Alt+arrow keys to move focus between tmux panes. This is a
-    /// tmux-level binding that works in any terminal emulator; matching the
-    /// host terminal's native pane shortcuts (e.g. Ghostty's cmd-option
-    /// arrows) is intentionally out of scope for now.
+    /// Bind arrow keys to move focus between tmux panes. The binding lives at
+    /// the tmux level, so it works in any terminal emulator. When
+    /// `match_host_terminal` is set, Trelane tries to match the host
+    /// terminal's own pane-navigation shortcuts (see below); otherwise it uses
+    /// Alt+arrows.
     pub pane_navigation: bool,
+    /// Try to match the host terminal's native pane-navigation keybindings.
+    /// For Ghostty, Trelane reads `~/.config/ghostty/config` and mirrors any
+    /// `goto_split` bindings whose modifiers tmux can actually receive
+    /// (Alt/Ctrl/Shift). Cmd/Super-based bindings can't be forwarded to tmux
+    /// on macOS, so those fall back to Alt+arrows. Other terminals use
+    /// Alt+arrows directly.
+    pub match_host_terminal: bool,
 }
 
 impl Default for UiConfig {
@@ -111,6 +119,7 @@ impl Default for UiConfig {
         Self {
             keys: UiKeys::default(),
             pane_navigation: true,
+            match_host_terminal: true,
         }
     }
 }

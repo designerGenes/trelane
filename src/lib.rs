@@ -562,10 +562,44 @@ pub fn handle(cli: Cli) -> Result<()> {
         }
         Some(Command::Biplane {
             safe_pocket_dir,
+            describe,
+            next_steps,
+            emit_plan,
+            interactive,
+            accept_defaults,
             json,
         }) => {
-            let ctx = Context::open(cli.root.as_deref())?;
-            biplane::cmd_biplane(&ctx, safe_pocket_dir.as_deref(), json)
+            if interactive {
+                // Interactive/describe paths need no DB, so they work even
+                // before a project is initialized as a trelane session.
+                let root = match cli.root.as_deref() {
+                    Some(p) => p.to_path_buf(),
+                    None => std::env::current_dir()?,
+                };
+                biplane::cmd_biplane_interactive(
+                    &root,
+                    describe.as_deref(),
+                    cli.max_agents.map(|m| m as usize),
+                    accept_defaults,
+                    json,
+                )
+            } else if let Some(desc_path) = describe {
+                let root = match cli.root.as_deref() {
+                    Some(p) => p.to_path_buf(),
+                    None => std::env::current_dir()?,
+                };
+                biplane::cmd_describe(
+                    &root,
+                    &desc_path,
+                    next_steps,
+                    emit_plan,
+                    cli.max_agents.map(|m| m as usize),
+                    json,
+                )
+            } else {
+                let ctx = Context::open(cli.root.as_deref())?;
+                biplane::cmd_biplane(&ctx, safe_pocket_dir.as_deref(), json)
+            }
         }
         Some(Command::Stub { agent }) => {
             let ctx = Context::open(cli.root.as_deref())?;
