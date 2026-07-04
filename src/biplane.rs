@@ -57,31 +57,105 @@ pub fn run_biplane_plan(
     println!("[biplane] Launching planner with model '{}'...", model);
     println!("[biplane] Prompt: {}", prompt_file.display());
 
-    let output = Command::new("sh")
-        .arg("-c")
-        .arg(&cmd)
-        .current_dir(project_root)
-        .output()?;
+    let mut last_error = String::new();
+    let output_file = project_root
+        .join(".trelane")
+        .join("biplane-plan-output.txt");
+    let runner_script = project_root.join(".trelane").join("biplane-runner.sh");
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(TrelaneError::msg(format!(
-            "biplane planner failed: {}",
-            stderr.trim()
-        )));
+    // Write the runner as a standalone shell script so command substitution
+    // ("$(cat prompt)") is preserved exactly. Building a nested `sh -c '...'`
+    // string mangles the quoting and corrupts the request opencode sends.
+    fs::write(&runner_script, format!("#!/bin/sh\n{cmd}\n"))?;
+
+    for attempt in 1..=3 {
+        if attempt > 1 {
+            println!("[biplane] Retrying (attempt {}/3)...", attempt);
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+
+        let out_handle = std::fs::File::create(&output_file)?;
+        let err_handle = out_handle.try_clone()?;
+
+        let status = Command::new("sh")
+            .arg(&runner_script)
+            .current_dir(project_root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(out_handle))
+            .stderr(std::process::Stdio::from(err_handle))
+            .status()?;
+
+        let stdout = std::fs::read_to_string(&output_file).unwrap_or_default();
+
+        let text = extract_text_from_json_events(&stdout);
+        let cleaned = strip_ansi(&text);
+
+        if let Ok(plan) = parse_biplane_plan(&cleaned, max_agents) {
+            return Ok(plan);
+        }
+
+        if let Ok(plan) = parse_biplane_plan(&strip_ansi(&stdout), max_agents) {
+            return Ok(plan);
+        }
+
+        last_error = if stdout.trim().is_empty() {
+            format!("exit code: {:?}", status.code())
+        } else {
+            let preview = if stdout.len() > 500 {
+                &stdout[..500]
+            } else {
+                &stdout
+            };
+            format!("exit code: {:?}, output: {}", status.code(), preview)
+        };
+
+        if attempt < 3 {
+            eprintln!(
+                "[biplane] Attempt {} failed: {}",
+                attempt,
+                &last_error[..200.min(last_error.len())]
+            );
+        }
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let plan = parse_biplane_plan(&stdout, max_agents)?;
-
-    Ok(plan)
+    Err(TrelaneError::msg(format!(
+        "biplane planner failed after 3 attempts: {}",
+        last_error
+    )))
 }
 
 fn resolve_launcher_template(model: &str) -> Result<String> {
+    // Determine the fully-qualified model id. Prefer the exact id from a
+    // configured launcher profile so we never guess an "openrouter/{model}"
+    // id -- an invalid id makes OpenRouter return an opaque
+    // "Unexpected server error".
+    let model_id = resolve_model_id(model)?;
     Ok(format!(
-        "opencode run --model openrouter/{} --dir {{root}} \"$(cat {{prompt_file}})\"",
-        model
+        "opencode run --model {model_id} --dir {{root}} \"$(cat {{prompt_file}})\""
     ))
+}
+
+/// Resolve a launcher label (e.g. "glm-5.2") to a fully-qualified model id
+/// (e.g. "openrouter/z-ai/glm-5.2") by reading the matching launcher profile's
+/// `--model` argument. Falls back to the label itself if no profile matches.
+fn resolve_model_id(model: &str) -> Result<String> {
+    let config = crate::load_config()?;
+    if let Some(profile) = config.launcher.profiles.get(model)
+        && let Some(id) = extract_model_arg(profile)
+    {
+        return Ok(id);
+    }
+    Ok(model.to_string())
+}
+
+fn extract_model_arg(profile: &str) -> Option<String> {
+    let tokens: Vec<&str> = profile.split_whitespace().collect();
+    for (i, t) in tokens.iter().enumerate() {
+        if (*t == "--model" || *t == "-m") && i + 1 < tokens.len() {
+            return Some(tokens[i + 1].to_string());
+        }
+    }
+    None
 }
 
 fn compose_biplane_planning_prompt(
@@ -153,6 +227,44 @@ Rules:
         max_agents,
         max_agents
     )
+}
+
+fn strip_ansi(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            while let Some(&next) = chars.peek() {
+                chars.next();
+                if next == 'm' {
+                    break;
+                }
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+fn extract_text_from_json_events(stdout: &str) -> String {
+    let mut text_parts = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() || !line.starts_with('{') {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line)
+            && v.get("type").and_then(|t| t.as_str()) == Some("text")
+            && let Some(text) = v
+                .get("part")
+                .and_then(|p| p.get("text"))
+                .and_then(|t| t.as_str())
+        {
+            text_parts.push(text.to_string());
+        }
+    }
+    text_parts.join("")
 }
 
 fn parse_biplane_plan(output: &str, max_agents: usize) -> Result<BiplanePlan> {
@@ -667,4 +779,35 @@ fn scan_feature_dir(dir: &Path) -> Vec<String> {
         }
     }
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_model_arg_reads_full_model_id() {
+        let profile =
+            "opencode {root} --model openrouter/z-ai/glm-5.2 --prompt \"$(cat {prompt_file})\"";
+        assert_eq!(
+            extract_model_arg(profile),
+            Some("openrouter/z-ai/glm-5.2".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_model_arg_supports_short_flag() {
+        assert_eq!(
+            extract_model_arg("opencode run -m github-copilot/gpt-5-mini --dir x"),
+            Some("github-copilot/gpt-5-mini".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_model_arg_none_when_absent() {
+        assert_eq!(
+            extract_model_arg("trelane --root {root} stub {agent}"),
+            None
+        );
+    }
 }
