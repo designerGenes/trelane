@@ -1044,11 +1044,39 @@ pub fn cmd_wake(
                 .replace("{agent}", agent)
                 .replace("{root}", &ctx.root.display().to_string())
         };
+
         let command = command_for_launch_target(&LaunchTarget {
             command: resolved_command,
             ..target.clone()
         });
-        launch_via_adapter(&target.adapter, &target.target, &command)?;
+
+        if target.adapter == "tmux" {
+            // Write the resolved command to a launch script so the pane
+            // executes a clean script file instead of receiving a complex
+            // command via tmux send-keys (which mangles quoting and
+            // command substitution).
+            let script_path = ctx
+                .trelane_dir()
+                .join("agents")
+                .join(agent)
+                .join("launch.sh");
+            if let Some(parent) = script_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&script_path, format!("#!/bin/sh\nexec {command}\n"))?;
+
+            launch_via_adapter(
+                &target.adapter,
+                &target.target,
+                &format!(
+                    "sh {}",
+                    shell_single_quote(&script_path.display().to_string())
+                ),
+            )?;
+        } else {
+            launch_via_adapter(&target.adapter, &target.target, &command)?;
+        }
+
         let inserted =
             store::insert_running_lock(&ctx.conn, agent, -1, &crypto::now_iso(), reason)?;
         if !inserted {

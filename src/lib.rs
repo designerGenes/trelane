@@ -19,7 +19,6 @@ use crate::error::{Result, TrelaneError};
 use crate::models::{Config, TRELANE_DIR};
 use clap::Parser;
 use rusqlite::Connection;
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 /// Resolve the global config directory, respecting XDG_CONFIG_HOME.
@@ -286,17 +285,23 @@ fn launch_interactive_pump(root: &std::path::Path, _primary_model: &str) -> Resu
     crate::splash::bind_diagnostic_toggle(&session_name).ok();
 
     println!("[launch] tmux session created: {}", session_name);
-    println!(
-        "[launch] Attach with: tmux attach-session -t {}",
-        session_name
-    );
     println!();
 
-    if std::io::stdout().is_terminal() {
-        std::process::Command::new("tmux")
-            .args(["attach-session", "-t", &session_name])
-            .status()?;
-    }
+    // Open a new Terminal.app window that attaches to the tmux session so
+    // the user can immediately see the agent panes.  We use osascript
+    // because `open -a Terminal` doesn't let us pass a command.
+    let attach_cmd = format!("tmux attach-session -t {}", session_name);
+    let script = format!(
+        "tell application \"Terminal\"\n\
+         activate\n\
+         do script \"{}\"\n\
+         end tell",
+        attach_cmd.replace('"', "\\\"")
+    );
+    std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .status()
+        .ok();
 
     Ok(())
 }

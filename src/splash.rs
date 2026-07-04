@@ -25,7 +25,10 @@ fn tmux(label: &str, args: &[&str]) -> Result<()> {
 /// and the non-zero exit was swallowed, so the status bar silently never
 /// appeared. Failures now surface via `tmux()`.
 pub fn set_session_status_bar(session: &str, project: &str, active: bool) -> Result<()> {
-    let status_text = format!("Trelane | {project} | {}", if active { "ACTIVE" } else { "IDLE" });
+    let status_text = format!(
+        "Trelane | {project} | {}",
+        if active { "ACTIVE" } else { "IDLE" }
+    );
     let bg_color = if active { "red" } else { "green" };
 
     tmux("status on", &["set-option", "-t", session, "status", "on"])?;
@@ -62,12 +65,15 @@ pub fn set_session_status_bar(session: &str, project: &str, active: bool) -> Res
 
 /// Send a one-shot Trelane splash into a specific tmux pane.
 pub fn send_splash_to_pane(pane_id: &str, agent: &str, reason: &str, root: &str) -> Result<()> {
+    // Use echo (not printf) so backslashes in the ASCII logo are printed
+    // literally instead of being interpreted as escape sequences.
+    let logo = crate::logo::LOGO_SMALL.replace('\'', "'\"'\"'");
+    let agent_q = agent.replace('\'', "'\"'\"'");
+    let reason_q = reason.replace('\'', "'\"'\"'");
+    let root_q = root.replace('\'', "'\"'\"'");
+
     let splash = format!(
-        "clear && printf '\\n\\n{}\\n  Agent   : {}\\n  Reason  : {}\\n  Project : {}\\n  Status  : launching...\\n\\n' && sleep 1",
-        crate::logo::LOGO_SMALL.replace('\'', "'\"'\"'"),
-        agent.replace('\'', "'\"'\"'"),
-        reason.replace('\'', "'\"'\"'"),
-        root.replace('\'', "'\"'\"'"),
+        "clear && echo '' && echo '' && echo '{logo}' && echo '  Agent   : {agent_q}' && echo '  Reason  : {reason_q}' && echo '  Project : {root_q}' && echo '  Status  : launching...' && echo '' && sleep 1"
     );
 
     tmux(
@@ -114,7 +120,16 @@ pub fn bind_diagnostic_toggle(session: &str) -> Result<()> {
     );
     tmux(
         "bind-key F3 (inbox)",
-        &["bind-key", "-n", "F3", "split-window", "-v", "-l", "40%", &inbox_cmd],
+        &[
+            "bind-key",
+            "-n",
+            "F3",
+            "split-window",
+            "-v",
+            "-l",
+            "40%",
+            &inbox_cmd,
+        ],
     )?;
     Ok(())
 }
