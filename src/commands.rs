@@ -16,21 +16,31 @@ pub fn is_running(conn: &Connection, agent: &str) -> Result<bool> {
     match store::get_running_lock(conn, agent)? {
         None => Ok(false),
         Some(lock) => {
+            let age_s = chrono::DateTime::parse_from_rfc3339(&lock.started_at)
+                .ok()
+                .map(|dt| {
+                    chrono::Utc::now()
+                        .signed_duration_since(dt.with_timezone(&chrono::Utc))
+                        .num_seconds()
+                })
+                .unwrap_or(0);
+
+            // Hard timeout: any running lock older than 5 minutes is stale,
+            // regardless of PID. This prevents stale locks when opencode
+            // sessions crash or are closed without calling 'trelane done'.
+            if age_s > 300 {
+                eprintln!(
+                    "warning: clearing stale running lock for {agent} (age={age_s}s, pid={})",
+                    lock.pid
+                );
+                store::delete_running_lock(conn, agent)?;
+                return Ok(false);
+            }
+
             if lock.pid <= 0 {
-                let age_s = chrono::DateTime::parse_from_rfc3339(&lock.started_at)
-                    .ok()
-                    .map(|dt| {
-                        chrono::Utc::now()
-                            .signed_duration_since(dt.with_timezone(&chrono::Utc))
-                            .num_seconds()
-                    })
-                    .unwrap_or(0);
-                if age_s > 900 {
-                    store::delete_running_lock(conn, agent)?;
-                    return Ok(false);
-                }
                 return Ok(true);
             }
+
             let alive = unsafe { libc::kill(lock.pid, 0) == 0 };
             if !alive {
                 store::delete_running_lock(conn, agent)?;
@@ -38,6 +48,35 @@ pub fn is_running(conn: &Connection, agent: &str) -> Result<bool> {
             Ok(alive)
         }
     }
+}
+
+pub fn clear_all_stale_locks(conn: &Connection) -> Result<usize> {
+    let agents = store::list_agents(conn)?;
+    let mut cleared = 0;
+    for agent in &agents {
+        if let Some(lock) = store::get_running_lock(conn, agent)? {
+            let age_s = chrono::DateTime::parse_from_rfc3339(&lock.started_at)
+                .ok()
+                .map(|dt| {
+                    chrono::Utc::now()
+                        .signed_duration_since(dt.with_timezone(&chrono::Utc))
+                        .num_seconds()
+                })
+                .unwrap_or(0);
+
+            let stale = age_s > 300 || (lock.pid > 0 && unsafe { libc::kill(lock.pid, 0) != 0 });
+
+            if stale {
+                eprintln!(
+                    "clearing stale lock for {agent} (age={age_s}s, pid={})",
+                    lock.pid
+                );
+                store::delete_running_lock(conn, agent)?;
+                cleared += 1;
+            }
+        }
+    }
+    Ok(cleared)
 }
 
 fn is_valid_agent_name(name: &str) -> bool {

@@ -186,7 +186,7 @@ fn cmd_launch(cli: Cli) -> Result<()> {
         } else {
             println!("[launch] No agents registered. Use --with-biplane or add agents manually.");
             println!(
-                "[launch] Run: trelane --project {} --models {} --max-agents {} --with-biplane",
+                "[launch] Run: trelane {} --models {} --max-agents {} --with-biplane",
                 root.display(),
                 primary_model,
                 max_agents
@@ -194,11 +194,57 @@ fn cmd_launch(cli: Cli) -> Result<()> {
             return Ok(());
         }
     } else {
+        // Resume mode: agents already exist. Clear stale locks and check
+        // for pending work so we can pick up where we left off.
         println!(
             "[launch] Found {} existing agent(s): {}",
             existing_agents.len(),
             existing_agents.join(", ")
         );
+
+        let ctx = Context::open(Some(&root))?;
+        let cleared = crate::commands::clear_all_stale_locks(&ctx.conn)?;
+        if cleared > 0 {
+            println!("[launch] Cleared {} stale running lock(s)", cleared);
+        }
+
+        // Summarize pending work
+        let mut pending_inbox = 0;
+        let mut ready_parks = 0;
+        let mut stuck_parks = 0;
+        for agent in &existing_agents {
+            let inbox = crate::store::get_unprocessed_messages(&ctx.conn, agent)?.len();
+            pending_inbox += inbox;
+
+            for task in crate::store::list_parked_tasks_for_agent(&ctx.conn, agent)? {
+                if crate::prompt::park_satisfied(&ctx.conn, &task)? {
+                    ready_parks += 1;
+                } else {
+                    stuck_parks += 1;
+                }
+            }
+        }
+
+        if pending_inbox > 0 || ready_parks > 0 {
+            println!(
+                "[launch] Resuming: {} unprocessed message(s), {} ready parked task(s), {} waiting parked task(s)",
+                pending_inbox, ready_parks, stuck_parks
+            );
+        } else if stuck_parks > 0 {
+            println!(
+                "[launch] {} parked task(s) still waiting (no ready replies). Pump will attempt deadlock breaking if needed.",
+                stuck_parks
+            );
+        } else {
+            println!(
+                "[launch] No pending work found. All agents have empty inboxes and no parked tasks."
+            );
+            println!(
+                "[launch] Assign new work with: trelane send --from user --to <agent> --type question --subject '...' --body '...'"
+            );
+            println!("[launch] Or run: trelane {} biplane", root.display());
+            return Ok(());
+        }
         println!();
     }
 
