@@ -1090,10 +1090,11 @@ pub fn cmd_wake(
         });
 
         if target.adapter == "tmux" {
-            // Write the resolved command to a launch script so the pane
-            // executes a clean script file instead of receiving a complex
-            // command via tmux send-keys (which mangles quoting and
-            // command substitution).
+            // Write a single launch script containing the splash AND the
+            // agent command.  Sending two separate send-keys calls (splash
+            // then launch) causes a race: the splash's `sleep` is still
+            // running when the launch command arrives, so it gets lost.
+            // One script = one send-keys = no race.
             let script_path = ctx
                 .trelane_dir()
                 .join("agents")
@@ -1102,7 +1103,16 @@ pub fn cmd_wake(
             if let Some(parent) = script_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::write(&script_path, format!("#!/bin/sh\nexec {command}\n"))?;
+            let logo = crate::logo::LOGO_SMALL.replace('\'', "'\"'\"'");
+            let root_q = ctx.root.display().to_string().replace('\'', "'\"'\"'");
+            let agent_q = agent.replace('\'', "'\"'\"'");
+            let reason_q = reason.replace('\'', "'\"'\"'");
+            std::fs::write(
+                &script_path,
+                format!(
+                    "#!/bin/sh\nclear\nprintf '\\n\\n%s\\n  Agent   : %s\\n  Reason  : %s\\n  Project : %s\\n  Status  : launching...\\n\\n' '{logo}' '{agent_q}' '{reason_q}' '{root_q}'\nexec {command}\n",
+                ),
+            )?;
 
             launch_via_adapter(
                 &target.adapter,
