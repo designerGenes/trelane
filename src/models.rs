@@ -28,6 +28,8 @@ pub struct Config {
     pub claims: ClaimsConfig,
     #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
+    pub biplane: BiplaneConfig,
 }
 
 impl Default for Config {
@@ -64,6 +66,7 @@ impl Default for Config {
                 default_ttl_s: 900,
             },
             ui: UiConfig::default(),
+            biplane: BiplaneConfig::default(),
         }
     }
 }
@@ -148,6 +151,19 @@ impl Default for UiKeys {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimsConfig {
     pub default_ttl_s: u64,
+}
+
+/// Biplane configuration: controls optional re-analysis behaviour when the
+/// swarm goes fully quiescent (all agents stopped, all inboxes empty, no
+/// parked tasks).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BiplaneConfig {
+    /// When true, the prop watch loop checks for uncovered domains each time
+    /// the swarm becomes fully quiescent and auto-registers agents for any
+    /// new domains found.  Additive-only: existing agents are never removed
+    /// or re-assigned.
+    pub reanalyze_on_all_stop: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

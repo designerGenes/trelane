@@ -645,6 +645,11 @@ pub fn handle(cli: Cli) -> Result<()> {
                     eprintln!("warning: session UI setup failed: {e:?}");
                 }
             }
+            if ctx.config.biplane.reanalyze_on_all_stop {
+                eprintln!("  biplane : reanalyze_on_all_stop enabled");
+            }
+
+            let mut reanalyzed_this_stretch = false;
 
             loop {
                 let v = verbose || splash::verbose_enabled(session.as_deref());
@@ -667,6 +672,27 @@ pub fn handle(cli: Cli) -> Result<()> {
                 {
                     eprintln!("warning: status bar refresh failed: {e:?}");
                 }
+
+                // Biplane re-analysis: when the swarm is fully quiescent
+                // (no running agents, empty inboxes, no parked tasks) and
+                // the feature is enabled, look for uncovered domains and
+                // auto-register agents for them.  Fires at most once per
+                // idle stretch; resets when any agent is running again.
+                let any_running = crate::store::list_agents(&ctx.conn)?
+                    .iter()
+                    .any(|a| crate::commands::is_running(&ctx.conn, a).unwrap_or(false));
+                if any_running {
+                    reanalyzed_this_stretch = false;
+                } else if ctx.config.biplane.reanalyze_on_all_stop
+                    && !reanalyzed_this_stretch
+                    && crate::testing::swarm_quiescent(&ctx)?
+                {
+                    if let Err(e) = biplane::reanalyze_on_stop(&ctx) {
+                        eprintln!("warning: biplane re-analysis failed: {e:?}");
+                    }
+                    reanalyzed_this_stretch = true;
+                }
+
                 std::thread::sleep(std::time::Duration::from_secs(interval_s));
             }
         }

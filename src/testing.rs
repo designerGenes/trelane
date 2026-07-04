@@ -544,7 +544,7 @@ fn wait_for_idle(ctx: &Context, attempts: usize, delay: std::time::Duration) -> 
     ))
 }
 
-fn swarm_quiescent(ctx: &Context) -> Result<bool> {
+pub(crate) fn swarm_quiescent(ctx: &Context) -> Result<bool> {
     let any_running = crate::store::list_agents(&ctx.conn)?
         .iter()
         .any(|agent| crate::commands::is_running(&ctx.conn, agent).unwrap_or(false));

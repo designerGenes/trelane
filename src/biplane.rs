@@ -1038,11 +1038,7 @@ pub fn plan_from_description(desc: &ProjectDescription, max_agents: usize) -> Re
     let by_name: std::collections::HashMap<&str, &DomainSpec> =
         desc.domains.iter().map(|d| (d.name.as_str(), d)).collect();
 
-    let cap = desc
-        .max_agents
-        .unwrap_or(max_agents)
-        .min(max_agents)
-        .max(1);
+    let cap = desc.max_agents.unwrap_or(max_agents).min(max_agents).max(1);
 
     let mut agents = Vec::new();
     let mut initial_tasks = Vec::new();
@@ -1254,10 +1250,7 @@ fn print_description_analysis(
             } else {
                 d.depends_on.join(", ")
             };
-            println!(
-                "    {:<16} agents={} depends_on={}",
-                d.name, d.agents, deps
-            );
+            println!("    {:<16} agents={} depends_on={}", d.name, d.agents, deps);
             if !d.description.is_empty() {
                 println!("      {}", d.description);
             }
@@ -1495,7 +1488,16 @@ fn apply_plan_to_session(
             .map(|w| normalize_urgency(&w.priority))
             .unwrap_or_else(|| "normal".to_string());
         crate::commands::cmd_send(
-            ctx, "user", &t.agent, "question", &urgency, &t.subject, &t.body, &None, &None, &[],
+            ctx,
+            "user",
+            &t.agent,
+            "question",
+            &urgency,
+            &t.subject,
+            &t.body,
+            &None,
+            &None,
+            &[],
         )?;
     }
     Ok(added)
@@ -1537,7 +1539,7 @@ pub fn cmd_biplane_interactive(
 
     let default_budget = budget_opt
         .or(base.max_agents)
-        .unwrap_or_else(|| base.domains.len().min(4).max(1));
+        .unwrap_or_else(|| base.domains.len().clamp(1, 4));
 
     if !accept_defaults && !json {
         println!();
@@ -1545,11 +1547,14 @@ pub fn cmd_biplane_interactive(
         println!("  Interactive Biplane");
         println!("  ===================");
         println!("  Project : {}", base.name);
-        println!("  Source  : {}", if describe_path.is_some() {
-            "project-description file"
-        } else {
-            "scaffolded from source layout"
-        });
+        println!(
+            "  Source  : {}",
+            if describe_path.is_some() {
+                "project-description file"
+            } else {
+                "scaffolded from source layout"
+            }
+        );
         println!("  Proposed domains: {}", base.domains.len());
         println!();
     }
@@ -1605,7 +1610,9 @@ pub fn cmd_biplane_interactive(
 
     let refined = apply_domain_selection(&base, &selections)?;
     if refined.domains.is_empty() {
-        return Err(TrelaneError::msg("interactive biplane: no domains selected"));
+        return Err(TrelaneError::msg(
+            "interactive biplane: no domains selected",
+        ));
     }
 
     let order2 = topo_order_domains(&refined)?;
@@ -1698,13 +1705,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_dependency_cycle() {
-        let d = desc(
-            vec![
-                domain("a", &["b"], 1),
-                domain("b", &["a"], 1),
-            ],
-            None,
-        );
+        let d = desc(vec![domain("a", &["b"], 1), domain("b", &["a"], 1)], None);
         let err = validate_description(&d).unwrap_err();
         assert!(format!("{err:?}").contains("cycle"));
     }
@@ -1770,13 +1771,7 @@ mod tests {
     #[test]
     fn next_steps_honours_requested_agent_count() {
         // 'heavy' wants 2 agents; with budget 3 it and one more run in phase 1.
-        let d = desc(
-            vec![
-                domain("heavy", &[], 2),
-                domain("light", &[], 1),
-            ],
-            None,
-        );
+        let d = desc(vec![domain("heavy", &[], 2), domain("light", &[], 1)], None);
         let steps = next_steps_plan(&d, 3).unwrap();
         assert_eq!(steps.phases.len(), 1);
         let heavy = steps.phases[0]
@@ -1799,15 +1794,30 @@ mod tests {
             None,
         );
         let selections = vec![
-            DomainSelection { name: "a".into(), include: true, agents: 1 },
-            DomainSelection { name: "b".into(), include: false, agents: 1 },
-            DomainSelection { name: "c".into(), include: true, agents: 1 },
+            DomainSelection {
+                name: "a".into(),
+                include: true,
+                agents: 1,
+            },
+            DomainSelection {
+                name: "b".into(),
+                include: false,
+                agents: 1,
+            },
+            DomainSelection {
+                name: "c".into(),
+                include: true,
+                agents: 1,
+            },
         ];
         let refined = apply_domain_selection(&base, &selections).unwrap();
         let names: Vec<&str> = refined.domains.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, vec!["a", "c"]);
         let c = refined.domains.iter().find(|d| d.name == "c").unwrap();
-        assert!(c.depends_on.is_empty(), "dangling dep on excluded 'b' must be pruned");
+        assert!(
+            c.depends_on.is_empty(),
+            "dangling dep on excluded 'b' must be pruned"
+        );
     }
 
     #[test]
@@ -1871,4 +1881,120 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn new_agents_since_returns_only_unregistered() {
+        let plan = BiplanePlan {
+            agents: vec![
+                BiplanePlanAgent {
+                    name: "alpha".to_string(),
+                    description: "a".to_string(),
+                    writable: vec!["src/a/**".to_string()],
+                },
+                BiplanePlanAgent {
+                    name: "beta".to_string(),
+                    description: "b".to_string(),
+                    writable: vec!["src/b/**".to_string()],
+                },
+                BiplanePlanAgent {
+                    name: "gamma".to_string(),
+                    description: "g".to_string(),
+                    writable: vec!["src/c/**".to_string()],
+                },
+            ],
+            initial_tasks: vec![],
+        };
+        let existing = vec!["alpha".to_string(), "gamma".to_string()];
+        let new = new_agents_since(&existing, &plan);
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].name, "beta");
+    }
+
+    #[test]
+    fn new_agents_since_empty_when_all_registered() {
+        let plan = BiplanePlan {
+            agents: vec![BiplanePlanAgent {
+                name: "alpha".to_string(),
+                description: "a".to_string(),
+                writable: vec!["src/a/**".to_string()],
+            }],
+            initial_tasks: vec![],
+        };
+        let existing = vec!["alpha".to_string()];
+        assert!(new_agents_since(&existing, &plan).is_empty());
+    }
+}
+
+/// Return only the plan agents whose name is NOT in `existing`, preserving
+/// the plan's declaration order.  Used by `reanalyze_on_stop` to find
+/// domains that have not yet been registered as agents.
+pub fn new_agents_since(existing: &[String], plan: &BiplanePlan) -> Vec<BiplanePlanAgent> {
+    plan.agents
+        .iter()
+        .filter(|a| !existing.iter().any(|e| e == &a.name))
+        .cloned()
+        .collect()
+}
+
+/// Called from the prop watch loop when the swarm is fully quiescent and
+/// `biplane.reanalyze_on_all_stop` is enabled.  Loads (or scaffolds) a
+/// project description, derives a plan, and registers any agents for
+/// domains not yet covered -- additive-only, never touching existing
+/// agents.
+pub fn reanalyze_on_stop(ctx: &crate::Context) -> Result<()> {
+    let desc_path = ctx.trelane_dir().join("biplane-description.json");
+    let desc = if desc_path.exists() {
+        load_project_description(&desc_path)?
+    } else {
+        scaffold_description_from_structure(&ctx.root)
+    };
+
+    let max_agents = ctx.config.prop.max_concurrent.max(4);
+    let plan = plan_from_description(&desc, max_agents)?;
+    let existing = crate::store::list_agents(&ctx.conn)?;
+    let new_agents = new_agents_since(&existing, &plan);
+
+    if new_agents.is_empty() {
+        return Ok(());
+    }
+
+    eprintln!(
+        "{} biplane re-analysis: {} new domain(s) discovered",
+        crate::crypto::now_iso(),
+        new_agents.len()
+    );
+
+    for agent in &new_agents {
+        crate::commands::cmd_add_agent(
+            ctx,
+            &agent.name,
+            &agent.writable,
+            Some(&agent.description),
+            None,
+        )?;
+        eprintln!(
+            "  + registered agent: {} ({})",
+            agent.name, agent.description
+        );
+    }
+
+    // Queue initial work for each new agent.
+    for task in &plan.initial_tasks {
+        if new_agents.iter().any(|a| a.name == task.agent) {
+            crate::commands::cmd_send(
+                ctx,
+                "user",
+                &task.agent,
+                "question",
+                "normal",
+                &task.subject,
+                &task.body,
+                &None,
+                &None,
+                &[],
+            )?;
+        }
+    }
+
+    Ok(())
 }
