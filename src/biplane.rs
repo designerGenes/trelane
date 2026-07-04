@@ -482,7 +482,7 @@ pub fn generate_biplane_report(
         });
     }
 
-    let (_, cycle) = crate::prop::wait_graph(&ctx.conn)?;
+    let (_, cycle) = crate::squire::wait_graph(&ctx.conn)?;
     let deadlock = cycle.clone();
 
     let safe_pocket_features = scan_safe_pocket_features(safe_pocket_dir);
@@ -497,7 +497,7 @@ pub fn generate_biplane_report(
     for a in &agent_summaries {
         if a.inbox_count > 0 && !a.running {
             recommendations.push(format!(
-                "Agent '{}' has {} unprocessed message(s) but is not running. Consider 'trelane wake {}' or 'trelane prop --once'.",
+                "Agent '{}' has {} unprocessed message(s) but is not running. Consider 'trelane wake {}' or 'trelane squire --once'.",
                 a.name, a.inbox_count, a.name
             ));
         }
@@ -511,7 +511,7 @@ pub fn generate_biplane_report(
         }
     }
     if deadlock.is_some() {
-        recommendations.push("Deadlock detected in the wait-for graph. Run 'trelane prop --once' to trigger the designated breaker.".to_string());
+        recommendations.push("Deadlock detected in the wait-for graph. Run 'trelane squire --once' to trigger the designated breaker.".to_string());
     }
     if !safe_pocket_features.is_empty() {
         recommendations.push(format!(
@@ -636,7 +636,7 @@ pub fn cmd_welcome(project: Option<PathBuf>) -> Result<()> {
         println!(
             "    trelane send --from user --to AGENT --type question --subject '...'  -- assign work"
         );
-        println!("    trelane prop --watch        -- start the prop");
+        println!("    trelane squire --watch        -- start the prop");
         println!("    trelane --testing tests/full-usage-scenario.json  -- run the test harness");
         println!();
     } else {
@@ -932,7 +932,7 @@ pub fn validate_description(desc: &ProjectDescription) -> Result<()> {
 }
 
 /// DFS cycle detection over the domain `depends_on` graph. Mirrors the wait-for
-/// graph detector in `prop.rs`; returns the nodes on the first cycle found.
+/// graph detector in `squire.rs`; returns the nodes on the first cycle found.
 fn domain_dependency_cycle(desc: &ProjectDescription) -> Option<Vec<String>> {
     use std::collections::{HashMap, HashSet};
     let edges: HashMap<&str, &Vec<String>> = desc
@@ -1662,7 +1662,7 @@ pub fn cmd_biplane_interactive(
         println!("  Plan written to {}", plan_out.display());
         if applied > 0 {
             println!("  Registered {applied} agent(s) and queued their initial task(s).");
-            println!("  Start the swarm with:  trelane prop --watch");
+            println!("  Start the swarm with:  trelane squire --watch");
         } else if db_exists {
             println!("  Not applied. Re-run and confirm apply, or launch with the written plan.");
         } else {
@@ -1936,7 +1936,7 @@ pub fn new_agents_since(existing: &[String], plan: &BiplanePlan) -> Vec<BiplaneP
         .collect()
 }
 
-/// Called from the prop watch loop when the swarm is fully quiescent and
+/// Called from the squire watch loop when the swarm is fully quiescent and
 /// `biplane.reanalyze_on_all_stop` is enabled.  Loads (or scaffolds) a
 /// project description, derives a plan, and registers any agents for
 /// domains not yet covered -- additive-only, never touching existing
@@ -1949,7 +1949,7 @@ pub fn reanalyze_on_stop(ctx: &crate::Context) -> Result<()> {
         scaffold_description_from_structure(&ctx.root)
     };
 
-    let max_agents = ctx.config.prop.max_concurrent.max(4);
+    let max_agents = ctx.config.squire.max_concurrent.max(4);
     let plan = plan_from_description(&desc, max_agents)?;
     let existing = crate::store::list_agents(&ctx.conn)?;
     let new_agents = new_agents_since(&existing, &plan);

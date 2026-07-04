@@ -63,5 +63,5 @@
       "explanation": "A single directed wait can never cycle."
     }
   ],
-  "metrics": ["messages_sent", "prop_ticks"]
+  "metrics": ["messages_sent", "squire_ticks"]
 }

@@ -1,6 +1,6 @@
 {
   "name": "large",
-  "description": "Large benchmark project: four agents across three phases -- fan-out Q&A with parallel parks, contested cross-domain claims, and a genuine wait-cycle that must be detected and broken by the prop's cycle detector (not by message side effects). Ends with a PropWatch quiescence check.",
+  "description": "Large benchmark project: four agents across three phases -- fan-out Q&A with parallel parks, contested cross-domain claims, and a genuine wait-cycle that must be detected and broken by the prop's cycle detector (not by message side effects). Ends with a SquireWatch quiescence check.",
   "launcher": "trelane --root {root} stub {agent}",
   "project": {
     "files": [
@@ -178,7 +178,7 @@
     },
     {
       "type": "Prop",
-      "explanation": "With no inbox work and no ready parks, the prop must detect the wait-cycle and wake the designated breaker (lexicographic minimum: api).",
+      "explanation": "With no inbox work and no ready parks, the squire must detect the wait-cycle and wake the designated breaker (lexicographic minimum: api).",
       "ticks": 1
     },
     {
@@ -207,8 +207,8 @@
       "body": "I have shifted domain to include docs/** for the coverage chapter."
     },
     {
-      "type": "PropWatch",
-      "explanation": "Run the prop as it runs in production until the swarm is quiescent: no running agents, empty inboxes, no parked tasks.",
+      "type": "SquireWatch",
+      "explanation": "Run the squire as it runs in production until the swarm is quiescent: no running agents, empty inboxes, no parked tasks.",
       "interval_s": 1,
       "max_ticks": 6,
       "idle_grace_ticks": 2
@@ -223,5 +223,5 @@
       "explanation": "The scenario must end with a clean ledger."
     }
   ],
-  "metrics": ["messages_sent", "prop_ticks", "redomains", "deadlocks_detected"]
+  "metrics": ["messages_sent", "squire_ticks", "redomains", "deadlocks_detected"]
 }

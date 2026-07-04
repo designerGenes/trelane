@@ -130,5 +130,5 @@
       "explanation": "No residual wait-cycle may remain in the ledger."
     }
   ],
-  "metrics": ["messages_sent", "prop_ticks", "redomains"]
+  "metrics": ["messages_sent", "squire_ticks", "redomains"]
 }

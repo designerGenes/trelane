@@ -11,6 +11,7 @@ pub mod prompt;
 pub mod prop;
 pub mod pump;
 pub mod splash;
+pub mod squire;
 pub mod store;
 pub mod telemetry;
 pub mod testing;
@@ -235,7 +236,7 @@ fn cmd_launch(cli: Cli) -> Result<()> {
             );
         } else if stuck_parks > 0 {
             println!(
-                "[launch] {} parked task(s) still waiting (no ready replies). The prop will attempt deadlock breaking if needed.",
+                "[launch] {} parked task(s) still waiting (no ready replies). The squire will attempt deadlock breaking if needed.",
                 stuck_parks
             );
         } else {
@@ -323,9 +324,9 @@ done
 
 tmux select-layout -t "$SESSION" tiled
 
-# Start the prop in the controller pane. TRELANE_SESSION lets the prop own
+# Start the squire in the controller pane. TRELANE_SESSION lets the squire own
 # the session UI: status bar refresh, key bindings, verbose marker.
-tmux send-keys -t "$CONTROLLER" "TRELANE_SESSION='$SESSION' '$EXE' --root '$ROOT' prop --watch" Enter
+tmux send-keys -t "$CONTROLLER" "TRELANE_SESSION='$SESSION' '$EXE' --root '$ROOT' squire --watch" Enter
 
 echo ""
 echo "Session $SESSION is ready."
@@ -363,7 +364,7 @@ exec tmux attach-session -t "$SESSION"
         "[launch] Terminal.app window opened with session: {}",
         session_name
     );
-    println!("[launch] The prop and agents will start automatically.");
+    println!("[launch] The squire and agents will start automatically.");
 
     Ok(())
 }
@@ -374,14 +375,14 @@ fn shell_quote(s: &str) -> String {
 }
 
 /// Compute the live session state and push it to the tmux status bar.
-/// Called by the prop on every watch tick.
+/// Called by the squire on every watch tick.
 fn refresh_session_status(ctx: &Context, session: &str) -> Result<()> {
     let agents = store::list_agents(&ctx.conn)?;
     let running = agents
         .iter()
         .filter(|a| commands::is_running(&ctx.conn, a).unwrap_or(false))
         .count();
-    let (_, cycle) = prop::wait_graph(&ctx.conn)?;
+    let (_, cycle) = squire::wait_graph(&ctx.conn)?;
     let state = if let Some(cycle) = cycle {
         let mut display = cycle.clone();
         display.push(cycle[0].clone());
@@ -606,7 +607,7 @@ pub fn handle(cli: Cli) -> Result<()> {
             let ctx = Context::open(cli.root.as_deref())?;
             commands::cmd_stub(&ctx, &agent)
         }
-        Some(Command::Prop {
+        Some(Command::Squire {
             once,
             watch,
             interval,
@@ -614,7 +615,7 @@ pub fn handle(cli: Cli) -> Result<()> {
             verbose,
         }) => {
             let ctx = Context::open(cli.root.as_deref())?;
-            // The launch script exports TRELANE_SESSION so the prop can own
+            // The launch script exports TRELANE_SESSION so the squire can own
             // the session UI (status bar, key bindings, verbose marker).
             let session = std::env::var("TRELANE_SESSION")
                 .ok()
@@ -622,16 +623,16 @@ pub fn handle(cli: Cli) -> Result<()> {
 
             if once || !watch {
                 let v = verbose || splash::verbose_enabled(session.as_deref());
-                prop::tick(&ctx, launcher.as_deref(), v)?;
+                squire::tick(&ctx, launcher.as_deref(), v)?;
                 return Ok(());
             }
 
-            let interval_s = interval.unwrap_or(ctx.config.prop.interval_s);
+            let interval_s = interval.unwrap_or(ctx.config.squire.interval_s);
 
-            // The controller frame is the prop's home: identify it.
+            // The controller frame is the squire's home: identify it.
             logo::print_logo();
             eprintln!(
-                "{} prop watching every {interval_s}s (ctrl-c to stop)",
+                "{} squire watching every {interval_s}s (ctrl-c to stop)",
                 crypto::now_iso()
             );
             if let Some(session) = session.as_deref() {
@@ -641,7 +642,7 @@ pub fn handle(cli: Cli) -> Result<()> {
                     ctx.config.ui.keys.verbose_toggle,
                     splash::verbose_marker_path(session)
                 );
-                // Best-effort: a broken tmux server must not kill the prop.
+                // Best-effort: a broken tmux server must not kill the squire.
                 if let Err(e) = splash::setup_session_ui(session, &ctx.config.ui) {
                     eprintln!("warning: session UI setup failed: {e:?}");
                 }
@@ -654,7 +655,7 @@ pub fn handle(cli: Cli) -> Result<()> {
 
             loop {
                 let v = verbose || splash::verbose_enabled(session.as_deref());
-                match prop::tick(&ctx, launcher.as_deref(), v) {
+                match squire::tick(&ctx, launcher.as_deref(), v) {
                     Ok(n) => {
                         if n > 0 {
                             eprintln!("{} launched {n} agent(s)", crypto::now_iso());
@@ -753,7 +754,7 @@ fn print_metrics(m: &telemetry::MetricsSummary) {
     println!("  Overview:");
     println!("    Total agent runs      : {}", m.total_runs);
     println!("    Total wait events     : {}", m.total_wait_events);
-    println!("    Total prop ticks      : {}", m.total_prop_ticks);
+    println!("    Total squire ticks      : {}", m.total_squire_ticks);
     println!(
         "    Total run time        : {}",
         fmt_ms(m.total_run_duration_ms)

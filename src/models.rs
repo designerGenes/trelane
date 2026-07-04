@@ -21,10 +21,11 @@ pub struct Config {
     #[serde(default)]
     pub agents: AgentConfig,
     pub launcher: LauncherConfig,
-    /// The prop (formerly "pump"). `alias = "pump"` keeps pre-0.3 config
-    /// files loading without migration.
-    #[serde(alias = "pump")]
-    pub prop: PropConfig,
+    /// The squire -- Trelane's dutiful assistant who restarts agents and
+    /// keeps the workflow in motion.  `alias = "pump"` and `alias = "prop"`
+    /// keep pre-0.3 config files loading without migration.
+    #[serde(alias = "pump", alias = "prop")]
+    pub squire: SquireConfig,
     pub claims: ClaimsConfig,
     #[serde(default)]
     pub ui: UiConfig,
@@ -58,7 +59,7 @@ impl Default for Config {
                     .to_string(),
                 profiles,
             },
-            prop: PropConfig {
+            squire: SquireConfig {
                 interval_s: 20,
                 max_concurrent: 2,
             },
@@ -87,13 +88,14 @@ pub struct LauncherConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PropConfig {
+pub struct SquireConfig {
     pub interval_s: u64,
     pub max_concurrent: usize,
 }
 
-/// Deprecated name for [`PropConfig`], kept so external code compiles.
-pub type PumpConfig = PropConfig;
+/// Deprecated name for [`SquireConfig`], kept so external code compiles.
+pub type PumpConfig = SquireConfig;
+pub type PropConfig = SquireConfig;
 
 /// Session UI configuration: tmux key bindings and pane-navigation behaviour.
 /// All keys use tmux key syntax (`F2`, `M-Left`, `C-b`, ...). Bindings land
@@ -134,7 +136,7 @@ pub struct UiKeys {
     pub diagnostics: String,
     /// Pop a diagnostic split showing the focused pane's agent inbox.
     pub inbox: String,
-    /// Toggle verbose prop output for the session frame.
+    /// Toggle verbose squire output for the session frame.
     pub verbose_toggle: String,
 }
 
@@ -159,7 +161,7 @@ pub struct ClaimsConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BiplaneConfig {
-    /// When true, the prop watch loop checks for uncovered domains each time
+    /// When true, the squire watch loop checks for uncovered domains each time
     /// the swarm becomes fully quiescent and auto-registers agents for any
     /// new domains found.  Additive-only: existing agents are never removed
     /// or re-assigned.

@@ -202,7 +202,7 @@ pub fn cmd_init(project: Option<PathBuf>) -> Result<()> {
 
     std::fs::write(
         trelane_dir.join(".gitignore"),
-        "secret\nagents/*/.prompt.md\nagents/*/logs/\nprop.log\npump.log\n*.db-wal\n*.db-shm\n",
+        "secret\nagents/*/.prompt.md\nagents/*/logs/\nsquire.log\nsquire.log\n*.db-wal\n*.db-shm\n",
     )?;
 
     let db_path = trelane_dir.join("trelane.db");
@@ -1108,7 +1108,7 @@ pub fn cmd_status(ctx: &Context) -> Result<()> {
         println!("  {}  held by {} until {exp}", l.path, l.holder);
     }
 
-    let (_, cycle) = crate::prop::wait_graph(&ctx.conn)?;
+    let (_, cycle) = crate::squire::wait_graph(&ctx.conn)?;
     if let Some(cycle) = cycle {
         let mut display = cycle.clone();
         display.push(cycle[0].clone());
@@ -1224,7 +1224,7 @@ pub fn cmd_wake(
         let inserted =
             store::insert_running_lock(&ctx.conn, agent, -1, &crypto::now_iso(), reason)?;
         if !inserted {
-            eprintln!("warning: {agent} was already launched by another prop");
+            eprintln!("warning: {agent} was already launched by another squire");
         }
         println!(
             "relaunched {agent} via {} target={} reason={reason}",
@@ -1262,7 +1262,7 @@ pub fn cmd_wake(
 
     let inserted = store::insert_running_lock(&ctx.conn, agent, pid, &crypto::now_iso(), reason)?;
     if !inserted {
-        eprintln!("warning: {agent} was already launched by another prop");
+        eprintln!("warning: {agent} was already launched by another squire");
     }
     println!("launched {agent} pid={pid} reason={reason}");
     Ok(())

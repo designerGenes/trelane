@@ -2,7 +2,7 @@
 name = "trelane"
 version = "0.3.0"
 edition = "2024"
-description = "Park-and-prop multi-agent coordination protocol"
+description = "Park-and-squire multi-agent coordination protocol"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

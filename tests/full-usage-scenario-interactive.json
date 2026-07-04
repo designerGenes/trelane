@@ -1,6 +1,6 @@
 {
   "name": "full-usage-scenario-interactive",
-  "description": "Interactive multi-agent scenario intended for real tmux-managed agents rather than the stub harness. Requires low-cost launcher profiles such as Claude Haiku or GPT-5 mini. Trelane creates the tmux testing session and agent panes automatically and keeps the pump alive until the swarm settles.",
+  "description": "Interactive multi-agent scenario intended for real tmux-managed agents rather than the stub harness. Requires low-cost launcher profiles such as Claude Haiku or GPT-5 mini. Trelane creates the tmux testing session and agent panes automatically and keeps the squire alive until the swarm settles.",
   "mode": "interactive",
   "project": {
     "files": [
@@ -173,7 +173,7 @@
       "resume_hint": "Break the cycle with a documented assumption if designated."
     },
     {
-      "type": "PumpWatch",
+      "type": "SquireWatch",
       "explanation": "Keep the tmux-first swarm alive until all agents have drained their work, resolved the deadlock, and the session goes quiet.",
       "interval_s": 5,
       "max_ticks": 180,

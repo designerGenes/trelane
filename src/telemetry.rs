@@ -8,7 +8,7 @@
 //! Span types produced:
 //! - `agent.run` -- one per wake/done cycle (duration, code diff, reason)
 //! - `agent.wait` -- one per park/unpark cycle (sleep duration, waiting_on)
-//! - `prop.tick` -- one per prop tick (agents launched, cycle detected)
+//! - `squire.tick` -- one per squire tick (agents launched, cycle detected)
 //! - `agent.rate` -- inter-agent consensus rating (optional)
 
 use crate::error::Result;
@@ -183,8 +183,8 @@ impl Tracer {
         Ok(span_id)
     }
 
-    /// Record a prop tick span.
-    pub fn record_prop_tick(
+    /// Record a squire tick span.
+    pub fn record_squire_tick(
         &self,
         agents_launched: usize,
         agents_running: usize,
@@ -197,14 +197,14 @@ impl Tracer {
             trace_id: self.trace_id.clone(),
             span_id: span_id.clone(),
             parent_span_id: None,
-            name: "prop.tick".to_string(),
+            name: "squire.tick".to_string(),
             kind: 1, // INTERNAL
             start_time_unix_nano: start_ns,
             end_time_unix_nano: end_ns,
             attributes: vec![
-                attr_int("prop.agents_launched", agents_launched as i64),
-                attr_int("prop.agents_running", agents_running as i64),
-                attr_bool("prop.cycle_detected", cycle_detected),
+                attr_int("squire.agents_launched", agents_launched as i64),
+                attr_int("squire.agents_running", agents_running as i64),
+                attr_bool("squire.cycle_detected", cycle_detected),
                 attr_str("project.root", &self.project_root),
                 attr_str("session.name", &self.session_name),
             ],
@@ -402,7 +402,7 @@ pub fn git_diff_stats(root: &Path) -> (usize, usize, usize) {
 pub struct MetricsSummary {
     pub total_runs: usize,
     pub total_wait_events: usize,
-    pub total_prop_ticks: usize,
+    pub total_squire_ticks: usize,
     pub total_run_duration_ms: u64,
     pub total_wait_duration_ms: u64,
     pub total_files_changed: usize,
@@ -439,7 +439,7 @@ pub fn compute_metrics(trace_dir: &Path) -> Result<MetricsSummary> {
     let mut agent_map: HashMap<String, AgentMetrics> = HashMap::new();
     let mut total_runs = 0;
     let mut total_wait_events = 0;
-    let mut total_prop_ticks = 0;
+    let mut total_squire_ticks = 0;
     let mut total_run_duration_ms = 0u64;
     let mut total_wait_duration_ms = 0u64;
     let mut total_files_changed = 0;
@@ -517,9 +517,9 @@ pub fn compute_metrics(trace_dir: &Path) -> Result<MetricsSummary> {
                 entry.wait_events += 1;
                 entry.wait_duration_ms += duration_ms;
             }
-            Some("prop.tick") => {
-                total_prop_ticks += 1;
-                if get_attr_bool(&span.attributes, "prop.cycle_detected") {
+            Some("squire.tick") => {
+                total_squire_ticks += 1;
+                if get_attr_bool(&span.attributes, "squire.cycle_detected") {
                     total_deadlocks_detected += 1;
                 }
             }
@@ -553,7 +553,7 @@ pub fn compute_metrics(trace_dir: &Path) -> Result<MetricsSummary> {
     Ok(MetricsSummary {
         total_runs,
         total_wait_events,
-        total_prop_ticks,
+        total_squire_ticks,
         total_run_duration_ms,
         total_wait_duration_ms,
         total_files_changed,

@@ -61,7 +61,7 @@
     },
     {
       "type": "Pump",
-      "explanation": "The pump wakes backend to answer, then frontend to resume from the reply.",
+      "explanation": "The squire wakes backend to answer, then frontend to resume from the reply.",
       "ticks": 2
     },
     {
@@ -92,7 +92,7 @@
     },
     {
       "type": "Pump",
-      "explanation": "The pump wakes frontend to grant the claim, then backend to act on it.",
+      "explanation": "The squire wakes frontend to grant the claim, then backend to act on it.",
       "ticks": 2
     },
     {
@@ -156,7 +156,7 @@
     },
     {
       "type": "Pump",
-      "explanation": "With no inbox-first progress left, the pump should detect the wait-cycle and wake the designated breaker.",
+      "explanation": "With no inbox-first progress left, the squire should detect the wait-cycle and wake the designated breaker.",
       "ticks": 1
     },
     {

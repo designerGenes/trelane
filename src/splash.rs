@@ -20,7 +20,7 @@ fn tmux(label: &str, args: &[&str]) -> Result<()> {
 ///
 /// Colour semantics (changed in 0.3.0 -- previously red meant "active"):
 /// - green  = ACTIVE: at least one agent is running; work is happening
-/// - grey   = IDLE: no agents running, no wait-cycle; the prop is watching
+/// - grey   = IDLE: no agents running, no wait-cycle; the squire is watching
 /// - red    = DEADLOCK: a wait-cycle exists in the parked-task ledger
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionState {
@@ -50,7 +50,7 @@ impl SessionState {
 /// Set (or refresh) the session-scoped top status bar:
 /// `Trelane | <project> | ACTIVE (2 running)`.
 ///
-/// This is intentionally cheap and idempotent -- the prop calls it on every
+/// This is intentionally cheap and idempotent -- the squire calls it on every
 /// watch tick so the bar tracks the real session state instead of whatever
 /// it was set to at bootstrap. An earlier version set the bar exactly once
 /// (and only from the testing bootstrap), which is why it never updated.
@@ -116,14 +116,14 @@ pub fn send_splash_to_pane(pane_id: &str, agent: &str, reason: &str, root: &str)
     )
 }
 
-/// Path of the per-session marker file that toggles verbose prop output.
-/// Present = verbose on. The prop checks it every tick, so the toggle takes
+/// Path of the per-session marker file that toggles verbose squire output.
+/// Present = verbose on. The squire checks it every tick, so the toggle takes
 /// effect without restarting anything.
 pub fn verbose_marker_path(session: &str) -> String {
     format!("/tmp/trelane-{session}-verbose")
 }
 
-/// Whether verbose prop output is enabled for this session. `TRELANE_VERBOSE=1`
+/// Whether verbose squire output is enabled for this session. `TRELANE_VERBOSE=1`
 /// forces it on regardless of the marker (useful outside tmux).
 pub fn verbose_enabled(session: Option<&str>) -> bool {
     if std::env::var("TRELANE_VERBOSE").ok().as_deref() == Some("1") {
@@ -188,7 +188,7 @@ pub fn setup_session_ui(session: &str, ui: &UiConfig) -> Result<()> {
     )?;
 
     // Verbose toggle: flip the marker file and flash a confirmation in the
-    // tmux message line. The prop re-reads the marker every tick.
+    // tmux message line. The squire re-reads the marker every tick.
     let marker = verbose_marker_path(session);
     let toggle_cmd = format!(
         "if [ -f {marker} ]; then rm -f {marker}; tmux display-message 'trelane: verbose OFF'; \
@@ -196,7 +196,13 @@ pub fn setup_session_ui(session: &str, ui: &UiConfig) -> Result<()> {
     );
     tmux(
         "bind-key verbose toggle",
-        &["bind-key", "-n", &ui.keys.verbose_toggle, "run-shell", &toggle_cmd],
+        &[
+            "bind-key",
+            "-n",
+            &ui.keys.verbose_toggle,
+            "run-shell",
+            &toggle_cmd,
+        ],
     )?;
 
     // Pane navigation. When `match_host_terminal` is set, mirror the host
@@ -509,9 +515,7 @@ keybind = alt+down=goto_split:down
         let parsed = parse_ghostty_pane_nav(cfg);
         assert_eq!(parsed.unforwardable, 0);
         assert_eq!(parsed.forwardable.len(), 4);
-        assert!(parsed
-            .forwardable
-            .contains(&("M-Left".to_string(), "-L")));
+        assert!(parsed.forwardable.contains(&("M-Left".to_string(), "-L")));
     }
 
     #[test]

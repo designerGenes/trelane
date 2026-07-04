@@ -1,4 +1,4 @@
-# trelane -- park-and-prop multi-agent coordination
+# trelane -- park-and-squire multi-agent coordination
 
 A coordination protocol for running multiple single-shot AI agents (Claude
 Code, opencode, or any headless CLI agent) on one project without deadlock.
@@ -17,13 +17,13 @@ wake, drain inbox, work, park anything blocked, exit.
 2. **Inbox first.** Every run begins by draining the inbox. Responsiveness
    happens at run boundaries; run boundaries are frequent because runs are
    deliberately short.
-3. **The prop is the only restarter.** A dumb watcher (`trelane prop`, formerly
-   `trelane pump`) with zero intelligence: if an agent has unread mail, a
+3. **The squire is the only restarter.** A dumb watcher (`trelane squire`, formerly
+   `trelane squire`) with zero intelligence: if an agent has unread mail, a
    ready parked task, or sits in a wait-cycle nobody else will break,
    relaunch it. Cron-friendly (`--once`) or looping (`--watch`).
 
 Deadlock changes character: a wait-cycle can still form, but only in the
-ledger, where it is inspectable data. The prop runs cycle detection on the
+ledger, where it is inspectable data. The squire runs cycle detection on the
 wait-for graph and, when a cycle has no other way to move, wakes the
 lexicographically-first member as designated breaker (documented assumption
 + notify counterpart). Total silent deadlock is impossible.
@@ -34,13 +34,13 @@ All state lives in SQLite (`.trelane/trelane.db`) with WAL mode for
 concurrent reads. No daemons, no external services, no message queues --
 just one file.
 
-Global configuration (launcher template, prop settings, claim TTL, UI,
+Global configuration (launcher template, squire settings, claim TTL, UI,
 biplane) lives at `~/.config/trelane/config.json` (respects
 `XDG_CONFIG_HOME`). This is shared across all projects -- each project
 session only needs its own database, secret, and prompts.
 
     ~/.config/trelane/
-      config.json             global: launcher profiles, prop settings, claim TTL, UI, biplane
+      config.json             global: launcher profiles, squire settings, claim TTL, UI, biplane
 
     <project>/.trelane/
       trelane.db              SQLite: agents, messages, claims, parked tasks, running locks
@@ -69,7 +69,7 @@ Requires Rust 1.85+ (edition 2024). SQLite is compiled in via
     trelane add-agent backend  --writable 'src/api/**' --desc 'owns the API layer'
     trelane send --from user --to frontend --type question \
         --subject "build the login page" --body "..."
-    trelane prop --watch          # or: --once from cron
+    trelane squire --watch          # or: --once from cron
 
 Or launch everything at once with Biplane:
 
@@ -101,7 +101,7 @@ Dry-run the full lifecycle with zero tokens:
 | `trelane relaunch AGENT` | Inject a wake command into a tmux target |
 | `trelane done AGENT` | Mark an agent as done (release running lock) |
 | `trelane audit AGENT` | Check for out-of-domain file changes |
-| `trelane prop --once \| --watch [--interval SECS] [--launcher L] [--verbose\|-v]` | The dumb prop (`pump` still works as an alias) |
+| `trelane squire --once \| --watch [--interval SECS] [--launcher L] [--verbose\|-v]` | The dumb prop (`squire` still works as an alias) |
 | `trelane stub AGENT` | Token-free scripted agent for demos |
 | `trelane --testing tests/scenario.json [--testing-runs N]` | Run a scenario harness |
 
@@ -144,7 +144,7 @@ Note: green-for-active is a change from pre-0.3, where red meant active.
 |-----|---------|--------|
 | `diagnostics` | `F2` | Pop a split showing `trelane status` |
 | `inbox` | `F3` | Pop a split showing the focused pane's agent inbox |
-| `verbose_toggle` | `F4` | Toggle verbose prop output (also settable via `TRELANE_VERBOSE=1` env) |
+| `verbose_toggle` | `F4` | Toggle verbose squire output (also settable via `TRELANE_VERBOSE=1` env) |
 
 **Pane navigation** (`config.json > ui.pane_navigation`, `ui.match_host_terminal`):
 
@@ -215,7 +215,7 @@ Full usage scenarios live under `tests/` as JSON files.
 |----------|---------|
 | `tests/small.json` | Small project, fast verification |
 | `tests/medium.json` | Medium complexity, multiple domains |
-| `tests/large.json` | Large project; engineers a genuine wait-cycle to exercise the real prop cycle detector (not a stub side-effect) |
+| `tests/large.json` | Large project; engineers a genuine wait-cycle to exercise the real squire cycle detector (not a stub side-effect) |
 | `tests/full-usage-scenario.json` | Full lifecycle: messaging, claims, deadlock, redomaining |
 
 Run one directly:
@@ -224,7 +224,7 @@ Run one directly:
 
 The runner emits regular debug output and appends one JSON object per run
 to a JSONL report file. Report fields include `messages_sent`,
-`prop_ticks` (renamed from `pumps` in pre-0.3), `redomains`, and
+`squire_ticks` (renamed from `pumps` in pre-0.3), `redomains`, and
 `deadlocks_detected`.
 
 ## Configuration
@@ -243,7 +243,7 @@ to a JSONL report file. Report fields include `messages_sent`,
       "copilot": "copilot -p \"$(cat {prompt_file})\" --allow-all-tools"
     }
   },
-  "prop": {
+  "squire": {
     "interval_s": 20,
     "max_concurrent": 4
   },
@@ -265,8 +265,8 @@ to a JSONL report file. Report fields include `messages_sent`,
 }
 ```
 
-The `prop` key accepts `pump` as a serde alias for pre-0.3 config
-compatibility. The CLI command `pump` remains as an alias for `prop`.
+The `squire` key accepts `squire` as a serde alias for pre-0.3 config
+compatibility. The CLI command `squire` remains as an alias for `squire`.
 
 ## Command Sequence Examples
 
@@ -276,7 +276,7 @@ compatibility. The CLI command `pump` remains as an alias for `prop`.
 
 Biplane analyzes the project, proposes domains, registers agents, sends
 initial work, opens a Terminal.app window with a tmux session, and starts
-the prop. All in one command.
+the squire. All in one command.
 
 ### Resume an existing session
 
@@ -291,19 +291,19 @@ parked tasks) is preserved.
     trelane send --from frontend --to backend --type claim-request \
         --subject "need src/api/auth.py" --path src/api/auth.py
     trelane park frontend --wait-reply msg-XXXX --waiting-on backend
-    trelane prop --once
+    trelane squire --once
 
 ### Deadlock resolution
 
     trelane park alpha --wait-reply msg-never-a --waiting-on beta
     trelane park beta --wait-reply msg-never-b --waiting-on alpha
-    trelane prop --once
+    trelane squire --once
     trelane status
 
 ### Domain shifting mid-session
 
     trelane redomain research --writable 'research/**' 'src/ui/**'
-    trelane prop --once
+    trelane squire --once
 
 ### Interactive testing with real AI
 
@@ -335,7 +335,7 @@ write. Enforcement is three layers:
 2. **Claim gate**: `trelane claim` refuses paths in another agent's domain
    unless a `claim-grant` message id is presented (`--grant`). Leases are
    acquired via SQLite `INSERT OR IGNORE` -- one winner even under a true
-   race -- and expire on TTL (the prop reaps and notifies).
+   race -- and expire on TTL (the squire reaps and notifies).
 3. **Audit**: at wake, trelane snapshots content hashes of all dirty files;
    `trelane audit <agent>` flags out-of-domain files changed *during that
    run*.
