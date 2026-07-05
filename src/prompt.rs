@@ -179,6 +179,55 @@ pub fn park_satisfied(conn: &Connection, entry: &crate::models::ParkedTask) -> R
     }
 }
 
+/// Returns true if the park's `waiting_on` agent is provably gone:
+/// either never registered, or registered but disabled in session_agents.
+pub fn park_target_gone(conn: &Connection, entry: &crate::models::ParkedTask) -> Result<bool> {
+    if !store::agent_exists(conn, &entry.waiting_on)? {
+        return Ok(true);
+    }
+    match store::session_agent_enabled(conn, &entry.waiting_on)? {
+        None => Ok(false),
+        Some(enabled) => Ok(!enabled),
+    }
+}
+
+/// Pure function: returns true if the park's age exceeds the timeout.
+/// No DB or clock access -- takes `now_iso` as a parameter for testability.
+pub fn park_age_exceeds(entry: &crate::models::ParkedTask, timeout_s: u64, now_iso: &str) -> bool {
+    let created = chrono::DateTime::parse_from_rfc3339(&entry.created_at);
+    let now = chrono::DateTime::parse_from_rfc3339(now_iso);
+    match (created, now) {
+        (Ok(c), Ok(n)) => {
+            let age = n
+                .with_timezone(&chrono::Utc)
+                .signed_duration_since(c.with_timezone(&chrono::Utc));
+            age.num_seconds() > timeout_s as i64
+        }
+        _ => false,
+    }
+}
+
+/// Returns true if the park should be treated as abandoned (not merely
+/// unsatisfied).  An abandoned park means the squire should wake the
+/// waiting agent with an abandonment reason rather than leaving it
+/// parked forever.
+pub fn park_abandoned(
+    conn: &Connection,
+    entry: &crate::models::ParkedTask,
+    reply_timeout_s: Option<u64>,
+) -> Result<bool> {
+    if park_target_gone(conn, entry)? {
+        return Ok(true);
+    }
+    if let Some(timeout) = reply_timeout_s {
+        let now = crate::crypto::now_iso();
+        if park_age_exceeds(entry, timeout, &now) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub fn write_prompt_file(
     trelane_dir: &Path,
     agent: &str,
@@ -189,4 +238,41 @@ pub fn write_prompt_file(
     let path = dir.join(".prompt.md");
     std::fs::write(&path, prompt)?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::ParkedTask;
+
+    fn make_parked(created_at: &str, waiting_on: &str) -> ParkedTask {
+        ParkedTask {
+            task: "task-1".to_string(),
+            agent: "alpha".to_string(),
+            wait_type: "reply".to_string(),
+            wait_re: Some("msg-1".to_string()),
+            wait_path: None,
+            waiting_on: waiting_on.to_string(),
+            resume_hint: String::new(),
+            created_at: created_at.to_string(),
+        }
+    }
+
+    #[test]
+    fn park_age_exceeds_true_when_old() {
+        let entry = make_parked("2026-01-01T00:00:00Z", "beta");
+        assert!(park_age_exceeds(&entry, 60, "2026-01-01T00:05:00Z"));
+    }
+
+    #[test]
+    fn park_age_exceeds_false_when_recent() {
+        let entry = make_parked("2026-01-01T00:00:00Z", "beta");
+        assert!(!park_age_exceeds(&entry, 600, "2026-01-01T00:05:00Z"));
+    }
+
+    #[test]
+    fn park_age_exceeds_false_on_bad_timestamp() {
+        let entry = make_parked("garbage", "beta");
+        assert!(!park_age_exceeds(&entry, 1, "2026-01-01T00:00:00Z"));
+    }
 }

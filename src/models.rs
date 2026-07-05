@@ -62,6 +62,7 @@ impl Default for Config {
             squire: SquireConfig {
                 interval_s: 20,
                 max_concurrent: 2,
+                reply_timeout_s: None,
             },
             claims: ClaimsConfig {
                 default_ttl_s: 900,
@@ -91,6 +92,13 @@ pub struct LauncherConfig {
 pub struct SquireConfig {
     pub interval_s: u64,
     pub max_concurrent: usize,
+    /// Maximum seconds a reply-wait park can sit unsatisfied before the
+    /// squire declares it abandoned and wakes the waiting agent with an
+    /// abandonment reason.  `None` (the default) disables timeout-based
+    /// abandonment -- only `park_target_gone` (disabled/removed agent)
+    /// triggers abandonment in that case.
+    #[serde(default)]
+    pub reply_timeout_s: Option<u64>,
 }
 
 /// Deprecated name for [`SquireConfig`], kept so external code compiles.

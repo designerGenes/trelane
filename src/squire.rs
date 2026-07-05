@@ -105,8 +105,11 @@ pub fn reap_leases(ctx: &Context) -> Result<()> {
 /// Return (agent, reason) pairs for agents that should be woken.
 pub fn wake_candidates(ctx: &Context) -> Result<Vec<(String, String)>> {
     let mut cands = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let agents = store::list_agents(&ctx.conn)?;
+    let reply_timeout = ctx.config.squire.reply_timeout_s;
 
+    // Pass 1: inbox, ready parks, and abandoned parks per agent.
     for agent in &agents {
         if commands::is_running(&ctx.conn, agent)? {
             continue;
@@ -117,9 +120,49 @@ pub fn wake_candidates(ctx: &Context) -> Result<Vec<(String, String)>> {
                 agent.clone(),
                 format!("inbox: {} unprocessed message(s)", inbox.len()),
             ));
+            seen.insert(agent.clone());
             continue;
         }
+
         let parked = store::list_parked_tasks_for_agent(&ctx.conn, agent)?;
+
+        // Check for abandoned parks (T1): target gone or timed out.
+        let abandoned: Vec<&crate::models::ParkedTask> = parked
+            .iter()
+            .filter(|e| {
+                !prompt::park_satisfied(&ctx.conn, e).unwrap_or(false)
+                    && prompt::park_abandoned(&ctx.conn, e, reply_timeout).unwrap_or(false)
+            })
+            .collect();
+
+        if !abandoned.is_empty() {
+            let reasons: Vec<String> = abandoned
+                .iter()
+                .map(|e| {
+                    let cause = if prompt::park_target_gone(&ctx.conn, e).unwrap_or(false) {
+                        format!("agent '{}' is disabled or gone", e.waiting_on)
+                    } else {
+                        format!("timed out after park age exceeded {:?}", reply_timeout)
+                    };
+                    format!("task {} abandoned ({})", e.task, cause)
+                })
+                .collect();
+            // Delete the abandoned parks so they don't keep blocking.
+            for e in &abandoned {
+                let _ = store::delete_parked_task(&ctx.conn, &e.task);
+            }
+            cands.push((
+                agent.clone(),
+                format!(
+                    "abandonment: your wait is abandoned ({}). Proceed with a documented assumption or escalate.",
+                    reasons.join("; ")
+                ),
+            ));
+            seen.insert(agent.clone());
+            continue;
+        }
+
+        // Check for satisfied (ready) parks.
         let ready: Vec<String> = parked
             .iter()
             .filter(|e| prompt::park_satisfied(&ctx.conn, e).unwrap_or(false))
@@ -130,18 +173,21 @@ pub fn wake_candidates(ctx: &Context) -> Result<Vec<(String, String)>> {
                 agent.clone(),
                 format!("resume: parked task(s) ready: {}", ready.join(", ")),
             ));
+            seen.insert(agent.clone());
         }
     }
 
-    // Deadlock breaking — only when nothing else moves
-    if cands.is_empty() {
-        let (_, cycle) = wait_graph(&ctx.conn)?;
-        if let Some(cycle) = cycle {
-            let none_running = !cycle
-                .iter()
-                .any(|a| commands::is_running(&ctx.conn, a).unwrap_or(false));
-            if none_running {
-                let victim = cycle.iter().min().unwrap().clone();
+    // Pass 2 (T2): cycle detection runs EVERY tick, not just when
+    // nothing else moves.  A genuine cycle between two agents should be
+    // broken even if unrelated agents elsewhere have pending inbox work.
+    let (_, cycle) = wait_graph(&ctx.conn)?;
+    if let Some(cycle) = cycle {
+        let none_running = !cycle
+            .iter()
+            .any(|a| commands::is_running(&ctx.conn, a).unwrap_or(false));
+        if none_running {
+            let victim = cycle.iter().min().unwrap().clone();
+            if !seen.contains(&victim) {
                 let mut display = cycle.clone();
                 display.push(cycle[0].clone());
                 cands.push((
@@ -302,5 +348,21 @@ mod tests {
 
         let cycle = dfs_cycle("alpha", &edges, &mut visited, &mut stack, &mut stack_set).unwrap();
         assert_eq!(cycle, vec!["alpha".to_string()]);
+    }
+
+    #[test]
+    fn wait_graph_detects_cycle_alongside_non_cycle() {
+        // alpha -> beta -> alpha (cycle) + gamma -> user (no cycle)
+        let conn = in_memory_conn();
+        store::insert_parked_task(&conn, &parked("alpha", "beta")).unwrap();
+        store::insert_parked_task(&conn, &parked("beta", "alpha")).unwrap();
+        store::insert_parked_task(&conn, &parked("gamma", "user")).unwrap();
+
+        let (edges, cycle) = wait_graph(&conn).unwrap();
+        assert!(cycle.is_some(), "should detect the alpha-beta cycle");
+        assert!(
+            edges.contains_key("gamma"),
+            "gamma should be in the wait graph even though it's not in a cycle"
+        );
     }
 }
