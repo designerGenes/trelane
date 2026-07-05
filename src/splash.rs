@@ -381,6 +381,21 @@ fn default_pane_nav() -> Vec<(String, &'static str)> {
     ]
 }
 
+/// Pane-navigation bindings that work in Apple Terminal.app.
+/// Terminal.app doesn't forward Alt+arrows by default; it uses its own
+/// key encoding.  Ctrl+arrows and Shift+arrows do pass through, so we
+/// use those.  We also bind `[` and `]` with Alt (which Terminal.app
+/// sends as M-[ and M-]) for left/right, matching the user's mental
+/// model of Cmd+Opt+[ / ] but using a modifier tmux can actually see.
+fn apple_terminal_pane_nav() -> Vec<(String, &'static str)> {
+    vec![
+        ("M-[".to_string(), "-L"),
+        ("M-]".to_string(), "-R"),
+        ("C-Up".to_string(), "-U"),
+        ("C-Down".to_string(), "-D"),
+    ]
+}
+
 fn read_ghostty_config() -> Option<String> {
     let home = std::env::var("HOME").ok()?;
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
@@ -447,6 +462,13 @@ fn resolve_pane_nav_bindings(ui: &UiConfig) -> (Vec<(String, &'static str)>, Opt
                 ),
             )
         }
+        HostTerminal::AppleTerminal => (
+            apple_terminal_pane_nav(),
+            Some(
+                "detected Apple Terminal; using Alt+[ / Alt+] for left/right and Ctrl+Up/Down for up/down pane navigation."
+                    .to_string(),
+            ),
+        ),
         other => (
             default_pane_nav(),
             Some(format!(

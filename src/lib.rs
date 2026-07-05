@@ -341,25 +341,35 @@ exec tmux attach-session -t "$SESSION"
     );
     std::fs::write(&script_path, &script_content)?;
 
-    let script_path_str = script_path.display().to_string();
-    let osascript = format!(
-        r#"tell application "Terminal"
-        activate
-        do script "bash {script}"
-    end tell"#,
-        script = script_path_str
-    );
-
-    let result = std::process::Command::new("osascript")
-        .args(["-e", &osascript])
-        .output()?;
-
-    if !result.status.success() {
-        let err = String::from_utf8_lossy(&result.stderr);
-        return Err(crate::error::TrelaneError::msg(format!(
-            "failed to open Terminal.app: {err}"
-        )));
+    // Make the script executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms)?;
     }
+
+    // Open Terminal.app using `open` with a .command file instead of
+    // osascript.  This avoids the repeated macOS Automation permission
+    // prompts that osascript triggers every time the binary is rebuilt
+    // (each rebuild changes the code signature, so TCC re-prompts).
+    let command_file = script_path.with_extension("command");
+    std::fs::write(
+        &command_file,
+        format!("#!/bin/bash\nexec bash '{}'\n", script_path.display()),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&command_file)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&command_file, perms)?;
+    }
+
+    std::process::Command::new("open")
+        .arg(&command_file)
+        .status()?;
 
     println!(
         "[launch] Terminal.app window opened with session: {}",

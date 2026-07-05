@@ -56,6 +56,8 @@ pub fn run_biplane_plan(
 
     println!("[biplane] Launching planner with model '{}'...", model);
     println!("[biplane] Prompt: {}", prompt_file.display());
+    println!("[biplane] Analyzing project structure and feature files...");
+    println!();
 
     let mut last_error = String::new();
     let output_file = project_root
@@ -68,22 +70,48 @@ pub fn run_biplane_plan(
     // string mangles the quoting and corrupts the request opencode sends.
     fs::write(&runner_script, format!("#!/bin/sh\n{cmd}\n"))?;
 
+    let spinner_frames = ["|", "/", "-", "\\"];
+    let mut spinner_idx = 0usize;
+
     for attempt in 1..=3 {
         if attempt > 1 {
             println!("[biplane] Retrying (attempt {}/3)...", attempt);
             std::thread::sleep(std::time::Duration::from_secs(3));
         }
 
+        print!("[biplane] Thinking ");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+
         let out_handle = std::fs::File::create(&output_file)?;
         let err_handle = out_handle.try_clone()?;
 
-        let status = Command::new("sh")
+        let mut child = Command::new("sh")
             .arg(&runner_script)
             .current_dir(project_root)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::from(out_handle))
             .stderr(std::process::Stdio::from(err_handle))
-            .status()?;
+            .spawn()?;
+
+        // Animate a spinner while the planner runs.
+        let exit_status;
+        loop {
+            match child.try_wait()? {
+                Some(s) => {
+                    println!(" done");
+                    let _ = std::io::stdout().flush();
+                    exit_status = s;
+                    break;
+                }
+                None => {
+                    print!("\r[biplane] Thinking {} ", spinner_frames[spinner_idx]);
+                    let _ = std::io::stdout().flush();
+                    spinner_idx = (spinner_idx + 1) % spinner_frames.len();
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+        }
 
         let stdout = std::fs::read_to_string(&output_file).unwrap_or_default();
 
@@ -91,27 +119,35 @@ pub fn run_biplane_plan(
         let cleaned = strip_ansi(&text);
 
         if let Ok(plan) = parse_biplane_plan(&cleaned, max_agents) {
+            println!(
+                "[biplane] Plan received: {} agent(s) proposed",
+                plan.agents.len()
+            );
             return Ok(plan);
         }
 
         if let Ok(plan) = parse_biplane_plan(&strip_ansi(&stdout), max_agents) {
+            println!(
+                "[biplane] Plan received: {} agent(s) proposed",
+                plan.agents.len()
+            );
             return Ok(plan);
         }
 
         last_error = if stdout.trim().is_empty() {
-            format!("exit code: {:?}", status.code())
+            format!("exit code: {:?}", exit_status.code())
         } else {
             let preview = if stdout.len() > 500 {
                 &stdout[..500]
             } else {
                 &stdout
             };
-            format!("exit code: {:?}, output: {}", status.code(), preview)
+            format!("exit code: {:?}, output: {}", exit_status.code(), preview)
         };
 
         if attempt < 3 {
             eprintln!(
-                "[biplane] Attempt {} failed: {}",
+                "\n[biplane] Attempt {} failed: {}",
                 attempt,
                 &last_error[..200.min(last_error.len())]
             );
