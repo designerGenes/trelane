@@ -150,6 +150,8 @@ pub struct UiKeys {
     pub inbox: String,
     /// Toggle verbose squire output for the session frame.
     pub verbose_toggle: String,
+    /// Open the interactive diagnostic TUI (`trelane diagnostic`) in a split.
+    pub diagnostic_view: String,
 }
 
 impl Default for UiKeys {
@@ -158,6 +160,7 @@ impl Default for UiKeys {
             diagnostics: "F2".to_string(),
             inbox: "F3".to_string(),
             verbose_toggle: "F4".to_string(),
+            diagnostic_view: "F5".to_string(),
         }
     }
 }

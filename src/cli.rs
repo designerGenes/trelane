@@ -287,6 +287,11 @@ pub enum Command {
         )]
         interactive: bool,
         #[arg(
+            long = "ui",
+            help = "open the interactive Biplane editor TUI (amber-themed) to review and edit domains"
+        )]
+        ui: bool,
+        #[arg(
             long = "accept-defaults",
             help = "non-interactive: accept all proposed domains and defaults (use with --interactive)"
         )]
@@ -310,6 +315,9 @@ pub enum Command {
         #[arg(long)]
         rater: String,
     },
+
+    /// Interactive diagnostic view for the main Trelane session (TUI)
+    Diagnostic,
 
     /// Kill all trelane tmux sessions and stop all running agents
     Kill,

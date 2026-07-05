@@ -1,9 +1,11 @@
 pub mod biplane;
+pub mod biplane_ui;
 pub mod cli;
 pub mod commands;
 pub mod crypto;
 pub mod db;
 pub mod domain;
+pub mod diagnostic;
 pub mod error;
 pub mod logo;
 pub mod models;
@@ -582,10 +584,17 @@ pub fn handle(cli: Cli) -> Result<()> {
             next_steps,
             emit_plan,
             interactive,
+            ui,
             accept_defaults,
             json,
         }) => {
-            if interactive {
+            if ui {
+                let root = match cli.root.as_deref() {
+                    Some(p) => p.to_path_buf(),
+                    None => std::env::current_dir()?,
+                };
+                biplane_ui::run(&root)
+            } else if interactive {
                 // Interactive/describe paths need no DB, so they work even
                 // before a project is initialized as a trelane session.
                 let root = match cli.root.as_deref() {
@@ -743,6 +752,10 @@ pub fn handle(cli: Cli) -> Result<()> {
             tracer.record_rating(&rater, &agent, &run_span_id, rating, &rationale)?;
             println!("rating recorded: {rater} rated {agent} = {rating}/10");
             Ok(())
+        }
+        Some(Command::Diagnostic) => {
+            let ctx = Context::open(cli.root.as_deref())?;
+            diagnostic::run(&ctx)
         }
         Some(Command::Kill) => cmd_kill(),
     }
@@ -903,4 +916,10 @@ fn cmd_kill() -> Result<()> {
     println!();
 
     Ok(())
+}
+
+/// Public entry so the diagnostic TUI can trigger the emergency kill after it
+/// has restored the terminal out of raw/alternate-screen mode.
+pub fn run_kill_from_diagnostic() -> Result<()> {
+    cmd_kill()
 }
