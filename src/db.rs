@@ -144,5 +144,18 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE launch_targets ADD COLUMN tmux_target TEXT;")?;
         conn.execute_batch("PRAGMA user_version = 4;")?;
     }
+    if version < 5 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cycle_break_attempts (
+                cycle_key       TEXT PRIMARY KEY,
+                cycle_members   TEXT NOT NULL,
+                designated      TEXT NOT NULL,
+                attempts        INTEGER NOT NULL DEFAULT 0,
+                last_attempt_at TEXT,
+                escalated       INTEGER NOT NULL DEFAULT 0
+            );",
+        )?;
+        conn.execute_batch("PRAGMA user_version = 5;")?;
+    }
     Ok(())
 }

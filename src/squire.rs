@@ -186,18 +186,124 @@ pub fn wake_candidates(ctx: &Context) -> Result<Vec<(String, String)>> {
             .iter()
             .any(|a| commands::is_running(&ctx.conn, a).unwrap_or(false));
         if none_running {
-            let victim = cycle.iter().min().unwrap().clone();
-            if !seen.contains(&victim) {
-                let mut display = cycle.clone();
-                display.push(cycle[0].clone());
-                cands.push((
-                    victim,
+            // T3: Track repeated breaker failures and escalate.
+            let mut sorted = cycle.clone();
+            sorted.sort();
+            let cycle_key = sorted.join(",");
+
+            let attempt_count =
+                store::record_cycle_break_attempt(&ctx.conn, &cycle_key, &cycle, &sorted[0])?;
+
+            const ESCALATION_THRESHOLD: i64 = 3;
+
+            if attempt_count > ESCALATION_THRESHOLD
+                && !store::is_cycle_escalated(&ctx.conn, &cycle_key)?
+            {
+                // Escalation strategy 1: Broadcast a system message to
+                // every agent in the cycle.
+                let secret = ctx.secret()?;
+                for member in &cycle {
+                    let mut msg = Message::new(
+                        crate::crypto::new_id("msg"),
+                        "system".to_string(),
+                        member.clone(),
+                        "system".to_string(),
+                        "critical".to_string(),
+                        format!("cycle escalation: {} failed break attempts", attempt_count),
+                        format!(
+                            "The wait-cycle {} has been broken {attempt_count} times without resolution. \
+                            Each member must reassess their parked tasks and either unpark with a \
+                            documented assumption or escalate to the user. Last designated breaker: {}.",
+                            sorted.join(" -> "),
+                            sorted[0]
+                        ),
+                        None,
+                        None,
+                        vec![],
+                        crate::crypto::now_iso(),
+                    );
+                    crate::crypto::sign(&secret, &mut msg);
+                    store::insert_message(&ctx.conn, &msg)?;
+                }
+
+                // Escalation strategy 2: Write a durable alert.
+                let alerts_dir = ctx.trelane_dir().join("alerts");
+                let _ = std::fs::create_dir_all(&alerts_dir);
+                let alert_path = alerts_dir.join(format!("{}.txt", cycle_key.replace(',', "-")));
+                let _ = std::fs::write(
+                    &alert_path,
                     format!(
-                        "deadlock: wait-cycle {}. You are the designated breaker: proceed with a documented assumption, message your counterpart stating it, and unpark your task.",
-                        display.join(" -> ")
+                        "[{}] CYCLE ESCALATION\nCycle: {}\nAttempts: {}\nDesignated breaker: {}\nMembers: {}\n\n\
+                        This cycle has been broken {} times without resolution.\n\
+                        The squire has tried the lexicographically-first member each time.\n\
+                        Manual intervention may be required.\n",
+                        crate::crypto::now_iso(),
+                        sorted.join(" -> "),
+                        attempt_count,
+                        sorted[0],
+                        cycle.join(", "),
+                        attempt_count,
                     ),
-                ));
+                );
+
+                // Escalation strategy 3: Try a DIFFERENT designated breaker.
+                // Instead of always picking sorted[0], rotate to the next member.
+                let alt_breaker = sorted[(attempt_count as usize) % sorted.len()].clone();
+
+                store::mark_cycle_escalated(&ctx.conn, &cycle_key)?;
+
+                eprintln!(
+                    "{} CYCLE ESCALATION: cycle {} has {} failed break attempts. \
+                    Trying alternate breaker: {} (was {}). \
+                    System messages sent to all cycle members. Alert written to {}.",
+                    crate::crypto::now_iso(),
+                    sorted.join(" -> "),
+                    attempt_count,
+                    alt_breaker,
+                    sorted[0],
+                    alert_path.display(),
+                );
+
+                if !seen.contains(&alt_breaker) {
+                    let mut display = cycle.clone();
+                    display.push(cycle[0].clone());
+                    cands.push((
+                        alt_breaker,
+                        format!(
+                            "ESCALATED deadlock (attempt #{}): wait-cycle {}. \
+                            Previous breaker(s) failed to resolve this. \
+                            You are the new designated breaker: unpark your task, \
+                            proceed with a clearly documented assumption, and message all cycle members.",
+                            attempt_count,
+                            display.join(" -> ")
+                        ),
+                    ));
+                }
+            } else {
+                // Normal cycle-breaking: pick lexicographically-first member.
+                let victim = sorted[0].clone();
+                if !seen.contains(&victim) {
+                    let mut display = cycle.clone();
+                    display.push(cycle[0].clone());
+                    cands.push((
+                        victim,
+                        format!(
+                            "deadlock: wait-cycle {}. You are the designated breaker: \
+                            proceed with a documented assumption, message your counterpart \
+                            stating it, and unpark your task.",
+                            display.join(" -> ")
+                        ),
+                    ));
+                }
             }
+        }
+    } else {
+        // No cycle detected -- clear any attempt tracking for resolved cycles.
+        // We can't know which specific cycle_key to clear without the cycle,
+        // but clearing all is safe: if the cycle re-forms, tracking restarts at 1.
+        let attempts = store::list_cycle_break_attempts(&ctx.conn).unwrap_or_default();
+        for attempt in &attempts {
+            let _ = store::clear_cycle_break_attempts(&ctx.conn, &attempt.cycle_key);
         }
     }
 

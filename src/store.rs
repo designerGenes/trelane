@@ -547,3 +547,109 @@ pub fn list_launch_targets(conn: &Connection) -> Result<Vec<LaunchTarget>> {
     }
     Ok(out)
 }
+
+// ------------------------------------------------- cycle break attempts (T3)
+
+/// Record or increment a cycle-break attempt for a given cycle.
+/// Returns the new attempt count.
+pub fn record_cycle_break_attempt(
+    conn: &Connection,
+    cycle_key: &str,
+    cycle_members: &[String],
+    designated: &str,
+) -> Result<i64> {
+    let members_str = cycle_members.join(",");
+    let now = crate::crypto::now_iso();
+
+    conn.execute(
+        "INSERT INTO cycle_break_attempts (cycle_key, cycle_members, designated, attempts, last_attempt_at, escalated)
+         VALUES (?1, ?2, ?3, 1, ?4, 0)
+         ON CONFLICT(cycle_key) DO UPDATE SET
+            attempts = attempts + 1,
+            designated = excluded.designated,
+            last_attempt_at = excluded.last_attempt_at",
+        params![cycle_key, members_str, designated, now],
+    )?;
+
+    let count: i64 = conn.query_row(
+        "SELECT attempts FROM cycle_break_attempts WHERE cycle_key = ?1",
+        params![cycle_key],
+        |r| r.get(0),
+    )?;
+    Ok(count)
+}
+
+/// Reset the attempt counter for a cycle (call when the cycle is resolved).
+pub fn clear_cycle_break_attempts(conn: &Connection, cycle_key: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM cycle_break_attempts WHERE cycle_key = ?1",
+        params![cycle_key],
+    )?;
+    Ok(())
+}
+
+/// Mark a cycle as escalated (so we don't re-escalate every tick).
+pub fn mark_cycle_escalated(conn: &Connection, cycle_key: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE cycle_break_attempts SET escalated = 1 WHERE cycle_key = ?1",
+        params![cycle_key],
+    )?;
+    Ok(())
+}
+
+/// Check if a cycle has already been escalated.
+pub fn is_cycle_escalated(conn: &Connection, cycle_key: &str) -> Result<bool> {
+    let result: Option<i64> = conn
+        .query_row(
+            "SELECT escalated FROM cycle_break_attempts WHERE cycle_key = ?1",
+            params![cycle_key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(result == Some(1))
+}
+
+/// Get the current attempt count for a cycle (0 if never recorded).
+pub fn get_cycle_attempt_count(conn: &Connection, cycle_key: &str) -> Result<i64> {
+    let result: Option<i64> = conn
+        .query_row(
+            "SELECT attempts FROM cycle_break_attempts WHERE cycle_key = ?1",
+            params![cycle_key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(result.unwrap_or(0))
+}
+
+/// A cycle break attempt record.
+pub struct CycleBreakAttempt {
+    pub cycle_key: String,
+    pub cycle_members: String,
+    pub designated: String,
+    pub attempts: i64,
+    pub last_attempt_at: Option<String>,
+    pub escalated: bool,
+}
+
+/// List all cycle break attempt records (for diagnostics and cleanup).
+pub fn list_cycle_break_attempts(conn: &Connection) -> Result<Vec<CycleBreakAttempt>> {
+    let mut stmt = conn.prepare(
+        "SELECT cycle_key, cycle_members, designated, attempts, last_attempt_at, escalated
+         FROM cycle_break_attempts ORDER BY attempts DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(CycleBreakAttempt {
+            cycle_key: r.get(0)?,
+            cycle_members: r.get(1)?,
+            designated: r.get(2)?,
+            attempts: r.get(3)?,
+            last_attempt_at: r.get(4)?,
+            escalated: r.get::<_, i64>(5)? != 0,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
