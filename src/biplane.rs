@@ -915,6 +915,11 @@ pub struct DomainSpec {
     /// agent budget across phases.
     #[serde(default = "default_agent_count")]
     pub agents: usize,
+    /// Model/launcher profile to use for this domain's agent(s).  When set,
+    /// overrides the project-level `default_model`.  Populated by the Biplane
+    /// UI's model selector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 fn default_agent_count() -> usize {
@@ -1495,6 +1500,7 @@ pub fn scaffold_description_from_structure(root: &Path) -> ProjectDescription {
                     depends_on: vec![],
                     planned_work: vec![],
                     agents: 1,
+                    model: None,
                 });
             }
         }
@@ -1515,6 +1521,7 @@ pub fn scaffold_description_from_structure(root: &Path) -> ProjectDescription {
             depends_on: vec![],
             planned_work: vec![],
             agents: 1,
+            model: None,
         });
     }
 
@@ -1776,6 +1783,7 @@ mod tests {
                 priority: "normal".to_string(),
             }],
             agents,
+            model: None,
         }
     }
 
@@ -2428,6 +2436,7 @@ mod reconciliation_tests {
             depends_on: vec![],
             planned_work: vec![],
             agents: 1,
+            model: None,
         }
     }
 

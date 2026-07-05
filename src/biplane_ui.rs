@@ -17,6 +17,33 @@
 
 use crate::biplane::{DomainSpec, ProjectDescription, validate_description};
 use crate::error::Result;
+use std::process::Command;
+
+/// A model entry from `opencode models`, with a free-model flag.
+#[derive(Debug, Clone)]
+pub struct ModelEntry {
+    pub id: String,
+    pub is_free: bool,
+}
+
+/// Fetch the available model list from `opencode models`.
+pub fn fetch_opencode_models() -> Vec<ModelEntry> {
+    let output = Command::new("opencode").arg("models").output();
+    let Ok(out) = output else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| ModelEntry {
+            id: l.trim().to_string(),
+            is_free: l.contains(":free") || l.contains("-free"),
+        })
+        .collect()
+}
 
 /// A single editable row: a domain plus whether it's currently included.
 #[derive(Debug, Clone)]
@@ -47,6 +74,14 @@ pub struct BiplaneUiState {
     /// When Some, the user is editing the focused domain's name; keys route
     /// into this buffer until commit (Enter) or cancel (Esc).
     pub editing: Option<crate::text_input::TextInput>,
+    /// Available models from `opencode models`.
+    pub models: Vec<ModelEntry>,
+    /// When true, the model selector popup is open for the focused domain.
+    pub model_selector_open: bool,
+    /// Cursor within the model selector popup.
+    pub model_cursor: usize,
+    /// When true, the model selector only shows free models.
+    pub free_only: bool,
 }
 
 impl BiplaneUiState {
@@ -73,6 +108,10 @@ impl BiplaneUiState {
             status: None,
             source: source.into(),
             editing: None,
+            models: Vec::new(),
+            model_selector_open: false,
+            model_cursor: 0,
+            free_only: false,
         }
     }
 
@@ -285,6 +324,112 @@ impl BiplaneUiState {
             input.backspace();
         }
     }
+
+    // -- Model selector --
+
+    /// Open the model selector popup for the focused domain.
+    pub fn open_model_selector(&mut self) {
+        if self.rows.is_empty() || self.cursor >= self.rows.len() {
+            return;
+        }
+        if self.models.is_empty() {
+            self.models = fetch_opencode_models();
+        }
+        self.model_selector_open = true;
+        self.model_cursor = 0;
+        // If the domain already has a model, try to position the cursor on it.
+        if let Some(row) = self.rows.get(self.cursor)
+            && let Some(ref model) = row.spec.model
+            && let Some(idx) = self.filtered_models().iter().position(|m| m.id == *model)
+        {
+            self.model_cursor = idx;
+        }
+    }
+
+    /// Close the model selector without applying.
+    pub fn close_model_selector(&mut self) {
+        self.model_selector_open = false;
+    }
+
+    /// Toggle the free-only filter in the model selector.
+    pub fn toggle_free_only(&mut self) {
+        self.free_only = !self.free_only;
+        self.model_cursor = 0;
+    }
+
+    /// Move the model selector cursor up.
+    pub fn model_cursor_up(&mut self) {
+        if self.model_cursor > 0 {
+            self.model_cursor -= 1;
+        }
+    }
+
+    /// Move the model selector cursor down.
+    pub fn model_cursor_down(&mut self) {
+        let len = self.filtered_models().len();
+        if len > 0 && self.model_cursor + 1 < len {
+            self.model_cursor += 1;
+        }
+    }
+
+    /// Apply the selected model to the focused domain and close the popup.
+    pub fn apply_model(&mut self) {
+        let selected_id: Option<String> = self
+            .filtered_models()
+            .get(self.model_cursor)
+            .map(|m| m.id.clone());
+        if let Some(id) = selected_id
+            && let Some(row) = self.rows.get_mut(self.cursor)
+        {
+            row.spec.model = Some(id.clone());
+            self.dirty = true;
+            self.status = Some(format!("model set to {id} for {}", row.spec.name));
+        }
+        self.model_selector_open = false;
+    }
+
+    /// Clear the focused domain's model (revert to project default).
+    pub fn clear_model(&mut self) {
+        if let Some(row) = self.rows.get_mut(self.cursor) {
+            row.spec.model = None;
+            self.dirty = true;
+            self.status = Some(format!("model cleared for {}", row.spec.name));
+        }
+        self.model_selector_open = false;
+    }
+
+    /// Set the same model on all included domains.
+    pub fn set_model_for_all(&mut self, model_id: &str) {
+        for row in &mut self.rows {
+            if row.include {
+                row.spec.model = Some(model_id.to_string());
+            }
+        }
+        self.dirty = true;
+        self.status = Some(format!("model set to {model_id} for all agents"));
+    }
+
+    /// Set the same model on all included domains using the currently
+    /// selected model in the popup.  Convenience: press 'a' in the popup.
+    pub fn apply_model_to_all(&mut self) {
+        let selected_id: Option<String> = self
+            .filtered_models()
+            .get(self.model_cursor)
+            .map(|m| m.id.clone());
+        if let Some(id) = selected_id {
+            self.set_model_for_all(&id);
+        }
+        self.model_selector_open = false;
+    }
+
+    /// The list of models currently visible (respecting free_only filter).
+    pub fn filtered_models(&self) -> Vec<&ModelEntry> {
+        if self.free_only {
+            self.models.iter().filter(|m| m.is_free).collect()
+        } else {
+            self.models.iter().collect()
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -350,6 +495,20 @@ fn run_loop(root: &std::path::Path, state: &mut BiplaneUiState) -> Result<()> {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                // Model selector popup: keys route here when open.
+                if state.model_selector_open {
+                    match key.code {
+                        KeyCode::Esc => state.close_model_selector(),
+                        KeyCode::Up => state.model_cursor_up(),
+                        KeyCode::Down => state.model_cursor_down(),
+                        KeyCode::Enter => state.apply_model(),
+                        KeyCode::Char('f') => state.toggle_free_only(),
+                        KeyCode::Char('a') => state.apply_model_to_all(),
+                        KeyCode::Char('c') => state.clear_model(),
+                        _ => {}
+                    }
+                    continue;
+                }
                 // Edit mode: keys flow into the rename buffer.
                 if state.is_editing() {
                     match key.code {
@@ -385,6 +544,14 @@ fn run_loop(root: &std::path::Path, state: &mut BiplaneUiState) -> Result<()> {
                     KeyCode::Char('K') => state.move_up(),
                     KeyCode::Char('J') => state.move_down(),
                     KeyCode::Char('e') => state.begin_rename(),
+                    KeyCode::Char('m') => state.open_model_selector(),
+                    KeyCode::Char('M') => {
+                        // Quick: set all included domains to the first free model
+                        let models = fetch_opencode_models();
+                        if let Some(free) = models.iter().find(|m| m.is_free) {
+                            state.set_model_for_all(&free.id);
+                        }
+                    }
                     KeyCode::Char('s') => {
                         if let Some(desc) = state.validated() {
                             save_description(root, &desc)?;
@@ -520,6 +687,7 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
             } else {
                 Span::styled(name_cell, name_style)
             };
+            let model_str = row.spec.model.as_deref().unwrap_or("(default)");
             ListItem::new(Line::from(vec![
                 Span::raw(marker),
                 check,
@@ -533,6 +701,14 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
                     Style::default().fg(dim),
                 ),
                 Span::styled(format!("deps:{:<12} ", deps), Style::default().fg(dim)),
+                Span::styled(
+                    format!("model:{} ", model_str),
+                    Style::default().fg(if row.spec.model.is_some() {
+                        accent
+                    } else {
+                        dim
+                    }),
+                ),
                 Span::styled(row.spec.writable.join(","), Style::default().fg(dim)),
             ]))
         })
@@ -545,12 +721,19 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
     );
     f.render_widget(list, chunks[1]);
 
+    // Model selector popup
+    if state.model_selector_open {
+        render_model_selector(f, state);
+    }
+
     // Footer
     let hint = state.status.clone().unwrap_or_else(|| {
-        if state.editing.is_some() {
+        if state.model_selector_open {
+            "↑↓ select model  Enter apply  f free-only  a apply-to-all  c clear  Esc close".to_string()
+        } else if state.editing.is_some() {
             "typing… Enter save name  Esc cancel  ←→ move caret  Backspace delete".to_string()
         } else {
-            "↑↓ move  space include  ←→ agents  [ ] budget  K/J reorder  e rename  s save  q quit"
+            "↑↓ move  space include  ←→ agents  [ ] budget  K/J reorder  e rename  m model  M all-free  s save  q quit"
                 .to_string()
         }
     });
@@ -560,6 +743,90 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
             .border_style(Style::default().fg(dim)),
     );
     f.render_widget(footer, chunks[2]);
+}
+
+fn render_model_selector(f: &mut ratatui::Frame, state: &BiplaneUiState) {
+    use crate::diagnostic::{THEME_BIPLANE_ACCENT, THEME_DIM, THEME_OK};
+    use ratatui::prelude::*;
+    use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+
+    let accent = tc(THEME_BIPLANE_ACCENT);
+    let dim = tc(THEME_DIM);
+
+    let area = centered_rect_pct(60, 60, f.area());
+    f.render_widget(Clear, area);
+
+    let filtered = state.filtered_models();
+    let title = if state.free_only {
+        " Select Model (free only) "
+    } else {
+        " Select Model (all) "
+    };
+
+    let items: Vec<ListItem> = filtered
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let marker = if i == state.model_cursor {
+                "▶ "
+            } else {
+                "  "
+            };
+            let free_tag = if m.is_free {
+                Span::styled(" [FREE]", Style::default().fg(tc(THEME_OK)))
+            } else {
+                Span::raw("")
+            };
+            ListItem::new(Line::from(vec![
+                Span::raw(marker),
+                Span::styled(&m.id, Style::default().fg(accent)),
+                free_tag,
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(accent)),
+    );
+    f.render_widget(list, area);
+
+    // Hint line at the bottom of the popup
+    let hint_area = Rect {
+        x: area.x,
+        y: area.bottom().saturating_sub(1),
+        width: area.width,
+        height: 1,
+    };
+    let hint = format!(
+        "  {} models  |  f: free-only({})  a: all  c: clear  Esc: close",
+        filtered.len(),
+        if state.free_only { "ON" } else { "off" }
+    );
+    let hint_para = Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(dim))));
+    f.render_widget(hint_para, hint_area);
+}
+
+fn centered_rect_pct(pct_x: u16, pct_y: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    use ratatui::prelude::*;
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - pct_y) / 2),
+            Constraint::Percentage(pct_y),
+            Constraint::Percentage((100 - pct_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - pct_x) / 2),
+            Constraint::Percentage(pct_x),
+            Constraint::Percentage((100 - pct_x) / 2),
+        ])
+        .split(v[1])[1]
 }
 
 #[cfg(test)]
@@ -580,6 +847,7 @@ mod tests {
                 priority: "normal".to_string(),
             }],
             agents,
+            model: None,
         }
     }
 
@@ -803,5 +1071,105 @@ mod tests {
         s.cancel_edit();
         assert!(!s.is_editing());
         assert_eq!(s.rows[0].spec.name, "engine"); // unchanged
+    }
+
+    #[test]
+    fn model_selector_opens_and_closes() {
+        let mut s = state();
+        assert!(!s.model_selector_open);
+        s.open_model_selector();
+        assert!(s.model_selector_open);
+        s.close_model_selector();
+        assert!(!s.model_selector_open);
+    }
+
+    #[test]
+    fn apply_model_sets_domain_model() {
+        let mut s = state();
+        s.cursor = 0;
+        s.models = vec![
+            ModelEntry {
+                id: "opencode/big-pickle".into(),
+                is_free: false,
+            },
+            ModelEntry {
+                id: "opencode/deepseek-v4-flash-free".into(),
+                is_free: true,
+            },
+        ];
+        s.open_model_selector();
+        s.model_cursor = 1;
+        s.apply_model();
+        assert!(!s.model_selector_open);
+        assert_eq!(
+            s.rows[0].spec.model.as_deref(),
+            Some("opencode/deepseek-v4-flash-free")
+        );
+        assert!(s.dirty);
+    }
+
+    #[test]
+    fn free_only_filter_hides_paid() {
+        let mut s = state();
+        s.models = vec![
+            ModelEntry {
+                id: "paid-model".into(),
+                is_free: false,
+            },
+            ModelEntry {
+                id: "free-model:free".into(),
+                is_free: true,
+            },
+        ];
+        assert_eq!(s.filtered_models().len(), 2);
+        s.toggle_free_only();
+        assert_eq!(s.filtered_models().len(), 1);
+        assert_eq!(s.filtered_models()[0].id, "free-model:free");
+    }
+
+    #[test]
+    fn set_model_for_all_updates_included_only() {
+        let mut s = state();
+        s.cursor = 1; // ui
+        s.toggle_include(); // exclude ui
+        s.set_model_for_all("test-model");
+        assert_eq!(s.rows[0].spec.model.as_deref(), Some("test-model")); // engine
+        assert_eq!(s.rows[1].spec.model, None); // ui excluded
+        assert_eq!(s.rows[2].spec.model.as_deref(), Some("test-model")); // api
+        assert!(s.dirty);
+    }
+
+    #[test]
+    fn clear_model_removes_assignment() {
+        let mut s = state();
+        s.rows[0].spec.model = Some("test".into());
+        s.cursor = 0;
+        s.clear_model();
+        assert_eq!(s.rows[0].spec.model, None);
+        assert!(s.dirty);
+    }
+
+    #[test]
+    fn model_cursor_is_bounded() {
+        let mut s = state();
+        s.models = vec![
+            ModelEntry {
+                id: "a".into(),
+                is_free: false,
+            },
+            ModelEntry {
+                id: "b".into(),
+                is_free: false,
+            },
+        ];
+        s.open_model_selector();
+        s.model_cursor_down();
+        assert_eq!(s.model_cursor, 1);
+        s.model_cursor_down(); // at end, should not advance
+        assert_eq!(s.model_cursor, 1);
+        s.model_cursor_up();
+        assert_eq!(s.model_cursor, 0);
+        s.model_cursor_up(); // at top
+        assert_eq!(s.model_cursor, 0);
     }
 }
