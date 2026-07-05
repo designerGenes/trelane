@@ -18,7 +18,10 @@ pub struct TextInput {
 impl TextInput {
     /// New empty input.
     pub fn new() -> Self {
-        Self { chars: Vec::new(), caret: 0 }
+        Self {
+            chars: Vec::new(),
+            caret: 0,
+        }
     }
 
     /// Pre-populate with existing text; caret starts at the end (natural for

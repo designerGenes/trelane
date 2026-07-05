@@ -60,10 +60,21 @@ impl Tab {
 pub enum FieldValue {
     Bool(bool),
     /// Unsigned integer with an inclusive [min, max] clamp and a step.
-    Uint { value: u64, min: u64, max: u64, step: u64 },
+    Uint {
+        value: u64,
+        min: u64,
+        max: u64,
+        step: u64,
+    },
     /// Optional unsigned integer (None renders as "off"); toggling from None
     /// yields `default_on`.
-    OptUint { value: Option<u64>, default_on: u64, min: u64, max: u64, step: u64 },
+    OptUint {
+        value: Option<u64>,
+        default_on: u64,
+        min: u64,
+        max: u64,
+        step: u64,
+    },
 }
 
 /// A single editable row in the Config tab.
@@ -80,9 +91,9 @@ impl ConfigField {
         match &self.value {
             FieldValue::Bool(b) => (if *b { "[x]" } else { "[ ]" }).to_string(),
             FieldValue::Uint { value, .. } => value.to_string(),
-            FieldValue::OptUint { value, .. } => {
-                value.map(|v| v.to_string()).unwrap_or_else(|| "off".to_string())
-            }
+            FieldValue::OptUint { value, .. } => value
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "off".to_string()),
         }
     }
 
@@ -90,14 +101,25 @@ impl ConfigField {
     fn adjust(&mut self, increase: bool) {
         match &mut self.value {
             FieldValue::Bool(b) => *b = !*b,
-            FieldValue::Uint { value, min, max, step } => {
+            FieldValue::Uint {
+                value,
+                min,
+                max,
+                step,
+            } => {
                 *value = if increase {
                     (*value).saturating_add(*step).min(*max)
                 } else {
                     (*value).saturating_sub(*step).max(*min)
                 };
             }
-            FieldValue::OptUint { value, default_on, min, max, step } => {
+            FieldValue::OptUint {
+                value,
+                default_on,
+                min,
+                max,
+                step,
+            } => {
                 match value {
                     None => {
                         if increase {
@@ -124,13 +146,21 @@ impl ConfigField {
     fn toggle(&mut self) {
         match &mut self.value {
             FieldValue::Bool(b) => *b = !*b,
-            FieldValue::OptUint { value, default_on, min, max, .. } => {
+            FieldValue::OptUint {
+                value,
+                default_on,
+                min,
+                max,
+                ..
+            } => {
                 *value = match value {
                     Some(_) => None,
                     None => Some((*default_on).clamp(*min, *max)),
                 };
             }
-            FieldValue::Uint { value, min, max, .. } => {
+            FieldValue::Uint {
+                value, min, max, ..
+            } => {
                 *value = if *value == *max { *min } else { *max };
             }
         }
@@ -185,12 +215,22 @@ impl DiagnosticState {
             ConfigField {
                 key: "squire.interval_s",
                 label: "Squire tick interval (s)",
-                value: FieldValue::Uint { value: config.squire.interval_s, min: 1, max: 3600, step: 1 },
+                value: FieldValue::Uint {
+                    value: config.squire.interval_s,
+                    min: 1,
+                    max: 3600,
+                    step: 1,
+                },
             },
             ConfigField {
                 key: "squire.max_concurrent",
                 label: "Max concurrent agents",
-                value: FieldValue::Uint { value: config.squire.max_concurrent as u64, min: 1, max: 64, step: 1 },
+                value: FieldValue::Uint {
+                    value: config.squire.max_concurrent as u64,
+                    min: 1,
+                    max: 64,
+                    step: 1,
+                },
             },
             ConfigField {
                 key: "squire.reply_timeout_s",
@@ -206,7 +246,12 @@ impl DiagnosticState {
             ConfigField {
                 key: "claims.default_ttl_s",
                 label: "Claim TTL (s)",
-                value: FieldValue::Uint { value: config.claims.default_ttl_s, min: 30, max: 86_400, step: 30 },
+                value: FieldValue::Uint {
+                    value: config.claims.default_ttl_s,
+                    min: 30,
+                    max: 86_400,
+                    step: 30,
+                },
             },
             ConfigField {
                 key: "biplane.detect_thematic_deadlock",
@@ -236,14 +281,28 @@ impl DiagnosticState {
     pub fn apply_to_config(&self, config: &mut Config) {
         for f in &self.fields {
             match (f.key, &f.value) {
-                ("squire.interval_s", FieldValue::Uint { value, .. }) => config.squire.interval_s = *value,
-                ("squire.max_concurrent", FieldValue::Uint { value, .. }) => config.squire.max_concurrent = *value as usize,
-                ("squire.reply_timeout_s", FieldValue::OptUint { value, .. }) => config.squire.reply_timeout_s = *value,
-                ("claims.default_ttl_s", FieldValue::Uint { value, .. }) => config.claims.default_ttl_s = *value,
-                ("biplane.detect_thematic_deadlock", FieldValue::Bool(b)) => config.biplane.detect_thematic_deadlock = *b,
-                ("biplane.reanalyze_on_all_stop", FieldValue::Bool(b)) => config.biplane.reanalyze_on_all_stop = *b,
+                ("squire.interval_s", FieldValue::Uint { value, .. }) => {
+                    config.squire.interval_s = *value
+                }
+                ("squire.max_concurrent", FieldValue::Uint { value, .. }) => {
+                    config.squire.max_concurrent = *value as usize
+                }
+                ("squire.reply_timeout_s", FieldValue::OptUint { value, .. }) => {
+                    config.squire.reply_timeout_s = *value
+                }
+                ("claims.default_ttl_s", FieldValue::Uint { value, .. }) => {
+                    config.claims.default_ttl_s = *value
+                }
+                ("biplane.detect_thematic_deadlock", FieldValue::Bool(b)) => {
+                    config.biplane.detect_thematic_deadlock = *b
+                }
+                ("biplane.reanalyze_on_all_stop", FieldValue::Bool(b)) => {
+                    config.biplane.reanalyze_on_all_stop = *b
+                }
                 ("ui.pane_navigation", FieldValue::Bool(b)) => config.ui.pane_navigation = *b,
-                ("ui.match_host_terminal", FieldValue::Bool(b)) => config.ui.match_host_terminal = *b,
+                ("ui.match_host_terminal", FieldValue::Bool(b)) => {
+                    config.ui.match_host_terminal = *b
+                }
                 _ => {}
             }
         }
@@ -470,12 +529,24 @@ fn gather_state(ctx: &crate::Context) -> Result<DiagnosticState> {
         let domain = store::get_domain(&ctx.conn, name)?;
         let (domain_desc, model) = match domain {
             Some(d) => (
-                if d.writable.is_empty() { d.description.clone() } else { d.writable.join(", ") },
-                d.launcher_agent.clone().unwrap_or_else(|| "(default)".to_string()),
+                if d.writable.is_empty() {
+                    d.description.clone()
+                } else {
+                    d.writable.join(", ")
+                },
+                d.launcher_agent
+                    .clone()
+                    .unwrap_or_else(|| "(default)".to_string()),
             ),
             None => ("(unknown)".to_string(), "(default)".to_string()),
         };
-        rows.push(AgentRow { name: name.clone(), domain: domain_desc, running, inbox, model });
+        rows.push(AgentRow {
+            name: name.clone(),
+            domain: domain_desc,
+            running,
+            inbox,
+            model,
+        });
     }
 
     let (_, cycle) = squire::wait_graph(&ctx.conn)?;
@@ -501,13 +572,21 @@ fn gather_state(ctx: &crate::Context) -> Result<DiagnosticState> {
         .unwrap_or_else(|| ctx.root.display().to_string());
     let session_line = format!("{} agent(s) | {}", agent_names.len(), state_label);
 
-    Ok(DiagnosticState::new(project, session_line, rows, deadlock, &ctx.config))
+    Ok(DiagnosticState::new(
+        project,
+        session_line,
+        rows,
+        deadlock,
+        &ctx.config,
+    ))
 }
 
 fn run_loop(ctx: &crate::Context, state: &mut DiagnosticState) -> Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-    use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
     use crossterm::execute;
+    use crossterm::terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    };
     use ratatui::prelude::*;
     use std::time::Duration;
 
@@ -520,33 +599,33 @@ fn run_loop(ctx: &crate::Context, state: &mut DiagnosticState) -> Result<()> {
     let outcome = (|| -> Result<()> {
         loop {
             terminal.draw(|f| render(f, state))?;
-            if event::poll(Duration::from_millis(250))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind != KeyEventKind::Press {
-                        continue;
-                    }
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => state.should_quit = true,
-                        KeyCode::Tab => state.next_tab(),
-                        KeyCode::BackTab => state.prev_tab(),
-                        KeyCode::Up => state.cursor_up(),
-                        KeyCode::Down => state.cursor_down(),
-                        KeyCode::Left => state.adjust_left(),
-                        KeyCode::Right => state.adjust_right(),
-                        KeyCode::Char(' ') | KeyCode::Enter => state.toggle_focused(),
-                        KeyCode::Char('s') => {
-                            if state.dirty {
-                                save_config(state)?;
-                                state.mark_saved();
-                            }
-                            if state.models_dirty {
-                                save_agent_models(ctx, state)?;
-                                state.mark_models_saved();
-                            }
+            if event::poll(Duration::from_millis(250))?
+                && let Event::Key(key) = event::read()?
+            {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => state.should_quit = true,
+                    KeyCode::Tab => state.next_tab(),
+                    KeyCode::BackTab => state.prev_tab(),
+                    KeyCode::Up => state.cursor_up(),
+                    KeyCode::Down => state.cursor_down(),
+                    KeyCode::Left => state.adjust_left(),
+                    KeyCode::Right => state.adjust_right(),
+                    KeyCode::Char(' ') | KeyCode::Enter => state.toggle_focused(),
+                    KeyCode::Char('s') => {
+                        if state.dirty {
+                            save_config(state)?;
+                            state.mark_saved();
                         }
-                        KeyCode::Char('K') => confirm_and_kill(&mut terminal, state)?,
-                        _ => {}
+                        if state.models_dirty {
+                            save_agent_models(ctx, state)?;
+                            state.mark_models_saved();
+                        }
                     }
+                    KeyCode::Char('K') => confirm_and_kill(&mut terminal, state)?,
+                    _ => {}
                 }
             }
             if state.should_quit || state.kill_requested {
@@ -606,7 +685,7 @@ fn confirm_and_kill<B: ratatui::backend::Backend>(
 ) -> Result<()> {
     use crossterm::event::{self, Event, KeyCode};
     // Draw a confirm overlay, then block for a single y/n.
-    terminal.draw(|f| render_kill_confirm(f))?;
+    terminal.draw(render_kill_confirm)?;
     loop {
         if let Event::Key(key) = event::read()? {
             match key.code {
@@ -655,15 +734,18 @@ fn render(f: &mut ratatui::Frame, state: &DiagnosticState) {
 
     match state.tab {
         Tab::Overview => {
-            let mut lines = vec![
-                Line::from(vec![
-                    Span::styled("Session: ", Style::default().fg(dim)),
-                    Span::raw(state.session_line.clone()),
-                ]),
-            ];
+            let mut lines = vec![Line::from(vec![
+                Span::styled("Session: ", Style::default().fg(dim)),
+                Span::raw(state.session_line.clone()),
+            ])];
             match &state.deadlock {
                 Some(cycle) => lines.push(Line::from(vec![
-                    Span::styled("Deadlock: ", Style::default().fg(theme_color(THEME_WARN)).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "Deadlock: ",
+                        Style::default()
+                            .fg(theme_color(THEME_WARN))
+                            .add_modifier(Modifier::BOLD),
+                    ),
                     Span::raw(cycle.clone()),
                 ])),
                 None => lines.push(Line::from(vec![
@@ -676,7 +758,11 @@ fn render(f: &mut ratatui::Frame, state: &DiagnosticState) {
                 "Tab: switch view   ↑↓: move   ←→/space: edit (Config)   s: save   K: kill   q: quit",
                 Style::default().fg(dim),
             )));
-            let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(accent)));
+            let p = Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(accent)),
+            );
             f.render_widget(p, chunks[1]);
         }
         Tab::Agents => {
@@ -740,11 +826,18 @@ fn render(f: &mut ratatui::Frame, state: &DiagnosticState) {
                     ListItem::new(Line::from(vec![
                         Span::raw(marker),
                         Span::styled(format!("{:<28}", field.label), Style::default()),
-                        Span::styled(field.display_value(), Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            field.display_value(),
+                            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                        ),
                     ]))
                 })
                 .collect();
-            let title = if state.dirty { " Config * (unsaved) " } else { " Config " };
+            let title = if state.dirty {
+                " Config * (unsaved) "
+            } else {
+                " Config "
+            };
             let list = List::new(items).block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -755,15 +848,16 @@ fn render(f: &mut ratatui::Frame, state: &DiagnosticState) {
         }
     }
 
-    let status = state.status.clone().unwrap_or_else(|| {
-        match state.tab {
-            Tab::Config => "←→ adjust   space toggle   s save".to_string(),
-            Tab::Agents => "↑↓ select   ←→ change model   s save".to_string(),
-            Tab::Overview => "Tab to switch views".to_string(),
-        }
+    let status = state.status.clone().unwrap_or_else(|| match state.tab {
+        Tab::Config => "←→ adjust   space toggle   s save".to_string(),
+        Tab::Agents => "↑↓ select   ←→ change model   s save".to_string(),
+        Tab::Overview => "Tab to switch views".to_string(),
     });
-    let footer = Paragraph::new(Line::from(Span::styled(status, Style::default().fg(dim))))
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(dim)));
+    let footer = Paragraph::new(Line::from(Span::styled(status, Style::default().fg(dim)))).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(dim)),
+    );
     f.render_widget(footer, chunks[2]);
 }
 
@@ -775,11 +869,19 @@ fn render_kill_confirm(f: &mut ratatui::Frame) {
     let warn = theme_color(THEME_WARN);
     let p = Paragraph::new(vec![
         Line::from(""),
-        Line::from(Span::styled("  Kill ALL Trelane sessions?", Style::default().fg(warn).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            "  Kill ALL Trelane sessions?",
+            Style::default().fg(warn).add_modifier(Modifier::BOLD),
+        )),
         Line::from(""),
         Line::from("  y = confirm    n/Esc = cancel"),
     ])
-    .block(Block::default().borders(Borders::ALL).title(" Emergency Kill ").border_style(Style::default().fg(warn)));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Emergency Kill ")
+            .border_style(Style::default().fg(warn)),
+    );
     f.render_widget(p, area);
 }
 
@@ -811,10 +913,28 @@ mod tests {
     fn state_with_defaults() -> DiagnosticState {
         let config = Config::default();
         let agents = vec![
-            AgentRow { name: "alpha".into(), domain: "src/a/**".into(), running: true, inbox: 2, model: "opencode".into() },
-            AgentRow { name: "beta".into(), domain: "src/b/**".into(), running: false, inbox: 0, model: "claude-code".into() },
+            AgentRow {
+                name: "alpha".into(),
+                domain: "src/a/**".into(),
+                running: true,
+                inbox: 2,
+                model: "opencode".into(),
+            },
+            AgentRow {
+                name: "beta".into(),
+                domain: "src/b/**".into(),
+                running: false,
+                inbox: 0,
+                model: "claude-code".into(),
+            },
         ];
-        DiagnosticState::new("demo".into(), "2 agents | ACTIVE".into(), agents, None, &config)
+        DiagnosticState::new(
+            "demo".into(),
+            "2 agents | ACTIVE".into(),
+            agents,
+            None,
+            &config,
+        )
     }
 
     #[test]
@@ -857,7 +977,11 @@ mod tests {
         let mut s = state_with_defaults();
         s.tab = Tab::Config;
         // find the detect_thematic_deadlock field (default true)
-        let idx = s.fields.iter().position(|f| f.key == "biplane.detect_thematic_deadlock").unwrap();
+        let idx = s
+            .fields
+            .iter()
+            .position(|f| f.key == "biplane.detect_thematic_deadlock")
+            .unwrap();
         s.cursor = idx;
         assert!(!s.dirty);
         s.toggle_focused();
@@ -872,7 +996,11 @@ mod tests {
     fn uint_field_adjusts_and_clamps() {
         let mut s = state_with_defaults();
         s.tab = Tab::Config;
-        let idx = s.fields.iter().position(|f| f.key == "squire.interval_s").unwrap();
+        let idx = s
+            .fields
+            .iter()
+            .position(|f| f.key == "squire.interval_s")
+            .unwrap();
         s.cursor = idx;
         // default is 20 (from Config::default); decrement toward min 1
         for _ in 0..30 {
@@ -888,13 +1016,23 @@ mod tests {
     fn opt_uint_toggles_off_and_on() {
         let mut s = state_with_defaults();
         s.tab = Tab::Config;
-        let idx = s.fields.iter().position(|f| f.key == "squire.reply_timeout_s").unwrap();
+        let idx = s
+            .fields
+            .iter()
+            .position(|f| f.key == "squire.reply_timeout_s")
+            .unwrap();
         s.cursor = idx;
         // default from Config::default() is Some(3600)
         s.toggle_focused();
-        assert!(matches!(s.fields[idx].value, FieldValue::OptUint { value: None, .. }));
+        assert!(matches!(
+            s.fields[idx].value,
+            FieldValue::OptUint { value: None, .. }
+        ));
         s.toggle_focused();
-        assert!(matches!(s.fields[idx].value, FieldValue::OptUint { value: Some(_), .. }));
+        assert!(matches!(
+            s.fields[idx].value,
+            FieldValue::OptUint { value: Some(_), .. }
+        ));
     }
 
     #[test]
@@ -919,7 +1057,11 @@ mod tests {
     fn edits_reflected_back_into_config() {
         let mut s = state_with_defaults();
         s.tab = Tab::Config;
-        let idx = s.fields.iter().position(|f| f.key == "squire.max_concurrent").unwrap();
+        let idx = s
+            .fields
+            .iter()
+            .position(|f| f.key == "squire.max_concurrent")
+            .unwrap();
         s.cursor = idx;
         s.adjust_right(); // +1 from default 2 -> 3
         let mut config = Config::default();
@@ -965,11 +1107,34 @@ mod tests {
 
     #[test]
     fn display_value_formats_each_kind() {
-        let b = ConfigField { key: "k", label: "l", value: FieldValue::Bool(true) };
+        let b = ConfigField {
+            key: "k",
+            label: "l",
+            value: FieldValue::Bool(true),
+        };
         assert_eq!(b.display_value(), "[x]");
-        let u = ConfigField { key: "k", label: "l", value: FieldValue::Uint { value: 7, min: 0, max: 9, step: 1 } };
+        let u = ConfigField {
+            key: "k",
+            label: "l",
+            value: FieldValue::Uint {
+                value: 7,
+                min: 0,
+                max: 9,
+                step: 1,
+            },
+        };
         assert_eq!(u.display_value(), "7");
-        let o = ConfigField { key: "k", label: "l", value: FieldValue::OptUint { value: None, default_on: 1, min: 1, max: 9, step: 1 } };
+        let o = ConfigField {
+            key: "k",
+            label: "l",
+            value: FieldValue::OptUint {
+                value: None,
+                default_on: 1,
+                min: 1,
+                max: 9,
+                step: 1,
+            },
+        };
         assert_eq!(o.display_value(), "off");
     }
 
@@ -990,7 +1155,10 @@ mod tests {
         s.cycle_agent_model(true); // opencode is last -> wraps to "(default)"
         assert_eq!(s.agents[0].model, "(default)");
         assert!(s.models_dirty);
-        assert_eq!(s.pending_models.get("alpha").map(String::as_str), Some("(default)"));
+        assert_eq!(
+            s.pending_models.get("alpha").map(String::as_str),
+            Some("(default)")
+        );
     }
 
     #[test]
@@ -1016,7 +1184,10 @@ mod tests {
     #[test]
     fn model_to_launcher_agent_maps_default_to_none() {
         assert_eq!(DiagnosticState::model_to_launcher_agent("(default)"), None);
-        assert_eq!(DiagnosticState::model_to_launcher_agent("opencode"), Some("opencode"));
+        assert_eq!(
+            DiagnosticState::model_to_launcher_agent("opencode"),
+            Some("opencode")
+        );
     }
 
     #[test]

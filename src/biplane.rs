@@ -521,7 +521,21 @@ pub fn generate_biplane_report(
     let (_, cycle) = crate::squire::wait_graph(&ctx.conn)?;
     let deadlock = cycle.clone();
 
-    let safe_pocket_features = scan_safe_pocket_features(safe_pocket_dir);
+    // Determine the safe_pocket to scan: explicit override > project-linked pocket > SPOCKET_ROOT env
+    let effective_pocket = safe_pocket_dir
+        .map(Path::to_path_buf)
+        .or_else(|| find_pocket_for_project(&ctx.root));
+
+    let safe_pocket_features = if let Some(ref pocket) = effective_pocket {
+        let features_dir = pocket.join("FEATURES");
+        if features_dir.is_dir() {
+            scan_feature_dir(&features_dir)
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
 
     let mut recommendations = Vec::new();
     if agents.is_empty() {
@@ -571,25 +585,65 @@ pub fn generate_biplane_report(
 }
 
 pub fn find_pocket_for_project(project_root: &Path) -> Option<PathBuf> {
+    // 1. Check SPOCKET_ROOT env var (set when project is open in VS Code)
+    if let Ok(root) = std::env::var("SPOCKET_ROOT")
+        && !root.is_empty()
+    {
+        let pocket = PathBuf::from(&root);
+        if pocket.is_dir() {
+            return Some(pocket);
+        }
+    }
+
+    // 2. Scan ~/.safe_pocket/*/manifest.json for a pocket linked to this project
     let home = std::env::var("HOME").ok()?;
     let pockets_root = PathBuf::from(&home).join(".safe_pocket");
     let entries = fs::read_dir(&pockets_root).ok()?;
+
+    let project_str = project_root.display().to_string();
+    let mut matches = Vec::new();
+
     for entry in entries.flatten() {
         let pocket = entry.path();
         let manifest_path = pocket.join("manifest.json");
         if let Ok(text) = fs::read_to_string(&manifest_path)
-            && text.contains(&project_root.display().to_string())
+            && text.contains(&project_str)
         {
-            return Some(pocket);
+            matches.push(pocket);
+            continue;
         }
         let agents_md = pocket.join("AGENTS.md");
         if let Ok(text) = fs::read_to_string(&agents_md)
-            && text.contains(&project_root.display().to_string())
+            && text.contains(&project_str)
         {
-            return Some(pocket);
+            matches.push(pocket);
         }
     }
-    None
+
+    match matches.len() {
+        0 => None,
+        1 => Some(matches.into_iter().next().unwrap()),
+        _ => {
+            // Multiple pockets linked to this project -- ask the user to choose.
+            eprintln!();
+            eprintln!("  Multiple safe_pockets are linked to this project:");
+            for (i, p) in matches.iter().enumerate() {
+                eprintln!("  [{}] {}", i + 1, p.display());
+            }
+            eprintln!();
+            eprint!("  Select a pocket (1-{}): ", matches.len());
+            use std::io::{self, Write};
+            let _ = io::stderr().flush();
+            let mut input = String::new();
+            io::stdin().read_line(&mut input).ok()?;
+            let choice: usize = input.trim().parse().ok()?;
+            if choice >= 1 && choice <= matches.len() {
+                Some(matches.into_iter().nth(choice - 1).unwrap())
+            } else {
+                None
+            }
+        }
+    }
 }
 
 pub fn has_existing_biplane_report(project_root: &Path) -> Option<PathBuf> {
@@ -770,34 +824,34 @@ fn print_biplane_report(report: &BiplaneReport) {
     println!();
 }
 
+#[allow(dead_code)]
 fn scan_safe_pocket_features(safe_pocket_dir: Option<&Path>) -> Vec<String> {
-    let dir = match safe_pocket_dir {
-        Some(d) => d.to_path_buf(),
-        None => {
-            let home = std::env::var("HOME").unwrap_or_default();
-            PathBuf::from(&home).join(".safe_pocket")
+    // If an explicit dir is given, scan it directly.
+    if let Some(dir) = safe_pocket_dir {
+        if dir.is_dir() {
+            return scan_feature_dir(dir);
         }
-    };
-
-    if !dir.is_dir() {
         return Vec::new();
     }
 
-    if safe_pocket_dir.is_some() {
-        return scan_feature_dir(&dir);
-    }
-
-    let mut found = Vec::new();
-    if let Ok(pocket_entries) = fs::read_dir(&dir) {
-        for entry in pocket_entries.flatten() {
-            let pocket = entry.path();
-            let features = pocket.join("FEATURES");
-            if features.is_dir() {
-                found.extend(scan_feature_dir(&features));
-            }
+    // No explicit dir: try to find the pocket linked to the current project.
+    // Check SPOCKET_ROOT first, then scan manifests.
+    if let Ok(root) = std::env::var("SPOCKET_ROOT")
+        && !root.is_empty()
+    {
+        let pocket = PathBuf::from(&root);
+        let features = pocket.join("FEATURES");
+        if features.is_dir() {
+            return scan_feature_dir(&features);
         }
     }
-    found
+
+    // Try to find via manifest scan -- but we need a project root for that.
+    // In the biplane report context, we don't always have one, so fall back
+    // to scanning all pockets only if no SPOCKET_ROOT is set.
+    // The caller (generate_biplane_report) should pass the project root's
+    // linked pocket via safe_pocket_dir to avoid scanning everything.
+    Vec::new()
 }
 
 fn scan_feature_dir(dir: &Path) -> Vec<String> {

@@ -170,9 +170,8 @@ pub fn setup_session_ui(session: &str, ui: &UiConfig) -> Result<()> {
     // editing, per-agent model switching, kill) in a large split, giving the
     // user the "swap to diagnostic view" control the session UI is meant to
     // have. The TUI restores the pane on quit.
-    let diag_cmd = format!(
-        "trelane --root \"$(cat {root_marker} 2>/dev/null || echo $HOME)\" diagnostic",
-    );
+    let diag_cmd =
+        format!("trelane --root \"$(cat {root_marker} 2>/dev/null || echo $HOME)\" diagnostic",);
     tmux(
         "bind-key diagnostic-view",
         &[

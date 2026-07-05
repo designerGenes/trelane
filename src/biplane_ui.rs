@@ -15,7 +15,7 @@
 //! Trelane's teal so the two UIs are never confused at a glance -- both
 //! palettes live in `crate::diagnostic` as a single source of truth.
 
-use crate::biplane::{validate_description, DomainSpec, ProjectDescription};
+use crate::biplane::{DomainSpec, ProjectDescription, validate_description};
 use crate::error::Result;
 
 /// A single editable row: a domain plus whether it's currently included.
@@ -54,7 +54,10 @@ impl BiplaneUiState {
         let rows = desc
             .domains
             .iter()
-            .map(|d| DomainRow { spec: d.clone(), include: true })
+            .map(|d| DomainRow {
+                spec: d.clone(),
+                include: true,
+            })
             .collect();
         let budget = desc.max_agents.unwrap_or(desc.domains.len().max(1)).max(1);
         Self {
@@ -91,7 +94,8 @@ impl BiplaneUiState {
             .filter(|r| r.include)
             .map(|r| {
                 let mut spec = r.spec.clone();
-                spec.depends_on.retain(|dep| included.contains(dep.as_str()));
+                spec.depends_on
+                    .retain(|dep| included.contains(dep.as_str()));
                 spec
             })
             .collect();
@@ -326,7 +330,7 @@ fn run_loop(root: &std::path::Path, state: &mut BiplaneUiState) -> Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind};
     use crossterm::execute;
     use crossterm::terminal::{
-        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     };
     use ratatui::prelude::*;
     use std::time::Duration;
@@ -340,54 +344,54 @@ fn run_loop(root: &std::path::Path, state: &mut BiplaneUiState) -> Result<()> {
     let outcome = (|| -> Result<()> {
         loop {
             terminal.draw(|f| render(f, state))?;
-            if event::poll(Duration::from_millis(250))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind != KeyEventKind::Press {
-                        continue;
-                    }
-                    // Edit mode: keys flow into the rename buffer.
-                    if state.is_editing() {
-                        match key.code {
-                            KeyCode::Enter => {
-                                state.commit_rename();
-                            }
-                            KeyCode::Esc => state.cancel_edit(),
-                            KeyCode::Backspace => state.edit_backspace(),
-                            KeyCode::Left => {
-                                if let Some(i) = state.editing.as_mut() {
-                                    i.move_left();
-                                }
-                            }
-                            KeyCode::Right => {
-                                if let Some(i) = state.editing.as_mut() {
-                                    i.move_right();
-                                }
-                            }
-                            KeyCode::Char(c) => state.edit_insert(c),
-                            _ => {}
-                        }
-                        continue;
-                    }
+            if event::poll(Duration::from_millis(250))?
+                && let Event::Key(key) = event::read()?
+            {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                // Edit mode: keys flow into the rename buffer.
+                if state.is_editing() {
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => state.should_quit = true,
-                        KeyCode::Up => state.cursor_up(),
-                        KeyCode::Down => state.cursor_down(),
-                        KeyCode::Char(' ') | KeyCode::Enter => state.toggle_include(),
-                        KeyCode::Left => state.adjust_agents(false),
-                        KeyCode::Right => state.adjust_agents(true),
-                        KeyCode::Char('[') => state.adjust_budget(false),
-                        KeyCode::Char(']') => state.adjust_budget(true),
-                        KeyCode::Char('K') => state.move_up(),
-                        KeyCode::Char('J') => state.move_down(),
-                        KeyCode::Char('e') => state.begin_rename(),
-                        KeyCode::Char('s') => {
-                            if let Some(desc) = state.validated() {
-                                save_description(root, &desc)?;
-                                state.mark_saved();
+                        KeyCode::Enter => {
+                            state.commit_rename();
+                        }
+                        KeyCode::Esc => state.cancel_edit(),
+                        KeyCode::Backspace => state.edit_backspace(),
+                        KeyCode::Left => {
+                            if let Some(i) = state.editing.as_mut() {
+                                i.move_left();
                             }
                         }
+                        KeyCode::Right => {
+                            if let Some(i) = state.editing.as_mut() {
+                                i.move_right();
+                            }
+                        }
+                        KeyCode::Char(c) => state.edit_insert(c),
                         _ => {}
                     }
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => state.should_quit = true,
+                    KeyCode::Up => state.cursor_up(),
+                    KeyCode::Down => state.cursor_down(),
+                    KeyCode::Char(' ') | KeyCode::Enter => state.toggle_include(),
+                    KeyCode::Left => state.adjust_agents(false),
+                    KeyCode::Right => state.adjust_agents(true),
+                    KeyCode::Char('[') => state.adjust_budget(false),
+                    KeyCode::Char(']') => state.adjust_budget(true),
+                    KeyCode::Char('K') => state.move_up(),
+                    KeyCode::Char('J') => state.move_down(),
+                    KeyCode::Char('e') => state.begin_rename(),
+                    KeyCode::Char('s') => {
+                        if let Some(desc) = state.validated() {
+                            save_description(root, &desc)?;
+                            state.mark_saved();
+                        }
+                    }
+                    _ => {}
                 }
             }
             if state.should_quit {
@@ -427,7 +431,10 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
     // Header
     let mut header_lines = vec![
         Line::from(vec![
-            Span::styled("Biplane :: ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Biplane :: ",
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ),
             Span::raw(state.project_name.clone()),
         ]),
         Line::from(vec![
@@ -437,7 +444,11 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
                 Style::default().fg(accent),
             ),
             Span::styled(
-                format!("   included {}/{}", state.included_count(), state.rows.len()),
+                format!(
+                    "   included {}/{}",
+                    state.included_count(),
+                    state.rows.len()
+                ),
                 Style::default().fg(dim),
             ),
             Span::styled(format!("   ({})", state.source), Style::default().fg(dim)),
@@ -445,13 +456,25 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
     ];
     if let Some(err) = &state.last_error {
         header_lines.push(Line::from(vec![
-            Span::styled("invalid: ", Style::default().fg(tc(THEME_WARN)).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "invalid: ",
+                Style::default()
+                    .fg(tc(THEME_WARN))
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(err.clone()),
         ]));
     }
-    let title = if state.dirty { " Project * (unsaved) " } else { " Project " };
+    let title = if state.dirty {
+        " Project * (unsaved) "
+    } else {
+        " Project "
+    };
     let header = Paragraph::new(header_lines).block(
-        Block::default().borders(Borders::ALL).title(title).border_style(Style::default().fg(accent)),
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(accent)),
     );
     f.render_widget(header, chunks[0]);
 
@@ -480,12 +503,20 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
             // When editing the focused row, show the live buffer with a caret.
             let editing_here = i == state.cursor && state.editing.is_some();
             let name_cell = if editing_here {
-                format!(" {:<16}", state.editing.as_ref().unwrap().render_with_caret())
+                format!(
+                    " {:<16}",
+                    state.editing.as_ref().unwrap().render_with_caret()
+                )
             } else {
                 format!(" {:<16}", row.spec.name)
             };
             let name_span = if editing_here {
-                Span::styled(name_cell, Style::default().fg(tc(THEME_WARN)).add_modifier(Modifier::BOLD))
+                Span::styled(
+                    name_cell,
+                    Style::default()
+                        .fg(tc(THEME_WARN))
+                        .add_modifier(Modifier::BOLD),
+                )
             } else {
                 Span::styled(name_cell, name_style)
             };
@@ -493,8 +524,14 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
                 Span::raw(marker),
                 check,
                 name_span,
-                Span::styled(format!("agents:{:<3} ", row.spec.agents), Style::default().fg(dim)),
-                Span::styled(format!("work:{:<3} ", row.spec.planned_work.len()), Style::default().fg(dim)),
+                Span::styled(
+                    format!("agents:{:<3} ", row.spec.agents),
+                    Style::default().fg(dim),
+                ),
+                Span::styled(
+                    format!("work:{:<3} ", row.spec.planned_work.len()),
+                    Style::default().fg(dim),
+                ),
                 Span::styled(format!("deps:{:<12} ", deps), Style::default().fg(dim)),
                 Span::styled(row.spec.writable.join(","), Style::default().fg(dim)),
             ]))
@@ -513,11 +550,15 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
         if state.editing.is_some() {
             "typing… Enter save name  Esc cancel  ←→ move caret  Backspace delete".to_string()
         } else {
-            "↑↓ move  space include  ←→ agents  [ ] budget  K/J reorder  e rename  s save  q quit".to_string()
+            "↑↓ move  space include  ←→ agents  [ ] budget  K/J reorder  e rename  s save  q quit"
+                .to_string()
         }
     });
-    let footer = Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(dim))))
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(dim)));
+    let footer = Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(dim)))).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(dim)),
+    );
     f.render_widget(footer, chunks[2]);
 }
 
