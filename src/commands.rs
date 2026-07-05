@@ -341,6 +341,7 @@ fn relaunch_command_for_agent(ctx: &Context, agent: &str) -> String {
     )
 }
 
+#[allow(dead_code)]
 fn applescript_escape(input: &str) -> String {
     input.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -430,62 +431,15 @@ fn launch_via_adapter(adapter: &str, target: &str, command: &str) -> Result<()> 
         "tmux" => Command::new("tmux")
             .args(["send-keys", "-t", target, command, "Enter"])
             .status()?,
-        "kitty" => Command::new("kitty")
-            .args(["@", "send-text", "--match", target, &format!("{command}\n")])
-            .status()?,
-        "wezterm" => Command::new("wezterm")
-            .args(["cli", "send-text", "--pane-id", target, command])
-            .status()?,
-        "ghostty" => {
-            let script = if target == "frontmost" {
-                format!(
-                    "tell application \"Ghostty\" to activate\n\
-                     tell application \"System Events\"\n\
-                     tell process \"Ghostty\"\n\
-                     keystroke \"{}\"\n\
-                     key code 36\n\
-                     end tell\n\
-                     end tell",
-                    applescript_escape(command)
-                )
-            } else {
-                format!(
-                    "tell application \"Ghostty\" to activate\n\
-                     tell application \"System Events\"\n\
-                     tell process \"Ghostty\"\n\
-                     set frontmost to true\n\
-                     try\n\
-                     click (first window whose name contains \"{}\")\n\
-                     end try\n\
-                     keystroke \"{}\"\n\
-                     key code 36\n\
-                     end tell\n\
-                     end tell",
-                    applescript_escape(target),
-                    applescript_escape(command)
-                )
-            };
-            Command::new("osascript").args(["-e", &script]).status()?
+        // GUI terminal adapters removed: osascript calls trigger repeated
+        // macOS Automation permission prompts and are not needed now that
+        // Trelane is tmux-first.  Users who need a non-tmux adapter can
+        // write a custom --command on set-launch-target.
+        other => {
+            return Err(TrelaneError::msg(format!(
+                "unsupported adapter '{other}'. Trelane is tmux-first; use 'tmux' or set a custom --command."
+            )));
         }
-        "iterm2" => Command::new("osascript")
-            .args([
-                "-e",
-                &format!(
-                    "tell application \"iTerm2\" to tell current session of current window to write text \"{}\"",
-                    applescript_escape(command)
-                ),
-            ])
-            .status()?,
-        "terminal.app" => Command::new("osascript")
-            .args([
-                "-e",
-                &format!(
-                    "tell application \"Terminal\" to do script \"{}\" in selected tab of front window",
-                    applescript_escape(command)
-                ),
-            ])
-            .status()?,
-        other => return Err(TrelaneError::msg(format!("unsupported adapter '{other}'"))),
     };
 
     if !status.success() {
