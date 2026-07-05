@@ -108,6 +108,8 @@ pub enum Command {
         name: String,
         #[arg(long = "writable")]
         writable: Vec<String>,
+        #[arg(long = "forbidden-write")]
+        forbidden_write: Vec<String>,
         #[arg(long = "desc")]
         desc: Option<String>,
         #[arg(long = "launcher-agent")]
@@ -119,6 +121,8 @@ pub enum Command {
         agent: String,
         #[arg(long = "writable")]
         writable: Vec<String>,
+        #[arg(long = "forbidden-write")]
+        forbidden_write: Vec<String>,
         #[arg(long = "desc")]
         desc: Option<String>,
     },

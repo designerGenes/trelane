@@ -1462,22 +1462,18 @@ fn apply_plan_to_session(
         if existing.contains(&a.name) {
             continue;
         }
-        crate::commands::cmd_add_agent(ctx, &a.name, &a.writable, Some(&a.description), model)?;
-        // Apply forbidden_write globs if the domain declares any (cmd_add_agent
-        // only sets writable; this mirrors the testing harness's upsert path).
-        if let Some(d) = spec.get(a.name.as_str())
-            && !d.forbidden_write.is_empty()
-        {
-            crate::store::upsert_agent(
-                &ctx.conn,
-                &a.name,
-                &a.description,
-                &a.writable,
-                model,
-                &d.forbidden_write,
-                &crate::crypto::now_iso(),
-            )?;
-        }
+        let fw = spec
+            .get(a.name.as_str())
+            .map(|d| d.forbidden_write.clone())
+            .unwrap_or_default();
+        crate::commands::cmd_add_agent(
+            ctx,
+            &a.name,
+            &a.writable,
+            &fw,
+            Some(&a.description),
+            model,
+        )?;
         added += 1;
     }
 
@@ -1969,6 +1965,7 @@ pub fn reanalyze_on_stop(ctx: &crate::Context) -> Result<()> {
                 ctx,
                 &domain.name,
                 &domain.writable,
+                &domain.forbidden_write,
                 Some(&domain.description),
                 None,
             )?;

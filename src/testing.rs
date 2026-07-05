@@ -253,6 +253,7 @@ fn run_once(
             &ctx,
             &agent.name,
             &agent.writable,
+            &agent.forbidden_write,
             Some(&agent.description),
             agent.launcher_agent.as_deref(),
         )?;
@@ -431,7 +432,7 @@ fn run_once(
                 writable,
                 desc,
             } => {
-                commands::cmd_redomain(&ctx, agent, writable, desc.as_deref())?;
+                commands::cmd_redomain(&ctx, agent, writable, &[], desc.as_deref())?;
                 counters.redomains += 1;
             }
             ScenarioStep::AssertNoDeadlock { explanation: _ } => {

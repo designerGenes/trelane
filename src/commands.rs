@@ -548,6 +548,7 @@ pub fn cmd_add_agent(
     ctx: &Context,
     name: &str,
     writable: &[String],
+    forbidden_write: &[String],
     desc: Option<&str>,
     launcher_agent: Option<&str>,
 ) -> Result<()> {
@@ -567,7 +568,8 @@ pub fn cmd_add_agent(
         )));
     }
 
-    let forbidden = vec![format!("{TRELANE_DIR}/**"), ".git/**".to_string()];
+    let mut forbidden = vec![format!("{TRELANE_DIR}/**"), ".git/**".to_string()];
+    forbidden.extend(forbidden_write.iter().cloned());
     let agent_dir = ctx.trelane_dir().join("agents").join(name);
     std::fs::create_dir_all(agent_dir.join("logs"))?;
 
@@ -594,6 +596,7 @@ pub fn cmd_redomain(
     ctx: &Context,
     agent: &str,
     writable: &[String],
+    forbidden_write: &[String],
     desc: Option<&str>,
 ) -> Result<()> {
     if !store::agent_exists(&ctx.conn, agent)? {
@@ -603,7 +606,8 @@ pub fn cmd_redomain(
     let existing = store::get_domain(&ctx.conn, agent)?
         .ok_or_else(|| TrelaneError::msg(format!("unknown agent '{agent}'")))?;
 
-    let forbidden = vec![format!("{TRELANE_DIR}/**"), ".git/**".to_string()];
+    let mut forbidden = vec![format!("{TRELANE_DIR}/**"), ".git/**".to_string()];
+    forbidden.extend(forbidden_write.iter().cloned());
     let now = crypto::now_iso();
     store::upsert_agent(
         &ctx.conn,

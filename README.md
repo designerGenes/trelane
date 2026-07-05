@@ -17,16 +17,22 @@ wake, drain inbox, work, park anything blocked, exit.
 2. **Inbox first.** Every run begins by draining the inbox. Responsiveness
    happens at run boundaries; run boundaries are frequent because runs are
    deliberately short.
-3. **The squire is the only restarter.** A dumb watcher (`trelane squire`, formerly
-   `trelane squire`) with zero intelligence: if an agent has unread mail, a
-   ready parked task, or sits in a wait-cycle nobody else will break,
-   relaunch it. Cron-friendly (`--once`) or looping (`--watch`).
+3. **The squire is the only restarter.** A dutiful, tireless watcher
+   (`trelane squire`) with zero intelligence: if an agent has unread mail,
+   a ready parked task, or sits in a wait-cycle nobody else will break,
+   relaunch it. Cron-friendly (`--once`) or looping (`--watch`). The
+   squire works tirelessly, thanklessly, and dutifully. (`pump` and `prop`
+   still work as CLI aliases for backward compatibility.)
 
 Deadlock changes character: a wait-cycle can still form, but only in the
-ledger, where it is inspectable data. The squire runs cycle detection on the
-wait-for graph and, when a cycle has no other way to move, wakes the
-lexicographically-first member as designated breaker (documented assumption
-+ notify counterpart). Total silent deadlock is impossible.
+ledger, where it is inspectable data. The squire runs cycle detection on
+the wait-for graph every tick (not just when all agents are idle) and,
+when a cycle has no other way to move, wakes the lexicographically-first
+member as designated breaker (documented assumption + notify counterpart).
+If the same cycle persists across multiple break attempts, the squire
+escalates: broadcasts a critical system message to all cycle members,
+writes a durable alert file, and rotates to a different designated breaker.
+Total silent deadlock is impossible.
 
 ## Architecture
 
@@ -43,16 +49,20 @@ session only needs its own database, secret, and prompts.
       config.json             global: launcher profiles, squire settings, claim TTL, UI, biplane
 
     <project>/.trelane/
-      trelane.db              SQLite: agents, messages, claims, parked tasks, running locks
+      trelane.db              SQLite: agents, messages, claims, parked tasks, running locks, cycle break attempts
       secret                  HMAC key for message signing (gitignored)
       prompts/bootstrap.md    wake-up prompt template ([[TOKENS]] substituted)
       biplane-description.json  structured project description (optional, from --describe)
       biplane-plan.json       derived agent plan (optional, from --emit-plan)
+      traces/                 OpenTelemetry OTLP JSON spans (per session)
+      alerts/                 durable cycle escalation alerts
       agents/<id>/
         state.json            agent-owned scratch state (optional)
         logs/                 stdout of each run
         .prompt.md            generated prompt for the current run (gitignored)
         launch.sh             per-agent tmux launch script (gitignored)
+        wake.json             telemetry metadata for current run (gitignored)
+        park.json             telemetry metadata for current wait (gitignored)
 
 ## Install
 
@@ -79,14 +89,38 @@ Dry-run the full lifecycle with zero tokens:
 
     trelane --testing tests/small.json
 
+## Attach Mode
+
+Trelane is designed to be attachable to existing projects and already-open
+agent sessions. The shortest attach form is:
+
+    trelane --agents "claude,gpt-4,gpt-4-32k" --no-agents "gpt-3.5" .
+
+This does three things:
+
+1. Initializes `.trelane/` for the project if needed.
+2. Records enabled/disabled session agents in `.trelane/trelane.db`.
+3. Inserts a managed Trelane block into the project's `AGENTS.md`, giving
+   already-running agents the protocol, commands, and exit checklist.
+
+Session agent selection is operational: if a domain agent is registered
+with `--launcher-agent <model>`, Trelane will refuse to wake or relaunch
+it when that session model is disabled. When an agent is disabled, any
+parked tasks waiting on it are immediately resolved with an abandonment
+message -- no waiting for the next squire tick.
+
+Use `trelane attach --no-inject .` when you want to initialize and record
+agent selection without modifying `AGENTS.md`.
+
 ## Commands
 
 | Command | Description |
 |---------|-------------|
 | `trelane PROJECT --models M --max-agents N [--with-biplane]` | Launch interactive tmux session with agents |
 | `trelane init [--project DIR]` | Initialize a new trelane session |
-| `trelane add-agent NAME --writable GLOB [--desc TEXT] [--launcher-agent MODEL]` | Register an agent with a domain |
-| `trelane redomain AGENT --writable GLOB [--desc TEXT]` | Update an agent's domain and notify peers |
+| `trelane attach [PROJECT] [--no-inject]` | Attach to a project, inject AGENTS.md |
+| `trelane add-agent NAME --writable GLOB [--forbidden-write GLOB] [--desc TEXT] [--launcher-agent MODEL]` | Register an agent with a domain |
+| `trelane redomain AGENT --writable GLOB [--forbidden-write GLOB] [--desc TEXT]` | Update an agent's domain and notify peers |
 | `trelane send --from A --to B --type TYPE --subject TEXT [--body ...]` | Send a signed message |
 | `trelane inbox AGENT [--json]` | List unprocessed messages |
 | `trelane ack AGENT MSG_ID` | Mark a message as processed |
@@ -96,12 +130,14 @@ Dry-run the full lifecycle with zero tokens:
 | `trelane unpark TASK_ID` | Remove a parked task |
 | `trelane status` | Show full swarm state |
 | `trelane biplane [--json] [--safe-pocket DIR] [--describe FILE] [--next-steps] [--emit-plan] [--interactive] [--accept-defaults]` | Analyze project, generate reports, plan domains |
+| `trelane metrics [--json]` | Show aggregate metrics from OpenTelemetry traces |
+| `trelane rate AGENT RATING --rationale TEXT --rater AGENT` | Rate another agent's run (inter-agent consensus) |
 | `trelane wake AGENT [--why TEXT] [--launcher CMD]` | Launch an agent process |
 | `trelane set-launch-target AGENT --adapter tmux --target PANE [--command TEXT]` | Store a tmux relaunch target |
 | `trelane relaunch AGENT` | Inject a wake command into a tmux target |
 | `trelane done AGENT` | Mark an agent as done (release running lock) |
 | `trelane audit AGENT` | Check for out-of-domain file changes |
-| `trelane squire --once \| --watch [--interval SECS] [--launcher L] [--verbose\|-v]` | The dumb prop (`squire` still works as an alias) |
+| `trelane squire --once \| --watch [--interval SECS] [--launcher L] [--verbose\|-v]` | The dutiful squire (`pump` and `prop` still work as aliases) |
 | `trelane stub AGENT` | Token-free scripted agent for demos |
 | `trelane --testing tests/scenario.json [--testing-runs N]` | Run a scenario harness |
 
@@ -199,13 +235,66 @@ Walks through proposed domains, lets you select which to register, and
 optionally applies them to the live session. `--json` is analysis-only
 (never applies to a live session) to keep stdout parseable.
 
-### Biplane re-analysis on all-stop
+### Thematic deadlock detection (automatic)
+
+When the swarm becomes fully quiescent (no running agents, empty inboxes,
+no parked tasks), Biplane automatically reconciles the stored project
+description against the current repo state. This is on by default
+(`biplane.detect_thematic_deadlock: true` in config.json) and produces
+three distinct outcomes:
+
+- **Emergent domains**: new source directories found in the repo that
+  aren't covered by any registered agent. Reported as informational; auto-
+  registration requires `biplane.reanalyze_on_all_stop: true`.
+- **Stalled domains**: registered agents with no evidence of recent
+  activity (no git commits or file modifications since work was queued).
+  Reported as a "THEMATIC DEADLOCK" notice with per-domain evidence.
+  Domains stuck in an escalated wait-cycle are distinguished from domains
+  that are simply inactive via the `blocked_by_cycle` field.
+- **Healthy domains**: registered agents with recent activity. Confirmed
+  silently so silence is never ambiguous.
+
+### Biplane re-analysis with auto-registration
 
 When `biplane.reanalyze_on_all_stop` is set to `true` in config.json, the
-prop watch loop checks for uncovered domains each time the swarm becomes
-fully quiescent (no running agents, empty inboxes, no parked tasks) and
-auto-registers agents for any new domains found. This is additive-only:
-existing agents are never removed or re-assigned.
+squire watch loop auto-registers agents for emergent domains discovered
+during reconciliation. This is additive-only: existing agents are never
+removed or re-assigned.
+
+## Telemetry and Metrics
+
+Trelane instruments every agent run, wait, and squire tick with
+OpenTelemetry-valid OTLP JSON spans, written to `.trelane/traces/`.
+
+**Span types:**
+
+| Span | What it measures |
+|------|-----------------|
+| `agent.run:<name>` | Duration of a wake-to-done cycle, files changed, lines added/removed, messages processed/sent |
+| `agent.wait:<name>` | Duration of a park-to-unpark cycle, wait type, waiting_on agent, satisfied status |
+| `squire.tick` | Agents launched, agents running, cycle detected |
+| `agent.rate:<name>` | Inter-agent consensus rating (0-10) with rationale, linked to the rated run span |
+
+**Viewing metrics:**
+
+    trelane metrics
+    trelane metrics --json | jq .
+
+The metrics summary shows:
+
+- Total runs, wait events, squire ticks
+- Total run time, total wait time, averages
+- Efficiency ratio (run time / (run time + wait time))
+- Code production: files changed, lines added/removed
+- Messages processed/sent
+- Deadlocks detected
+- Per-agent breakdown table with average ratings
+
+**Rating another agent's run:**
+
+    trelane rate engine 8 --rationale "solid foundation, clean interfaces" --rater frontend
+
+Ratings aggregate into the `avg_rating` column in `trelane metrics`.
 
 ## Testing Harness
 
@@ -224,8 +313,7 @@ Run one directly:
 
 The runner emits regular debug output and appends one JSON object per run
 to a JSONL report file. Report fields include `messages_sent`,
-`squire_ticks` (renamed from `pumps` in pre-0.3), `redomains`, and
-`deadlocks_detected`.
+`squire_ticks`, `redomains`, and `deadlocks_detected`.
 
 ## Configuration
 
@@ -245,7 +333,8 @@ to a JSONL report file. Report fields include `messages_sent`,
   },
   "squire": {
     "interval_s": 20,
-    "max_concurrent": 4
+    "max_concurrent": 4,
+    "reply_timeout_s": 3600
   },
   "claims": {
     "default_ttl_s": 900
@@ -260,13 +349,15 @@ to a JSONL report file. Report fields include `messages_sent`,
     "match_host_terminal": true
   },
   "biplane": {
+    "detect_thematic_deadlock": true,
     "reanalyze_on_all_stop": false
   }
 }
 ```
 
-The `squire` key accepts `squire` as a serde alias for pre-0.3 config
-compatibility. The CLI command `squire` remains as an alias for `squire`.
+The `squire` key accepts `pump` and `prop` as serde aliases for pre-0.3
+config compatibility. The CLI commands `pump` and `prop` remain as aliases
+for `squire`.
 
 ## Command Sequence Examples
 
@@ -302,12 +393,18 @@ parked tasks) is preserved.
 
 ### Domain shifting mid-session
 
-    trelane redomain research --writable 'research/**' 'src/ui/**'
+    trelane redomain research --writable 'research/**' 'src/ui/**' \
+        --forbidden-write 'src/ui/secrets/**'
     trelane squire --once
 
 ### Interactive testing with real AI
 
     trelane --testing tests/full-usage-scenario-interactive.json
+
+### Check metrics after a session
+
+    trelane metrics
+    trelane metrics --json > session-report.json
 
 ## Message format
 
@@ -340,6 +437,11 @@ write. Enforcement is three layers:
    `trelane audit <agent>` flags out-of-domain files changed *during that
    run*.
 
+Custom forbidden-write globs can be added at registration time:
+
+    trelane add-agent frontend --writable 'src/ui/**' \
+        --forbidden-write 'src/ui/secrets/**' --forbidden-write 'src/ui/admin/**'
+
 ## Security model (honest edition)
 
 Signing makes messages tamper-*evident* and blocks accidental or
@@ -353,7 +455,7 @@ against adversarial code.
 
     cargo build                              # compile
     cargo clippy -- -D warnings              # lint
-    cargo test                               # run unit tests (46 passing)
+    cargo test                               # run unit tests (56 passing)
     trelane --testing tests/small.json       # quick scenario test
     trelane --testing tests/medium.json      # medium scenario
     trelane --testing tests/large.json       # large scenario with real deadlock

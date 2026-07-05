@@ -159,6 +159,7 @@ fn cmd_launch(cli: Cli) -> Result<()> {
                     &ctx,
                     &agent.name,
                     &agent.writable,
+                    &[],
                     Some(&agent.description),
                     Some(&primary_model),
                 )?;
@@ -429,6 +430,7 @@ pub fn handle(cli: Cli) -> Result<()> {
         Some(Command::AddAgent {
             name,
             writable,
+            forbidden_write,
             desc,
             launcher_agent,
         }) => {
@@ -437,6 +439,7 @@ pub fn handle(cli: Cli) -> Result<()> {
                 &ctx,
                 &name,
                 &writable,
+                &forbidden_write,
                 desc.as_deref(),
                 launcher_agent.as_deref(),
             )
@@ -444,10 +447,11 @@ pub fn handle(cli: Cli) -> Result<()> {
         Some(Command::Redomain {
             agent,
             writable,
+            forbidden_write,
             desc,
         }) => {
             let ctx = Context::open(cli.root.as_deref())?;
-            commands::cmd_redomain(&ctx, &agent, &writable, desc.as_deref())
+            commands::cmd_redomain(&ctx, &agent, &writable, &forbidden_write, desc.as_deref())
         }
         Some(Command::Send {
             from,
