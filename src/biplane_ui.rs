@@ -44,6 +44,9 @@ pub struct BiplaneUiState {
     pub status: Option<String>,
     /// Source of the description ("loaded from file" vs "scaffolded").
     pub source: String,
+    /// When Some, the user is editing the focused domain's name; keys route
+    /// into this buffer until commit (Enter) or cancel (Esc).
+    pub editing: Option<crate::text_input::TextInput>,
 }
 
 impl BiplaneUiState {
@@ -66,6 +69,7 @@ impl BiplaneUiState {
             save_requested: false,
             status: None,
             source: source.into(),
+            editing: None,
         }
     }
 
@@ -187,6 +191,96 @@ impl BiplaneUiState {
         self.dirty = false;
         self.status = Some("description saved".to_string());
     }
+
+    /// True when a text-edit is in progress (keys should route to the buffer).
+    pub fn is_editing(&self) -> bool {
+        self.editing.is_some()
+    }
+
+    /// Begin editing the focused domain's name, seeding the buffer with its
+    /// current value. No-op if there are no rows.
+    pub fn begin_rename(&mut self) {
+        if let Some(row) = self.rows.get(self.cursor) {
+            self.editing = Some(crate::text_input::TextInput::with_text(&row.spec.name));
+            self.last_error = None;
+        }
+    }
+
+    /// Cancel an in-progress edit, discarding the buffer.
+    pub fn cancel_edit(&mut self) {
+        self.editing = None;
+    }
+
+    /// Commit the in-progress rename to the focused domain. Rejects empty or
+    /// duplicate names (setting `last_error` and keeping edit mode open so the
+    /// user can fix it). On success, rewrites any other domain's `depends_on`
+    /// entries that referenced the old name, so dependencies stay intact.
+    /// Returns true if the rename was applied.
+    pub fn commit_rename(&mut self) -> bool {
+        let Some(input) = self.editing.as_ref() else {
+            return false;
+        };
+        let new_name = input.value().trim().to_string();
+
+        if new_name.is_empty() {
+            self.last_error = Some("domain name must not be empty".to_string());
+            return false;
+        }
+        let old_name = match self.rows.get(self.cursor) {
+            Some(r) => r.spec.name.clone(),
+            None => {
+                self.editing = None;
+                return false;
+            }
+        };
+        if new_name == old_name {
+            // No change; just close the editor cleanly.
+            self.editing = None;
+            self.last_error = None;
+            return false;
+        }
+        // Reject a name that collides with another domain.
+        if self
+            .rows
+            .iter()
+            .enumerate()
+            .any(|(i, r)| i != self.cursor && r.spec.name == new_name)
+        {
+            self.last_error = Some(format!("a domain named '{new_name}' already exists"));
+            return false;
+        }
+
+        // Apply: rename the focused domain and rewrite dependents' edges.
+        self.rows[self.cursor].spec.name = new_name.clone();
+        for (i, row) in self.rows.iter_mut().enumerate() {
+            if i == self.cursor {
+                continue;
+            }
+            for dep in row.spec.depends_on.iter_mut() {
+                if *dep == old_name {
+                    *dep = new_name.clone();
+                }
+            }
+        }
+        self.editing = None;
+        self.last_error = None;
+        self.dirty = true;
+        true
+    }
+
+    /// Feed a character into the active edit buffer (no-op if not editing).
+    pub fn edit_insert(&mut self, c: char) {
+        if let Some(input) = self.editing.as_mut() {
+            input.insert(c);
+        }
+    }
+
+    /// Backspace in the active edit buffer.
+    pub fn edit_backspace(&mut self) {
+        if let Some(input) = self.editing.as_mut() {
+            input.backspace();
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -251,6 +345,29 @@ fn run_loop(root: &std::path::Path, state: &mut BiplaneUiState) -> Result<()> {
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
+                    // Edit mode: keys flow into the rename buffer.
+                    if state.is_editing() {
+                        match key.code {
+                            KeyCode::Enter => {
+                                state.commit_rename();
+                            }
+                            KeyCode::Esc => state.cancel_edit(),
+                            KeyCode::Backspace => state.edit_backspace(),
+                            KeyCode::Left => {
+                                if let Some(i) = state.editing.as_mut() {
+                                    i.move_left();
+                                }
+                            }
+                            KeyCode::Right => {
+                                if let Some(i) = state.editing.as_mut() {
+                                    i.move_right();
+                                }
+                            }
+                            KeyCode::Char(c) => state.edit_insert(c),
+                            _ => {}
+                        }
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => state.should_quit = true,
                         KeyCode::Up => state.cursor_up(),
@@ -262,6 +379,7 @@ fn run_loop(root: &std::path::Path, state: &mut BiplaneUiState) -> Result<()> {
                         KeyCode::Char(']') => state.adjust_budget(true),
                         KeyCode::Char('K') => state.move_up(),
                         KeyCode::Char('J') => state.move_down(),
+                        KeyCode::Char('e') => state.begin_rename(),
                         KeyCode::Char('s') => {
                             if let Some(desc) = state.validated() {
                                 save_description(root, &desc)?;
@@ -359,10 +477,22 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
             } else {
                 Style::default().fg(dim)
             };
+            // When editing the focused row, show the live buffer with a caret.
+            let editing_here = i == state.cursor && state.editing.is_some();
+            let name_cell = if editing_here {
+                format!(" {:<16}", state.editing.as_ref().unwrap().render_with_caret())
+            } else {
+                format!(" {:<16}", row.spec.name)
+            };
+            let name_span = if editing_here {
+                Span::styled(name_cell, Style::default().fg(tc(THEME_WARN)).add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled(name_cell, name_style)
+            };
             ListItem::new(Line::from(vec![
                 Span::raw(marker),
                 check,
-                Span::styled(format!(" {:<16}", row.spec.name), name_style),
+                name_span,
                 Span::styled(format!("agents:{:<3} ", row.spec.agents), Style::default().fg(dim)),
                 Span::styled(format!("work:{:<3} ", row.spec.planned_work.len()), Style::default().fg(dim)),
                 Span::styled(format!("deps:{:<12} ", deps), Style::default().fg(dim)),
@@ -380,7 +510,11 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
 
     // Footer
     let hint = state.status.clone().unwrap_or_else(|| {
-        "↑↓ move  space include  ←→ agents  [ ] budget  K/J reorder  s save  q quit".to_string()
+        if state.editing.is_some() {
+            "typing… Enter save name  Esc cancel  ←→ move caret  Backspace delete".to_string()
+        } else {
+            "↑↓ move  space include  ←→ agents  [ ] budget  K/J reorder  e rename  s save  q quit".to_string()
+        }
     });
     let footer = Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(dim))))
         .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(dim)));
@@ -550,5 +684,83 @@ mod tests {
         assert!(s.dirty);
         s.mark_saved();
         assert!(!s.dirty);
+    }
+
+    #[test]
+    fn begin_rename_seeds_buffer_with_current_name() {
+        let mut s = state();
+        s.cursor = 1; // ui
+        s.begin_rename();
+        assert!(s.is_editing());
+        assert_eq!(s.editing.as_ref().unwrap().value(), "ui");
+    }
+
+    #[test]
+    fn commit_rename_applies_and_rewires_dependents() {
+        let mut s = state();
+        s.cursor = 0; // engine; ui and api both depend on it
+        s.begin_rename();
+        // clear buffer and type a new name
+        s.editing.as_mut().unwrap().clear();
+        for c in "core".chars() {
+            s.edit_insert(c);
+        }
+        assert!(s.commit_rename());
+        assert_eq!(s.rows[0].spec.name, "core");
+        // dependents rewired
+        let ui = s.rows.iter().find(|r| r.spec.name == "ui").unwrap();
+        let api = s.rows.iter().find(|r| r.spec.name == "api").unwrap();
+        assert!(ui.spec.depends_on.contains(&"core".to_string()));
+        assert!(api.spec.depends_on.contains(&"core".to_string()));
+        assert!(!s.is_editing());
+        assert!(s.dirty);
+    }
+
+    #[test]
+    fn commit_rename_rejects_empty_name() {
+        let mut s = state();
+        s.cursor = 0;
+        s.begin_rename();
+        s.editing.as_mut().unwrap().clear();
+        assert!(!s.commit_rename());
+        assert!(s.is_editing()); // stays open to fix
+        assert!(s.last_error.is_some());
+        assert_eq!(s.rows[0].spec.name, "engine"); // unchanged
+    }
+
+    #[test]
+    fn commit_rename_rejects_duplicate_name() {
+        let mut s = state();
+        s.cursor = 0; // engine
+        s.begin_rename();
+        s.editing.as_mut().unwrap().clear();
+        for c in "ui".chars() {
+            s.edit_insert(c);
+        }
+        assert!(!s.commit_rename());
+        assert!(s.is_editing());
+        assert!(s.last_error.as_ref().unwrap().contains("already exists"));
+        assert_eq!(s.rows[0].spec.name, "engine");
+    }
+
+    #[test]
+    fn commit_rename_to_same_name_closes_without_dirtying() {
+        let mut s = state();
+        s.cursor = 0;
+        s.begin_rename(); // buffer already "engine"
+        assert!(!s.commit_rename()); // no change
+        assert!(!s.is_editing());
+        assert!(!s.dirty);
+    }
+
+    #[test]
+    fn cancel_edit_discards_buffer() {
+        let mut s = state();
+        s.cursor = 0;
+        s.begin_rename();
+        s.edit_insert('X');
+        s.cancel_edit();
+        assert!(!s.is_editing());
+        assert_eq!(s.rows[0].spec.name, "engine"); // unchanged
     }
 }

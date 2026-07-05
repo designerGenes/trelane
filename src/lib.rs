@@ -16,6 +16,7 @@ pub mod splash;
 pub mod squire;
 pub mod store;
 pub mod telemetry;
+pub mod text_input;
 pub mod testing;
 
 use crate::cli::{Cli, Command};
