@@ -1949,52 +1949,420 @@ pub fn reanalyze_on_stop(ctx: &crate::Context) -> Result<()> {
         scaffold_description_from_structure(&ctx.root)
     };
 
-    let max_agents = ctx.config.squire.max_concurrent.max(4);
-    let plan = plan_from_description(&desc, max_agents)?;
-    let existing = crate::store::list_agents(&ctx.conn)?;
-    let new_agents = new_agents_since(&existing, &plan);
+    // T5: Use the reconciliation engine instead of the old name-matching check.
+    let report = reconcile_against_reality(ctx, &desc)?;
+    let mut found_work = false;
 
-    if new_agents.is_empty() {
-        return Ok(());
-    }
-
-    eprintln!(
-        "{} biplane re-analysis: {} new domain(s) discovered",
-        crate::crypto::now_iso(),
-        new_agents.len()
-    );
-
-    for agent in &new_agents {
-        crate::commands::cmd_add_agent(
-            ctx,
-            &agent.name,
-            &agent.writable,
-            Some(&agent.description),
-            None,
-        )?;
+    // Register agents for emergent domains (additive-only).
+    if !report.emergent_domains.is_empty() {
+        found_work = true;
         eprintln!(
-            "  + registered agent: {} ({})",
-            agent.name, agent.description
+            "{} biplane re-analysis: {} emergent domain(s) discovered",
+            crate::crypto::now_iso(),
+            report.emergent_domains.len()
         );
-    }
-
-    // Queue initial work for each new agent.
-    for task in &plan.initial_tasks {
-        if new_agents.iter().any(|a| a.name == task.agent) {
-            crate::commands::cmd_send(
+        let max_agents = ctx.config.squire.max_concurrent.max(4);
+        let plan = plan_from_description(&desc, max_agents)?;
+        for domain in &report.emergent_domains {
+            crate::commands::cmd_add_agent(
                 ctx,
-                "user",
-                &task.agent,
-                "question",
-                "normal",
-                &task.subject,
-                &task.body,
-                &None,
-                &None,
-                &[],
+                &domain.name,
+                &domain.writable,
+                Some(&domain.description),
+                None,
             )?;
+            eprintln!(
+                "  + registered agent: {} ({})",
+                domain.name, domain.description
+            );
+        }
+        // Queue initial work for new agents.
+        for task in &plan.initial_tasks {
+            if report.emergent_domains.iter().any(|d| d.name == task.agent) {
+                crate::commands::cmd_send(
+                    ctx,
+                    "user",
+                    &task.agent,
+                    "question",
+                    "normal",
+                    &task.subject,
+                    &task.body,
+                    &None,
+                    &None,
+                    &[],
+                )?;
+            }
         }
     }
 
+    // Surface stalled domains as an explicit thematic-deadlock notice.
+    if !report.stalled_domains.is_empty() {
+        found_work = true;
+        eprintln!(
+            "{} biplane: THEMATIC DEADLOCK detected -- {} stalled domain(s):",
+            crate::crypto::now_iso(),
+            report.stalled_domains.len()
+        );
+        for s in &report.stalled_domains {
+            eprintln!("  ! {} -- {}", s.domain, s.evidence);
+        }
+        eprintln!("  Consider sending new work to these agents or re-evaluating their tasks.");
+    }
+
+    // Log a clean outcome when genuinely nothing is wrong, so silence
+    // is never ambiguous.
+    if !found_work && report.healthy_domains.is_empty() {
+        eprintln!(
+            "{} biplane: reconciliation found no domains with agents -- nothing to report",
+            crate::crypto::now_iso()
+        );
+    } else if !found_work {
+        eprintln!(
+            "{} biplane: all {} domain(s) healthy, no emergent or stalled work",
+            crate::crypto::now_iso(),
+            report.healthy_domains.len()
+        );
+    }
+
     Ok(())
+}
+
+// ================================================================ T4: Reconciliation
+
+/// Evidence of real activity (or lack thereof) for a domain.  This is a
+/// plain, injectable struct so the reconciliation core is a pure function
+/// testable with synthetic data -- no git/filesystem/DB access needed.
+#[derive(Debug, Clone, Serialize)]
+pub struct DomainActivity {
+    pub domain_name: String,
+    pub has_recent_activity: bool,
+    pub evidence: String,
+}
+
+/// The outcome of reconciling a stored project description against reality.
+/// All three fields are always present (never collapsed into a single bool)
+/// so the caller can distinguish "nothing new AND nothing stalled" (genuinely
+/// done) from "nothing new BUT something stalled" (thematic deadlock).
+#[derive(Debug, Clone, Serialize)]
+pub struct ReconciliationReport {
+    /// Domains present in a fresh structural scan but not in the stored
+    /// description -- these need agents registered.
+    pub emergent_domains: Vec<DomainSpec>,
+    /// Domains with a registered agent but no evidence of recent activity.
+    pub stalled_domains: Vec<StalledDomain>,
+    /// Domains that are both registered AND show recent activity.
+    pub healthy_domains: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StalledDomain {
+    pub domain: String,
+    pub evidence: String,
+}
+
+/// Pure reconciliation core: compare a stored project description against
+/// a fresh scaffold, existing agents, and activity evidence to produce a
+/// three-way report.
+///
+/// This function has no I/O -- all inputs are passed in, making it fully
+/// unit-testable with synthetic data.
+pub fn reconcile_description_with_reality(
+    desc: &ProjectDescription,
+    fresh_scaffold: &ProjectDescription,
+    existing_agents: &[String],
+    activity: &[DomainActivity],
+) -> ReconciliationReport {
+    let stored_names: std::collections::HashSet<&str> =
+        desc.domains.iter().map(|d| d.name.as_str()).collect();
+
+    // Emergent: in fresh scaffold but not in stored description.
+    let emergent_domains: Vec<DomainSpec> = fresh_scaffold
+        .domains
+        .iter()
+        .filter(|d| !stored_names.contains(d.name.as_str()))
+        .cloned()
+        .collect();
+
+    let activity_map: std::collections::HashMap<&str, &DomainActivity> = activity
+        .iter()
+        .map(|a| (a.domain_name.as_str(), a))
+        .collect();
+
+    let mut stalled_domains = Vec::new();
+    let mut healthy_domains = Vec::new();
+
+    for d in &desc.domains {
+        let has_agent = existing_agents.iter().any(|a| a == &d.name);
+        if !has_agent {
+            continue;
+        }
+        match activity_map.get(d.name.as_str()) {
+            Some(act) if act.has_recent_activity => {
+                healthy_domains.push(d.name.clone());
+            }
+            Some(act) => {
+                stalled_domains.push(StalledDomain {
+                    domain: d.name.clone(),
+                    evidence: act.evidence.clone(),
+                });
+            }
+            None => {
+                stalled_domains.push(StalledDomain {
+                    domain: d.name.clone(),
+                    evidence: "no activity evidence found".to_string(),
+                });
+            }
+        }
+    }
+
+    ReconciliationReport {
+        emergent_domains,
+        stalled_domains,
+        healthy_domains,
+    }
+}
+
+/// Gather activity evidence for each domain by checking git history.
+pub fn gather_domain_activity(
+    root: &Path,
+    desc: &ProjectDescription,
+    queued_at_iso: &str,
+) -> Vec<DomainActivity> {
+    let is_git = root.join(".git").is_dir();
+    let queued_time = chrono::DateTime::parse_from_rfc3339(queued_at_iso)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .ok();
+
+    let mut results = Vec::new();
+    for domain in &desc.domains {
+        if domain.writable.is_empty() {
+            results.push(DomainActivity {
+                domain_name: domain.name.clone(),
+                has_recent_activity: false,
+                evidence: "domain has no writable globs".to_string(),
+            });
+            continue;
+        }
+
+        if is_git {
+            let since = queued_at_iso;
+            let mut found_activity = false;
+            let mut evidence_parts = Vec::new();
+
+            for glob in &domain.writable {
+                let output = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(root)
+                    .args(["log", "--oneline", "--since", since, "--", glob])
+                    .output();
+                if let Ok(out) = output
+                    && out.status.success()
+                {
+                    let count = String::from_utf8_lossy(&out.stdout)
+                        .lines()
+                        .filter(|l| !l.is_empty())
+                        .count();
+                    if count > 0 {
+                        found_activity = true;
+                        evidence_parts.push(format!("{glob}: {count} commit(s)"));
+                    }
+                }
+            }
+
+            results.push(DomainActivity {
+                domain_name: domain.name.clone(),
+                has_recent_activity: found_activity,
+                evidence: if found_activity {
+                    evidence_parts.join("; ")
+                } else {
+                    "no commits since work was queued".to_string()
+                },
+            });
+        } else {
+            let mut found = false;
+            for glob in &domain.writable {
+                if let Some(true) = has_recent_file_mtime(root, glob, queued_time) {
+                    found = true;
+                    break;
+                }
+            }
+            results.push(DomainActivity {
+                domain_name: domain.name.clone(),
+                has_recent_activity: found,
+                evidence: if found {
+                    "files modified since work queued".to_string()
+                } else {
+                    "no file modifications since work queued".to_string()
+                },
+            });
+        }
+    }
+    results
+}
+
+fn has_recent_file_mtime(
+    root: &Path,
+    glob: &str,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<bool> {
+    let since = since?;
+    let base = glob.split('/').next().unwrap_or("");
+    let base_path = root.join(base);
+    if !base_path.is_dir() {
+        return Some(false);
+    }
+    fn check_dir(dir: &Path, since: chrono::DateTime<chrono::Utc>) -> bool {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Ok(meta) = fs::metadata(&path)
+                    && let Ok(mtime) = meta.modified()
+                    && let Ok(dt) = mtime.duration_since(std::time::UNIX_EPOCH)
+                {
+                    let secs = dt.as_secs() as i64;
+                    if let Some(dt) = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+                        && dt > since
+                    {
+                        return true;
+                    }
+                }
+                if path.is_dir() && check_dir(&path, since) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    Some(check_dir(&base_path, since))
+}
+
+/// Full reconciliation: re-scaffold from the repo, gather activity, and
+/// produce a report.  This is the function the live loop (T5) calls.
+pub fn reconcile_against_reality(
+    ctx: &crate::Context,
+    desc: &ProjectDescription,
+) -> Result<ReconciliationReport> {
+    let fresh = scaffold_description_from_structure(&ctx.root);
+    let existing = crate::store::list_agents(&ctx.conn)?;
+
+    let queued_at = crate::store::list_agents(&ctx.conn)?
+        .iter()
+        .filter_map(|agent| {
+            crate::store::get_unprocessed_messages(&ctx.conn, agent)
+                .ok()
+                .and_then(|msgs| msgs.into_iter().map(|m| m.created_at).min())
+        })
+        .min()
+        .unwrap_or_else(crate::crypto::now_iso);
+
+    let activity = gather_domain_activity(&ctx.root, desc, &queued_at);
+    Ok(reconcile_description_with_reality(
+        desc, &fresh, &existing, &activity,
+    ))
+}
+
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::*;
+
+    fn domain(name: &str) -> DomainSpec {
+        DomainSpec {
+            name: name.to_string(),
+            description: String::new(),
+            writable: vec![format!("src/{name}/**")],
+            forbidden_write: vec![],
+            depends_on: vec![],
+            planned_work: vec![],
+            agents: 1,
+        }
+    }
+
+    fn desc(names: &[&str]) -> ProjectDescription {
+        ProjectDescription {
+            name: "test".to_string(),
+            description: String::new(),
+            domains: names.iter().map(|n| domain(n)).collect(),
+            max_agents: None,
+            default_model: None,
+        }
+    }
+
+    #[test]
+    fn all_active_returns_only_healthy() {
+        let d = desc(&["alpha", "beta"]);
+        let fresh = desc(&["alpha", "beta"]);
+        let existing = vec!["alpha".to_string(), "beta".to_string()];
+        let activity = vec![
+            DomainActivity {
+                domain_name: "alpha".to_string(),
+                has_recent_activity: true,
+                evidence: "commits".to_string(),
+            },
+            DomainActivity {
+                domain_name: "beta".to_string(),
+                has_recent_activity: true,
+                evidence: "commits".to_string(),
+            },
+        ];
+        let report = reconcile_description_with_reality(&d, &fresh, &existing, &activity);
+        assert!(report.emergent_domains.is_empty());
+        assert!(report.stalled_domains.is_empty());
+        assert_eq!(report.healthy_domains.len(), 2);
+    }
+
+    #[test]
+    fn stalled_domain_surfaces_explicitly() {
+        let d = desc(&["alpha", "beta"]);
+        let fresh = desc(&["alpha", "beta"]);
+        let existing = vec!["alpha".to_string(), "beta".to_string()];
+        let activity = vec![
+            DomainActivity {
+                domain_name: "alpha".to_string(),
+                has_recent_activity: true,
+                evidence: "active".to_string(),
+            },
+            DomainActivity {
+                domain_name: "beta".to_string(),
+                has_recent_activity: false,
+                evidence: "no commits since queued".to_string(),
+            },
+        ];
+        let report = reconcile_description_with_reality(&d, &fresh, &existing, &activity);
+        assert!(report.emergent_domains.is_empty());
+        assert_eq!(report.stalled_domains.len(), 1);
+        assert_eq!(report.stalled_domains[0].domain, "beta");
+        assert_eq!(report.healthy_domains, vec!["alpha".to_string()]);
+    }
+
+    #[test]
+    fn emergent_domain_detected_from_fresh_scaffold() {
+        let d = desc(&["alpha"]);
+        let fresh = desc(&["alpha", "gamma"]); // gamma is new
+        let existing = vec!["alpha".to_string()];
+        let activity = vec![DomainActivity {
+            domain_name: "alpha".to_string(),
+            has_recent_activity: true,
+            evidence: "active".to_string(),
+        }];
+        let report = reconcile_description_with_reality(&d, &fresh, &existing, &activity);
+        assert_eq!(report.emergent_domains.len(), 1);
+        assert_eq!(report.emergent_domains[0].name, "gamma");
+        assert!(report.stalled_domains.is_empty());
+    }
+
+    #[test]
+    fn genuinely_done_when_no_stalled_no_emergent() {
+        let d = desc(&["alpha"]);
+        let fresh = desc(&["alpha"]);
+        let existing = vec!["alpha".to_string()];
+        let activity = vec![DomainActivity {
+            domain_name: "alpha".to_string(),
+            has_recent_activity: true,
+            evidence: "active".to_string(),
+        }];
+        let report = reconcile_description_with_reality(&d, &fresh, &existing, &activity);
+        assert!(report.emergent_domains.is_empty());
+        assert!(report.stalled_domains.is_empty());
+        assert_eq!(report.healthy_domains, vec!["alpha".to_string()]);
+    }
 }
