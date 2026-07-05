@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "trelane",
     version,
-    about = "Park-and-squire multi-agent coordination protocol"
+    about = "Squire-based multi-agent coordination protocol"
 )]
 pub struct Cli {
     #[arg(long, global = true, help = "project root (default: walk up from cwd)")]
