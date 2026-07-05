@@ -62,7 +62,11 @@ impl Default for Config {
             squire: SquireConfig {
                 interval_s: 20,
                 max_concurrent: 2,
-                reply_timeout_s: None,
+                // F2: Default to 1 hour. Protects new installs against
+                // enabled-but-silently-stuck counterparts without being
+                // so aggressive that a legitimately slow agent gets
+                // force-expired in normal operation.
+                reply_timeout_s: Some(3600),
             },
             claims: ClaimsConfig {
                 default_ttl_s: 900,
@@ -163,17 +167,38 @@ pub struct ClaimsConfig {
     pub default_ttl_s: u64,
 }
 
-/// Biplane configuration: controls optional re-analysis behaviour when the
-/// swarm goes fully quiescent (all agents stopped, all inboxes empty, no
+/// Biplane configuration: controls re-analysis behaviour when the swarm
+/// goes fully quiescent (all agents stopped, all inboxes empty, no
 /// parked tasks).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// Two independent behaviours:
+/// - `detect_thematic_deadlock` (default true): automatically detect and
+///   report stalled domains when the swarm goes quiescent. This is a
+///   detection/reporting action only -- it surfaces the problem but does
+///   not modify the session.
+/// - `reanalyze_on_all_stop` (default false): additionally auto-register
+///   agents for any emergent (uncovered) domains discovered during
+///   reconciliation. This is a more consequential action that modifies
+///   the session, so it remains opt-in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BiplaneConfig {
-    /// When true, the squire watch loop checks for uncovered domains each time
-    /// the swarm becomes fully quiescent and auto-registers agents for any
-    /// new domains found.  Additive-only: existing agents are never removed
-    /// or re-assigned.
+    /// When true (default), the squire watch loop detects and reports
+    /// stalled domains (thematic deadlock) when the swarm is quiescent.
+    pub detect_thematic_deadlock: bool,
+    /// When true (default false), the squire watch loop also auto-registers
+    /// agents for emergent domains discovered during reconciliation.
+    /// Additive-only: existing agents are never removed or re-assigned.
     pub reanalyze_on_all_stop: bool,
+}
+
+impl Default for BiplaneConfig {
+    fn default() -> Self {
+        Self {
+            detect_thematic_deadlock: true,
+            reanalyze_on_all_stop: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

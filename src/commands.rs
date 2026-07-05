@@ -278,6 +278,11 @@ pub fn cmd_attach_project(
     }
     for name in &disabled {
         store::upsert_session_agent(&ctx.conn, name, false, "attach", &now)?;
+        // F1: Proactively resolve dangling parks for this disabled agent
+        // so waiters are woken immediately, not on the next squire tick.
+        if let Err(e) = resolve_dangling_parks_for(&ctx, name) {
+            eprintln!("warning: failed to resolve dangling parks for {name}: {e:?}");
+        }
     }
 
     if inject {
@@ -1649,4 +1654,61 @@ mod tests {
             "\"/tmp/a \\\"quoted\\\" path\""
         );
     }
+}
+
+/// F1: Resolve parked tasks whose `waiting_on` is a disabled/removed agent.
+/// Wakes the waiting agent immediately with an abandonment reason instead
+/// of waiting for the next squire tick.
+pub fn resolve_dangling_parks_for(ctx: &Context, disabled_agent: &str) -> Result<()> {
+    let all_parked = store::list_parked_tasks(&ctx.conn)?;
+    let dangling: Vec<_> = all_parked
+        .iter()
+        .filter(|e| e.waiting_on == disabled_agent)
+        .collect();
+
+    if dangling.is_empty() {
+        return Ok(());
+    }
+
+    let secret = ctx.secret()?;
+
+    for entry in &dangling {
+        if prompt::park_satisfied(&ctx.conn, entry)? {
+            continue;
+        }
+
+        // Delete the abandoned park so it stops blocking.
+        let _ = store::delete_parked_task(&ctx.conn, &entry.task);
+
+        // Send an abandonment info message to the waiting agent.
+        let mut msg = Message::new(
+            crypto::new_id("msg"),
+            "system".to_string(),
+            entry.agent.clone(),
+            "system".to_string(),
+            "high".to_string(),
+            format!("park abandoned: agent '{}' was disabled", disabled_agent),
+            format!(
+                "Your parked task '{}' was waiting on '{}' which has been disabled. \
+                The park has been cleared. Proceed with a documented assumption or \
+                escalate to the user.",
+                entry.task, disabled_agent
+            ),
+            None,
+            None,
+            vec![],
+            crypto::now_iso(),
+        );
+        crypto::sign(&secret, &mut msg);
+        store::insert_message(&ctx.conn, &msg)?;
+
+        eprintln!(
+            "{} proactive abandonment: woke {} (was waiting on disabled {})",
+            crypto::now_iso(),
+            entry.agent,
+            disabled_agent
+        );
+    }
+
+    Ok(())
 }

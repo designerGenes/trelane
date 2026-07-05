@@ -1954,7 +1954,8 @@ pub fn reanalyze_on_stop(ctx: &crate::Context) -> Result<()> {
     let mut found_work = false;
 
     // Register agents for emergent domains (additive-only).
-    if !report.emergent_domains.is_empty() {
+    // F3: This action is gated by reanalyze_on_all_stop (opt-in).
+    if !report.emergent_domains.is_empty() && ctx.config.biplane.reanalyze_on_all_stop {
         found_work = true;
         eprintln!(
             "{} biplane re-analysis: {} emergent domain(s) discovered",
@@ -1996,7 +1997,8 @@ pub fn reanalyze_on_stop(ctx: &crate::Context) -> Result<()> {
     }
 
     // Surface stalled domains as an explicit thematic-deadlock notice.
-    if !report.stalled_domains.is_empty() {
+    // F3: Detection/reporting is gated by detect_thematic_deadlock (on by default).
+    if !report.stalled_domains.is_empty() && ctx.config.biplane.detect_thematic_deadlock {
         found_work = true;
         eprintln!(
             "{} biplane: THEMATIC DEADLOCK detected -- {} stalled domain(s):",
@@ -2007,6 +2009,23 @@ pub fn reanalyze_on_stop(ctx: &crate::Context) -> Result<()> {
             eprintln!("  ! {} -- {}", s.domain, s.evidence);
         }
         eprintln!("  Consider sending new work to these agents or re-evaluating their tasks.");
+    }
+
+    // F3: If emergent domains were found but auto-registration is disabled,
+    // still report them so the user knows.
+    if !report.emergent_domains.is_empty() && !ctx.config.biplane.reanalyze_on_all_stop {
+        found_work = true;
+        eprintln!(
+            "{} biplane: {} emergent domain(s) found (auto-registration disabled):",
+            crate::crypto::now_iso(),
+            report.emergent_domains.len()
+        );
+        for d in &report.emergent_domains {
+            eprintln!("  ? {} -- {}", d.name, d.description);
+        }
+        eprintln!(
+            "  Enable biplane.reanalyze_on_all_stop in config.json to auto-register agents for these."
+        );
     }
 
     // Log a clean outcome when genuinely nothing is wrong, so silence
@@ -2058,6 +2077,11 @@ pub struct ReconciliationReport {
 pub struct StalledDomain {
     pub domain: String,
     pub evidence: String,
+    /// If the stall is caused by an escalated wait-cycle, this lists the
+    /// cycle members.  `None` means the stall is due to inactivity, not
+    /// a cycle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_by_cycle: Option<Vec<String>>,
 }
 
 /// Pure reconciliation core: compare a stored project description against
@@ -2066,11 +2090,16 @@ pub struct StalledDomain {
 ///
 /// This function has no I/O -- all inputs are passed in, making it fully
 /// unit-testable with synthetic data.
+///
+/// `escalated_cycles` is an optional list of cycle member lists that have
+/// been escalated by the squire (T3). Domains whose agents appear in an
+/// escalated cycle are reported as stalled with `blocked_by_cycle` set.
 pub fn reconcile_description_with_reality(
     desc: &ProjectDescription,
     fresh_scaffold: &ProjectDescription,
     existing_agents: &[String],
     activity: &[DomainActivity],
+    escalated_cycles: &[Vec<String>],
 ) -> ReconciliationReport {
     let stored_names: std::collections::HashSet<&str> =
         desc.domains.iter().map(|d| d.name.as_str()).collect();
@@ -2096,6 +2125,22 @@ pub fn reconcile_description_with_reality(
         if !has_agent {
             continue;
         }
+
+        // F4: Check if this domain's agent is stuck in an escalated cycle.
+        let cycle_match = escalated_cycles
+            .iter()
+            .find(|c| c.iter().any(|m| m == &d.name))
+            .cloned();
+
+        if let Some(cycle) = cycle_match {
+            stalled_domains.push(StalledDomain {
+                domain: d.name.clone(),
+                evidence: format!("blocked by escalated wait-cycle: {}", cycle.join(" -> ")),
+                blocked_by_cycle: Some(cycle),
+            });
+            continue;
+        }
+
         match activity_map.get(d.name.as_str()) {
             Some(act) if act.has_recent_activity => {
                 healthy_domains.push(d.name.clone());
@@ -2104,12 +2149,14 @@ pub fn reconcile_description_with_reality(
                 stalled_domains.push(StalledDomain {
                     domain: d.name.clone(),
                     evidence: act.evidence.clone(),
+                    blocked_by_cycle: None,
                 });
             }
             None => {
                 stalled_domains.push(StalledDomain {
                     domain: d.name.clone(),
                     evidence: "no activity evidence found".to_string(),
+                    blocked_by_cycle: None,
                 });
             }
         }
@@ -2256,9 +2303,29 @@ pub fn reconcile_against_reality(
         .unwrap_or_else(crate::crypto::now_iso);
 
     let activity = gather_domain_activity(&ctx.root, desc, &queued_at);
+
+    // F4: Gather escalated cycles from the DB so reconciliation can
+    // distinguish "stalled because blocked by cycle" from "stalled because
+    // quietly gave up".
+    let escalated_cycles = gather_escalated_cycles(&ctx.conn);
+
     Ok(reconcile_description_with_reality(
-        desc, &fresh, &existing, &activity,
+        desc,
+        &fresh,
+        &existing,
+        &activity,
+        &escalated_cycles,
     ))
+}
+
+/// Read escalated cycles from the cycle_break_attempts table.
+fn gather_escalated_cycles(conn: &rusqlite::Connection) -> Vec<Vec<String>> {
+    let attempts = crate::store::list_cycle_break_attempts(conn).unwrap_or_default();
+    attempts
+        .into_iter()
+        .filter(|a| a.escalated)
+        .map(|a| a.cycle_members.split(',').map(|s| s.to_string()).collect())
+        .collect()
 }
 
 #[cfg(test)]
@@ -2304,7 +2371,7 @@ mod reconciliation_tests {
                 evidence: "commits".to_string(),
             },
         ];
-        let report = reconcile_description_with_reality(&d, &fresh, &existing, &activity);
+        let report = reconcile_description_with_reality(&d, &fresh, &existing, &activity, &[]);
         assert!(report.emergent_domains.is_empty());
         assert!(report.stalled_domains.is_empty());
         assert_eq!(report.healthy_domains.len(), 2);
@@ -2327,24 +2394,25 @@ mod reconciliation_tests {
                 evidence: "no commits since queued".to_string(),
             },
         ];
-        let report = reconcile_description_with_reality(&d, &fresh, &existing, &activity);
+        let report = reconcile_description_with_reality(&d, &fresh, &existing, &activity, &[]);
         assert!(report.emergent_domains.is_empty());
         assert_eq!(report.stalled_domains.len(), 1);
         assert_eq!(report.stalled_domains[0].domain, "beta");
+        assert!(report.stalled_domains[0].blocked_by_cycle.is_none());
         assert_eq!(report.healthy_domains, vec!["alpha".to_string()]);
     }
 
     #[test]
     fn emergent_domain_detected_from_fresh_scaffold() {
         let d = desc(&["alpha"]);
-        let fresh = desc(&["alpha", "gamma"]); // gamma is new
+        let fresh = desc(&["alpha", "gamma"]);
         let existing = vec!["alpha".to_string()];
         let activity = vec![DomainActivity {
             domain_name: "alpha".to_string(),
             has_recent_activity: true,
             evidence: "active".to_string(),
         }];
-        let report = reconcile_description_with_reality(&d, &fresh, &existing, &activity);
+        let report = reconcile_description_with_reality(&d, &fresh, &existing, &activity, &[]);
         assert_eq!(report.emergent_domains.len(), 1);
         assert_eq!(report.emergent_domains[0].name, "gamma");
         assert!(report.stalled_domains.is_empty());
@@ -2360,9 +2428,43 @@ mod reconciliation_tests {
             has_recent_activity: true,
             evidence: "active".to_string(),
         }];
-        let report = reconcile_description_with_reality(&d, &fresh, &existing, &activity);
+        let report = reconcile_description_with_reality(&d, &fresh, &existing, &activity, &[]);
         assert!(report.emergent_domains.is_empty());
         assert!(report.stalled_domains.is_empty());
         assert_eq!(report.healthy_domains, vec!["alpha".to_string()]);
+    }
+
+    #[test]
+    fn cycle_stalled_domain_has_blocked_by_cycle() {
+        let d = desc(&["alpha", "beta"]);
+        let fresh = desc(&["alpha", "beta"]);
+        let existing = vec!["alpha".to_string(), "beta".to_string()];
+        let activity = vec![
+            DomainActivity {
+                domain_name: "alpha".to_string(),
+                has_recent_activity: true,
+                evidence: "active".to_string(),
+            },
+            DomainActivity {
+                domain_name: "beta".to_string(),
+                has_recent_activity: false,
+                evidence: "inactive".to_string(),
+            },
+        ];
+        let escalated = vec![vec!["alpha".to_string(), "beta".to_string()]];
+        let report =
+            reconcile_description_with_reality(&d, &fresh, &existing, &activity, &escalated);
+        // Both alpha and beta should be stalled because they're in the cycle.
+        assert_eq!(report.stalled_domains.len(), 2);
+        let beta_stall = report
+            .stalled_domains
+            .iter()
+            .find(|s| s.domain == "beta")
+            .unwrap();
+        assert!(beta_stall.blocked_by_cycle.is_some());
+        assert_eq!(
+            beta_stall.blocked_by_cycle.as_ref().unwrap(),
+            &vec!["alpha".to_string(), "beta".to_string()]
+        );
     }
 }

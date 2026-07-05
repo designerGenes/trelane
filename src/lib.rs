@@ -676,18 +676,18 @@ pub fn handle(cli: Cli) -> Result<()> {
                 }
 
                 // Biplane re-analysis: when the swarm is fully quiescent
-                // (no running agents, empty inboxes, no parked tasks) and
-                // the feature is enabled, look for uncovered domains and
-                // auto-register agents for them.  Fires at most once per
-                // idle stretch; resets when any agent is running again.
+                // (no running agents, empty inboxes, no parked tasks).
+                // F3: Detection (thematic deadlock reporting) is on by
+                // default; auto-registration of emergent domains is opt-in.
                 let any_running = crate::store::list_agents(&ctx.conn)?
                     .iter()
                     .any(|a| crate::commands::is_running(&ctx.conn, a).unwrap_or(false));
                 if any_running {
                     reanalyzed_this_stretch = false;
-                } else if ctx.config.biplane.reanalyze_on_all_stop
-                    && !reanalyzed_this_stretch
+                } else if !reanalyzed_this_stretch
                     && crate::testing::swarm_quiescent(&ctx)?
+                    && (ctx.config.biplane.detect_thematic_deadlock
+                        || ctx.config.biplane.reanalyze_on_all_stop)
                 {
                     if let Err(e) = biplane::reanalyze_on_stop(&ctx) {
                         eprintln!("warning: biplane re-analysis failed: {e:?}");
