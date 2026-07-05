@@ -52,6 +52,24 @@ pub struct DomainRow {
     pub include: bool,
 }
 
+/// What an in-progress text edit will be written to on commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditTarget {
+    /// Rename the focused domain.
+    DomainName,
+    /// Edit the subject of planned-work item `index` on the focused domain.
+    WorkSubject { index: usize },
+    /// Edit writable glob `index` on the focused domain.
+    Writable { index: usize },
+}
+
+/// An active text edit: the buffer plus where it commits.
+#[derive(Debug, Clone)]
+pub struct ActiveEdit {
+    pub input: crate::text_input::TextInput,
+    pub target: EditTarget,
+}
+
 /// The full editor state. Every mutation goes through the pure methods below.
 #[derive(Debug, Clone)]
 pub struct BiplaneUiState {
@@ -71,9 +89,9 @@ pub struct BiplaneUiState {
     pub status: Option<String>,
     /// Source of the description ("loaded from file" vs "scaffolded").
     pub source: String,
-    /// When Some, the user is editing the focused domain's name; keys route
-    /// into this buffer until commit (Enter) or cancel (Esc).
-    pub editing: Option<crate::text_input::TextInput>,
+    /// When Some, a text edit is in progress; keys route into the buffer until
+    /// commit (Enter) or cancel (Esc). `target` records what is being edited.
+    pub editing: Option<ActiveEdit>,
     /// Available models from `opencode models`.
     pub models: Vec<ModelEntry>,
     /// When true, the model selector popup is open for the focused domain.
@@ -240,12 +258,36 @@ impl BiplaneUiState {
         self.editing.is_some()
     }
 
+    /// The active edit's input buffer, if any (for the render layer).
+    pub fn edit_input(&self) -> Option<&crate::text_input::TextInput> {
+        self.editing.as_ref().map(|e| &e.input)
+    }
+
     /// Begin editing the focused domain's name, seeding the buffer with its
     /// current value. No-op if there are no rows.
     pub fn begin_rename(&mut self) {
         if let Some(row) = self.rows.get(self.cursor) {
-            self.editing = Some(crate::text_input::TextInput::with_text(&row.spec.name));
+            self.editing = Some(ActiveEdit {
+                input: crate::text_input::TextInput::with_text(&row.spec.name),
+                target: EditTarget::DomainName,
+            });
             self.last_error = None;
+        }
+    }
+
+    /// Begin editing planned-work item `index` on the focused domain. Sets an
+    /// error (and does not enter edit mode) if the domain has no such item.
+    pub fn begin_edit_work(&mut self, index: usize) {
+        if let Some(row) = self.rows.get(self.cursor) {
+            if let Some(work) = row.spec.planned_work.get(index) {
+                self.editing = Some(ActiveEdit {
+                    input: crate::text_input::TextInput::with_text(&work.subject),
+                    target: EditTarget::WorkSubject { index },
+                });
+                self.last_error = None;
+            } else {
+                self.last_error = Some("this domain has no planned work to edit".to_string());
+            }
         }
     }
 
@@ -254,16 +296,30 @@ impl BiplaneUiState {
         self.editing = None;
     }
 
+    /// Commit the in-progress edit to its target. Returns true if a change was
+    /// applied. Keeps the editor open on validation failure so the user can fix
+    /// the input.
+    pub fn commit_edit(&mut self) -> bool {
+        let Some(edit) = self.editing.as_ref() else {
+            return false;
+        };
+        match edit.target.clone() {
+            EditTarget::DomainName => self.commit_rename(),
+            EditTarget::WorkSubject { index } => self.commit_work_subject(index),
+            EditTarget::Writable { index } => self.commit_writable(index),
+        }
+    }
+
     /// Commit the in-progress rename to the focused domain. Rejects empty or
     /// duplicate names (setting `last_error` and keeping edit mode open so the
     /// user can fix it). On success, rewrites any other domain's `depends_on`
     /// entries that referenced the old name, so dependencies stay intact.
     /// Returns true if the rename was applied.
     pub fn commit_rename(&mut self) -> bool {
-        let Some(input) = self.editing.as_ref() else {
+        let Some(edit) = self.editing.as_ref() else {
             return false;
         };
-        let new_name = input.value().trim().to_string();
+        let new_name = edit.input.value().trim().to_string();
 
         if new_name.is_empty() {
             self.last_error = Some("domain name must not be empty".to_string());
@@ -311,17 +367,188 @@ impl BiplaneUiState {
         true
     }
 
+    /// Commit the in-progress planned-work subject edit. Rejects an empty
+    /// subject (keeping the editor open). A no-op if unchanged.
+    fn commit_work_subject(&mut self, index: usize) -> bool {
+        let Some(edit) = self.editing.as_ref() else {
+            return false;
+        };
+        let new_subject = edit.input.value().trim().to_string();
+        if new_subject.is_empty() {
+            self.last_error = Some("work subject must not be empty".to_string());
+            return false;
+        }
+        match self
+            .rows
+            .get_mut(self.cursor)
+            .and_then(|r| r.spec.planned_work.get_mut(index))
+        {
+            Some(work) => {
+                if work.subject == new_subject {
+                    self.editing = None;
+                    self.last_error = None;
+                    return false;
+                }
+                work.subject = new_subject;
+                self.editing = None;
+                self.last_error = None;
+                self.dirty = true;
+                true
+            }
+            None => {
+                self.editing = None;
+                false
+            }
+        }
+    }
+
     /// Feed a character into the active edit buffer (no-op if not editing).
     pub fn edit_insert(&mut self, c: char) {
-        if let Some(input) = self.editing.as_mut() {
-            input.insert(c);
+        if let Some(edit) = self.editing.as_mut() {
+            edit.input.insert(c);
         }
     }
 
     /// Backspace in the active edit buffer.
     pub fn edit_backspace(&mut self) {
-        if let Some(input) = self.editing.as_mut() {
-            input.backspace();
+        if let Some(edit) = self.editing.as_mut() {
+            edit.input.backspace();
+        }
+    }
+
+    // -- Writable glob editing --
+
+    /// Begin editing writable glob `index` on the focused domain.
+    pub fn begin_edit_writable(&mut self, index: usize) {
+        if let Some(row) = self.rows.get(self.cursor)
+            && let Some(glob) = row.spec.writable.get(index)
+        {
+            self.editing = Some(ActiveEdit {
+                input: crate::text_input::TextInput::with_text(glob),
+                target: EditTarget::Writable { index },
+            });
+            self.last_error = None;
+        }
+    }
+
+    /// Commit the in-progress writable glob edit. Rejects empty globs.
+    fn commit_writable(&mut self, index: usize) -> bool {
+        let Some(edit) = self.editing.as_ref() else {
+            return false;
+        };
+        let new_glob = edit.input.value().trim().to_string();
+        if new_glob.is_empty() {
+            self.last_error = Some("writable glob must not be empty".to_string());
+            return false;
+        }
+        match self
+            .rows
+            .get_mut(self.cursor)
+            .and_then(|r| r.spec.writable.get_mut(index))
+        {
+            Some(glob) => {
+                if *glob == new_glob {
+                    self.editing = None;
+                    self.last_error = None;
+                    return false;
+                }
+                *glob = new_glob;
+                self.editing = None;
+                self.last_error = None;
+                self.dirty = true;
+                true
+            }
+            None => {
+                self.editing = None;
+                false
+            }
+        }
+    }
+
+    // -- Domain add/remove --
+
+    /// Add a new empty domain at the end of the list and focus it.
+    pub fn add_domain(&mut self) {
+        let mut n = 1;
+        loop {
+            let name = format!("domain-{n}");
+            if !self.rows.iter().any(|r| r.spec.name == name) {
+                self.rows.push(DomainRow {
+                    spec: DomainSpec {
+                        name,
+                        description: String::new(),
+                        writable: vec!["src/**".to_string()],
+                        forbidden_write: vec![],
+                        depends_on: vec![],
+                        planned_work: vec![],
+                        agents: 1,
+                        model: None,
+                    },
+                    include: true,
+                });
+                self.cursor = self.rows.len() - 1;
+                self.dirty = true;
+                self.status = Some("domain added -- press 'e' to rename".to_string());
+                return;
+            }
+            n += 1;
+        }
+    }
+
+    /// Remove the focused domain. Does nothing if there are no rows.
+    pub fn remove_domain(&mut self) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let removed_name = self.rows[self.cursor].spec.name.clone();
+        self.rows.remove(self.cursor);
+        if self.cursor >= self.rows.len() && !self.rows.is_empty() {
+            self.cursor = self.rows.len() - 1;
+        }
+        // Prune dangling depends_on references.
+        for row in &mut self.rows {
+            row.spec.depends_on.retain(|d| *d != removed_name);
+        }
+        self.dirty = true;
+        self.status = Some(format!("domain '{removed_name}' removed"));
+    }
+
+    // -- Planned-work add/remove --
+
+    /// Add a new planned-work item to the focused domain.
+    pub fn add_work(&mut self) {
+        if let Some(row) = self.rows.get_mut(self.cursor) {
+            row.spec.planned_work.push(crate::biplane::PlannedWork {
+                subject: "new task".to_string(),
+                body: String::new(),
+                priority: "normal".to_string(),
+            });
+            self.dirty = true;
+            self.status = Some("work item added -- press 'w' to edit".to_string());
+        }
+    }
+
+    /// Remove planned-work item `index` from the focused domain.
+    pub fn remove_work(&mut self, index: usize) {
+        if let Some(row) = self.rows.get_mut(self.cursor)
+            && index < row.spec.planned_work.len()
+        {
+            row.spec.planned_work.remove(index);
+            self.dirty = true;
+            self.status = Some(format!("work item {index} removed"));
+        }
+    }
+
+    /// Move the edit caret left/right (no-op if not editing).
+    pub fn edit_caret_left(&mut self) {
+        if let Some(edit) = self.editing.as_mut() {
+            edit.input.move_left();
+        }
+    }
+
+    pub fn edit_caret_right(&mut self) {
+        if let Some(edit) = self.editing.as_mut() {
+            edit.input.move_right();
         }
     }
 
@@ -800,20 +1027,12 @@ fn run_loop(root: &std::path::Path, state: &mut BiplaneUiState) -> Result<()> {
                 if state.is_editing() {
                     match key.code {
                         KeyCode::Enter => {
-                            state.commit_rename();
+                            state.commit_edit();
                         }
                         KeyCode::Esc => state.cancel_edit(),
                         KeyCode::Backspace => state.edit_backspace(),
-                        KeyCode::Left => {
-                            if let Some(i) = state.editing.as_mut() {
-                                i.move_left();
-                            }
-                        }
-                        KeyCode::Right => {
-                            if let Some(i) = state.editing.as_mut() {
-                                i.move_right();
-                            }
-                        }
+                        KeyCode::Left => state.edit_caret_left(),
+                        KeyCode::Right => state.edit_caret_right(),
                         KeyCode::Char(c) => state.edit_insert(c),
                         _ => {}
                     }
@@ -831,6 +1050,12 @@ fn run_loop(root: &std::path::Path, state: &mut BiplaneUiState) -> Result<()> {
                     KeyCode::Char('K') => state.move_up(),
                     KeyCode::Char('J') => state.move_down(),
                     KeyCode::Char('e') => state.begin_rename(),
+                    KeyCode::Char('w') => state.begin_edit_work(0),
+                    KeyCode::Char('W') => state.begin_edit_writable(0),
+                    KeyCode::Char('a') => state.add_domain(),
+                    KeyCode::Char('D') => state.remove_domain(),
+                    KeyCode::Char('+') => state.add_work(),
+                    KeyCode::Char('-') => state.remove_work(0),
                     KeyCode::Char('m') => state.open_model_selector(),
                     KeyCode::Char('M') => {
                         // Quick: set all included domains to the first free model
@@ -954,17 +1179,24 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
             } else {
                 Style::default().fg(dim)
             };
-            // When editing the focused row, show the live buffer with a caret.
-            let editing_here = i == state.cursor && state.editing.is_some();
-            let name_cell = if editing_here {
-                format!(
-                    " {:<16}",
-                    state.editing.as_ref().unwrap().render_with_caret()
-                )
+            // When editing the focused row, show the live buffer with a caret
+            // in the cell matching the edit target.
+            let editing_name = i == state.cursor
+                && matches!(
+                    state.editing.as_ref().map(|e| &e.target),
+                    Some(EditTarget::DomainName)
+                );
+            let editing_work = i == state.cursor
+                && matches!(
+                    state.editing.as_ref().map(|e| &e.target),
+                    Some(EditTarget::WorkSubject { .. })
+                );
+            let name_cell = if editing_name {
+                format!(" {:<16}", state.edit_input().unwrap().render_with_caret())
             } else {
                 format!(" {:<16}", row.spec.name)
             };
-            let name_span = if editing_here {
+            let name_span = if editing_name {
                 Span::styled(
                     name_cell,
                     Style::default()
@@ -973,6 +1205,21 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
                 )
             } else {
                 Span::styled(name_cell, name_style)
+            };
+            let work_cell = if editing_work {
+                format!("work:{} ", state.edit_input().unwrap().render_with_caret())
+            } else {
+                format!("work:{:<3} ", row.spec.planned_work.len())
+            };
+            let work_span = if editing_work {
+                Span::styled(
+                    work_cell,
+                    Style::default()
+                        .fg(tc(THEME_WARN))
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(work_cell, Style::default().fg(dim))
             };
             let model_str = row.spec.model.as_deref().unwrap_or("(default)");
             ListItem::new(Line::from(vec![
@@ -983,10 +1230,7 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
                     format!("agents:{:<3} ", row.spec.agents),
                     Style::default().fg(dim),
                 ),
-                Span::styled(
-                    format!("work:{:<3} ", row.spec.planned_work.len()),
-                    Style::default().fg(dim),
-                ),
+                work_span,
                 Span::styled(format!("deps:{:<12} ", deps), Style::default().fg(dim)),
                 Span::styled(
                     format!("model:{} ", model_str),
@@ -1018,9 +1262,9 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
         if state.model_selector_open {
             "↑↓ select model  Enter apply  f free-only  a apply-to-all  c clear  Esc close".to_string()
         } else if state.editing.is_some() {
-            "typing… Enter save name  Esc cancel  ←→ move caret  Backspace delete".to_string()
+            "typing… Enter save  Esc cancel  ←→ move caret  Backspace delete".to_string()
         } else {
-            "↑↓ move  space include  ←→ agents  [ ] budget  K/J reorder  e rename  m model  M all-free  s save  q quit"
+            "↑↓ move  space include  ←→ agents  [ ] budget  K/J reorder  e rename  w work  W glob  a add-domain  D del-domain  + add-work  - del-work  m model  s save  q quit"
                 .to_string()
         }
     });
@@ -1288,7 +1532,7 @@ mod tests {
         s.cursor = 1; // ui
         s.begin_rename();
         assert!(s.is_editing());
-        assert_eq!(s.editing.as_ref().unwrap().value(), "ui");
+        assert_eq!(s.editing.as_ref().unwrap().input.value(), "ui");
     }
 
     #[test]
@@ -1297,7 +1541,7 @@ mod tests {
         s.cursor = 0; // engine; ui and api both depend on it
         s.begin_rename();
         // clear buffer and type a new name
-        s.editing.as_mut().unwrap().clear();
+        s.editing.as_mut().unwrap().input.clear();
         for c in "core".chars() {
             s.edit_insert(c);
         }
@@ -1317,7 +1561,7 @@ mod tests {
         let mut s = state();
         s.cursor = 0;
         s.begin_rename();
-        s.editing.as_mut().unwrap().clear();
+        s.editing.as_mut().unwrap().input.clear();
         assert!(!s.commit_rename());
         assert!(s.is_editing()); // stays open to fix
         assert!(s.last_error.is_some());
@@ -1329,7 +1573,7 @@ mod tests {
         let mut s = state();
         s.cursor = 0; // engine
         s.begin_rename();
-        s.editing.as_mut().unwrap().clear();
+        s.editing.as_mut().unwrap().input.clear();
         for c in "ui".chars() {
             s.edit_insert(c);
         }
@@ -1358,6 +1602,76 @@ mod tests {
         s.cancel_edit();
         assert!(!s.is_editing());
         assert_eq!(s.rows[0].spec.name, "engine"); // unchanged
+    }
+
+    #[test]
+    fn begin_edit_work_seeds_subject() {
+        let mut s = state();
+        s.cursor = 0; // engine, planned_work[0] = "build engine"
+        s.begin_edit_work(0);
+        assert!(s.is_editing());
+        assert_eq!(s.edit_input().unwrap().value(), "build engine");
+    }
+
+    #[test]
+    fn commit_work_subject_applies_and_dirties() {
+        let mut s = state();
+        s.cursor = 0;
+        s.begin_edit_work(0);
+        s.editing.as_mut().unwrap().input.clear();
+        for c in "wire the turn loop".chars() {
+            s.edit_insert(c);
+        }
+        assert!(s.commit_edit());
+        assert_eq!(s.rows[0].spec.planned_work[0].subject, "wire the turn loop");
+        assert!(!s.is_editing());
+        assert!(s.dirty);
+    }
+
+    #[test]
+    fn commit_work_subject_rejects_empty() {
+        let mut s = state();
+        s.cursor = 0;
+        s.begin_edit_work(0);
+        s.editing.as_mut().unwrap().input.clear();
+        assert!(!s.commit_edit());
+        assert!(s.is_editing()); // stays open to fix
+        assert!(s.last_error.is_some());
+        assert_eq!(s.rows[0].spec.planned_work[0].subject, "build engine");
+    }
+
+    #[test]
+    fn begin_edit_work_without_work_sets_error() {
+        let mut s = state();
+        s.cursor = 0;
+        s.rows[0].spec.planned_work.clear();
+        s.begin_edit_work(0);
+        assert!(!s.is_editing());
+        assert!(s.last_error.is_some());
+    }
+
+    #[test]
+    fn commit_edit_dispatches_rename_via_generic_entry() {
+        let mut s = state();
+        s.cursor = 1; // ui
+        s.begin_rename();
+        s.editing.as_mut().unwrap().input.clear();
+        for c in "frontend".chars() {
+            s.edit_insert(c);
+        }
+        assert!(s.commit_edit());
+        assert_eq!(s.rows[1].spec.name, "frontend");
+    }
+
+    #[test]
+    fn work_edit_does_not_touch_domain_name() {
+        let mut s = state();
+        s.cursor = 0;
+        s.begin_edit_work(0);
+        s.editing.as_mut().unwrap().input.clear();
+        s.edit_insert('x');
+        s.commit_edit();
+        assert_eq!(s.rows[0].spec.name, "engine"); // name untouched
     }
 
     #[test]
@@ -1458,5 +1772,131 @@ mod tests {
         assert_eq!(s.model_cursor, 0);
         s.model_cursor_up(); // at top
         assert_eq!(s.model_cursor, 0);
+    }
+
+    #[test]
+    fn begin_edit_writable_seeds_buffer() {
+        let mut s = state();
+        s.cursor = 0; // engine, writable ["src/engine/**"]
+        s.begin_edit_writable(0);
+        assert!(s.is_editing());
+        assert_eq!(s.editing.as_ref().unwrap().input.value(), "src/engine/**");
+    }
+
+    #[test]
+    fn commit_writable_updates_glob() {
+        let mut s = state();
+        s.cursor = 0;
+        s.begin_edit_writable(0);
+        s.editing.as_mut().unwrap().input.clear();
+        for c in "src/core/**".chars() {
+            s.edit_insert(c);
+        }
+        assert!(s.commit_edit());
+        assert_eq!(s.rows[0].spec.writable[0], "src/core/**");
+        assert!(s.dirty);
+        assert!(!s.is_editing());
+    }
+
+    #[test]
+    fn commit_writable_rejects_empty() {
+        let mut s = state();
+        s.cursor = 0;
+        s.begin_edit_writable(0);
+        s.editing.as_mut().unwrap().input.clear();
+        assert!(!s.commit_edit());
+        assert!(s.is_editing()); // stays open
+        assert!(s.last_error.is_some());
+    }
+
+    #[test]
+    fn add_domain_appends_and_focuses() {
+        let mut s = state();
+        let initial_len = s.rows.len();
+        s.add_domain();
+        assert_eq!(s.rows.len(), initial_len + 1);
+        assert_eq!(s.cursor, initial_len); // focused on new domain
+        assert!(s.dirty);
+        assert!(s.rows[s.cursor].spec.name.starts_with("domain-"));
+    }
+
+    #[test]
+    fn add_domain_avoids_name_collision() {
+        let mut s = state();
+        // Add a domain named "domain-1" manually
+        s.rows.push(DomainRow {
+            spec: DomainSpec {
+                name: "domain-1".into(),
+                description: "".into(),
+                writable: vec!["x/**".into()],
+                forbidden_write: vec![],
+                depends_on: vec![],
+                planned_work: vec![],
+                agents: 1,
+                model: None,
+            },
+            include: true,
+        });
+        s.add_domain();
+        // Should skip "domain-1" and use "domain-2"
+        let last = s.rows.last().unwrap();
+        assert_eq!(last.spec.name, "domain-2");
+    }
+
+    #[test]
+    fn remove_domain_deletes_and_prunes_deps() {
+        let mut s = state();
+        // engine is at index 0; ui and api depend on it
+        s.cursor = 0;
+        s.remove_domain();
+        // engine should be gone
+        assert!(!s.rows.iter().any(|r| r.spec.name == "engine"));
+        // ui and api should have empty depends_on (pruned)
+        assert!(s.rows.iter().all(|r| r.spec.depends_on.is_empty()));
+        assert!(s.dirty);
+    }
+
+    #[test]
+    fn remove_domain_adjusts_cursor() {
+        let mut s = state();
+        s.cursor = 2; // api (last)
+        s.remove_domain();
+        // cursor should clamp to last remaining row
+        assert_eq!(s.cursor, 1);
+    }
+
+    #[test]
+    fn add_work_appends_to_focused_domain() {
+        let mut s = state();
+        s.cursor = 0; // engine has 1 work item
+        let initial_work = s.rows[0].spec.planned_work.len();
+        s.add_work();
+        assert_eq!(s.rows[0].spec.planned_work.len(), initial_work + 1);
+        assert_eq!(
+            s.rows[0].spec.planned_work.last().unwrap().subject,
+            "new task"
+        );
+        assert!(s.dirty);
+    }
+
+    #[test]
+    fn remove_work_deletes_at_index() {
+        let mut s = state();
+        s.cursor = 0;
+        s.add_work(); // now 2 items
+        let len_before = s.rows[0].spec.planned_work.len();
+        s.remove_work(0);
+        assert_eq!(s.rows[0].spec.planned_work.len(), len_before - 1);
+        assert!(s.dirty);
+    }
+
+    #[test]
+    fn remove_work_out_of_bounds_is_noop() {
+        let mut s = state();
+        s.cursor = 0;
+        let len = s.rows[0].spec.planned_work.len();
+        s.remove_work(99);
+        assert_eq!(s.rows[0].spec.planned_work.len(), len);
+        assert!(!s.dirty);
     }
 }
