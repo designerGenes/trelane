@@ -439,6 +439,9 @@ impl BiplaneUiState {
 /// Entry point for `trelane biplane --ui`. Loads the stored description if one
 /// exists, otherwise scaffolds from the project structure, then runs the
 /// editor. No-ops with a message when stdout is not a TTY.
+///
+/// For empty projects (no source files), falls through to a "describe your
+/// project" prompt that uses an LLM to generate the initial description.
 pub fn run(root: &std::path::Path) -> Result<()> {
     use std::io::IsTerminal;
     if !std::io::stdout().is_terminal() {
@@ -453,8 +456,14 @@ pub fn run(root: &std::path::Path) -> Result<()> {
             format!("loaded from {}", desc_path.display()),
         )
     } else {
+        let scaffolded = crate::biplane::scaffold_description_from_structure(root);
+        if scaffolded.domains.is_empty() {
+            // Empty project: ask the user to describe it, then use an LLM
+            // to generate the domain split.
+            return run_empty_project_flow(root);
+        }
         (
-            crate::biplane::scaffold_description_from_structure(root),
+            scaffolded,
             "scaffolded from project source layout".to_string(),
         )
     };
@@ -469,6 +478,284 @@ fn save_description(root: &std::path::Path, desc: &ProjectDescription) -> Result
     let path = dir.join("biplane-description.json");
     std::fs::write(&path, serde_json::to_string_pretty(desc)?)?;
     Ok(())
+}
+
+/// Flow for empty projects: show a text input asking the user to describe
+/// their project, then use an LLM to generate a domain split from that
+/// description.  The result is loaded into the normal Biplane UI for
+/// review/editing before the user decides whether to begin work.
+fn run_empty_project_flow(root: &std::path::Path) -> Result<()> {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+    use crossterm::execute;
+    use crossterm::terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    };
+    use ratatui::prelude::*;
+    #[allow(unused_imports)]
+    use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+    use std::time::Duration;
+
+    // Phase 1: collect the project description from the user.
+    let mut description_input = crate::text_input::TextInput::new();
+    let mut max_agents_input = String::from("3");
+    let mut focused_field = 0usize; // 0 = description, 1 = max_agents
+    let mut phase = EmptyProjectPhase::Input;
+    let mut status_msg = String::new();
+    let mut generated_desc: Option<ProjectDescription> = None;
+
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let outcome = (|| -> Result<()> {
+        loop {
+            terminal.draw(|f| {
+                render_empty_project_input(
+                    f,
+                    &description_input,
+                    &max_agents_input,
+                    focused_field,
+                    &phase,
+                    &status_msg,
+                )
+            })?;
+
+            match &phase {
+                EmptyProjectPhase::Input => {
+                    if event::poll(Duration::from_millis(250))?
+                        && let Event::Key(key) = event::read()?
+                        && key.kind == KeyEventKind::Press
+                    {
+                        match key.code {
+                            KeyCode::Tab => focused_field = 1 - focused_field,
+                            KeyCode::Enter if focused_field == 1 => {
+                                // Generate
+                                let desc_text = description_input.value().trim().to_string();
+                                if desc_text.is_empty() {
+                                    status_msg = "Please describe your project first.".into();
+                                    continue;
+                                }
+                                let max_agents: usize =
+                                    max_agents_input.trim().parse().unwrap_or(3).clamp(1, 10);
+                                phase = EmptyProjectPhase::Generating;
+                                status_msg =
+                                    format!("Analyzing with LLM (max {} agents)...", max_agents);
+                                terminal.draw(|f| {
+                                    render_empty_project_input(
+                                        f,
+                                        &description_input,
+                                        &max_agents_input,
+                                        focused_field,
+                                        &phase,
+                                        &status_msg,
+                                    )
+                                })?;
+
+                                // Run the LLM planner.
+                                let plan = crate::biplane::run_biplane_plan_from_description(
+                                    root, &desc_text, max_agents,
+                                );
+                                match plan {
+                                    Ok(desc) => {
+                                        generated_desc = Some(desc);
+                                        phase = EmptyProjectPhase::Review;
+                                        status_msg =
+                                            "Plan generated. Review and edit below.".into();
+                                    }
+                                    Err(e) => {
+                                        status_msg = format!("Failed: {e}");
+                                        phase = EmptyProjectPhase::Input;
+                                    }
+                                }
+                            }
+                            KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Backspace => {
+                                if focused_field == 0 {
+                                    description_input.backspace();
+                                } else {
+                                    max_agents_input.pop();
+                                }
+                            }
+                            KeyCode::Left => {
+                                if focused_field == 0 {
+                                    description_input.move_left();
+                                }
+                            }
+                            KeyCode::Right => {
+                                if focused_field == 0 {
+                                    description_input.move_right();
+                                }
+                            }
+                            KeyCode::Char(c) => {
+                                if focused_field == 0 {
+                                    description_input.insert(c);
+                                } else if c.is_ascii_digit() {
+                                    max_agents_input.push(c);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                EmptyProjectPhase::Generating => {
+                    // Handled inline above; just keep the loop alive.
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                EmptyProjectPhase::Review => {
+                    // Drop out of the alt screen and hand off to the normal
+                    // Biplane UI editor with the generated description.
+                    if let Some(desc) = generated_desc.take() {
+                        // Save it so the editor can load from file on future runs.
+                        save_description(root, &desc)?;
+                        // Exit this loop; the caller will start the editor.
+                        return Ok(());
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    })();
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    outcome?;
+
+    // If we got a generated description, launch the normal editor.
+    let desc_path = root.join(".trelane").join("biplane-description.json");
+    if desc_path.exists() {
+        let desc = crate::biplane::load_project_description(&desc_path)?;
+        let mut state =
+            BiplaneUiState::from_description(&desc, "generated from project description");
+        run_loop(root, &mut state)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyProjectPhase {
+    Input,
+    Generating,
+    Review,
+}
+
+fn render_empty_project_input(
+    f: &mut ratatui::Frame,
+    desc_input: &crate::text_input::TextInput,
+    max_agents_input: &str,
+    focused: usize,
+    phase: &EmptyProjectPhase,
+    status: &str,
+) {
+    use crate::diagnostic::{THEME_BIPLANE_ACCENT, THEME_DIM, THEME_OK, THEME_WARN};
+    use ratatui::prelude::*;
+    use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+
+    let accent = tc(THEME_BIPLANE_ACCENT);
+    let dim = tc(THEME_DIM);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5), // header
+            Constraint::Min(8),    // description input
+            Constraint::Length(3), // max agents
+            Constraint::Length(3), // status / hints
+        ])
+        .split(f.area());
+
+    // Header
+    let header = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "Biplane :: New Project",
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "This project is empty. Describe what you want to build and Biplane\nwill propose a domain split using an LLM.",
+            Style::default().fg(dim),
+        )),
+    ])
+    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(accent)));
+    f.render_widget(header, chunks[0]);
+
+    // Description input
+    let desc_focused = focused == 0 && *phase == EmptyProjectPhase::Input;
+    let desc_display = if desc_focused {
+        desc_input.render_with_caret()
+    } else {
+        desc_input.value().to_string()
+    };
+    let desc_style = if desc_focused {
+        Style::default().fg(accent)
+    } else {
+        Style::default().fg(dim)
+    };
+    let desc_title = if desc_focused {
+        " Project Description (editing) "
+    } else {
+        " Project Description "
+    };
+    let desc_para = Paragraph::new(desc_display)
+        .style(desc_style)
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(desc_title)
+                .border_style(Style::default().fg(accent)),
+        );
+    f.render_widget(desc_para, chunks[1]);
+
+    // Max agents input
+    let ma_focused = focused == 1 && *phase == EmptyProjectPhase::Input;
+    let ma_style = if ma_focused {
+        Style::default().fg(accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(dim)
+    };
+    let ma_title = if ma_focused {
+        " Max Agents (editing) "
+    } else {
+        " Max Agents "
+    };
+    let ma_para = Paragraph::new(format!("{}  (press Enter to generate)", max_agents_input))
+        .style(ma_style)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(ma_title)
+                .border_style(Style::default().fg(accent)),
+        );
+    f.render_widget(ma_para, chunks[2]);
+
+    // Status / hints
+    let status_color = if status.starts_with("Failed") {
+        tc(THEME_WARN)
+    } else if status.starts_with("Plan generated") {
+        tc(THEME_OK)
+    } else {
+        dim
+    };
+    let hint = if *phase == EmptyProjectPhase::Generating {
+        status.to_string()
+    } else {
+        format!(
+            "{}  |  Tab: switch field  Enter: generate  Esc: quit",
+            status
+        )
+    };
+    let footer = Paragraph::new(Line::from(Span::styled(
+        hint,
+        Style::default().fg(status_color),
+    )))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(dim)),
+    );
+    f.render_widget(footer, chunks[3]);
 }
 
 fn run_loop(root: &std::path::Path, state: &mut BiplaneUiState) -> Result<()> {

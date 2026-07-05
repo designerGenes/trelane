@@ -42,11 +42,70 @@ pub fn run_biplane_plan(
         project_root,
     );
 
+    run_biplane_plan_with_prompt(project_root, model, max_agents, &prompt, "(empty project)")
+}
+
+/// Run the Biplane planner from a free-text project description (for empty
+/// projects where there is no source tree to scaffold from).
+pub fn run_biplane_plan_from_description(
+    project_root: &Path,
+    description: &str,
+    max_agents: usize,
+) -> Result<ProjectDescription> {
+    let model = "glm-5.2";
+    let prompt = compose_description_planning_prompt(description, max_agents, project_root);
+    let plan = run_biplane_plan_with_prompt(project_root, model, max_agents, &prompt, description)?;
+
+    // Convert the BiplanePlan into a ProjectDescription.
+    let domains: Vec<DomainSpec> = plan
+        .agents
+        .iter()
+        .map(|a| DomainSpec {
+            name: a.name.clone(),
+            description: a.description.clone(),
+            writable: a.writable.clone(),
+            forbidden_write: vec![],
+            depends_on: vec![],
+            planned_work: plan
+                .initial_tasks
+                .iter()
+                .filter(|t| t.agent == a.name)
+                .map(|t| PlannedWork {
+                    subject: t.subject.clone(),
+                    body: t.body.clone(),
+                    priority: "normal".to_string(),
+                })
+                .collect(),
+            agents: 1,
+            model: None,
+        })
+        .collect();
+
+    Ok(ProjectDescription {
+        name: project_root
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "project".to_string()),
+        description: description.to_string(),
+        domains,
+        max_agents: Some(max_agents),
+        default_model: None,
+    })
+}
+
+/// Shared inner: write prompt, run planner, parse result.
+fn run_biplane_plan_with_prompt(
+    project_root: &Path,
+    model: &str,
+    max_agents: usize,
+    prompt: &str,
+    _context_label: &str,
+) -> Result<BiplanePlan> {
     let prompt_file = project_root.join(".trelane").join("biplane-plan-prompt.md");
     if let Some(parent) = prompt_file.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&prompt_file, &prompt)?;
+    fs::write(&prompt_file, prompt)?;
 
     let launcher_template = resolve_launcher_template(model)?;
     let cmd = launcher_template
@@ -260,6 +319,67 @@ Rules:
         } else {
             features
         },
+        max_agents,
+        max_agents
+    )
+}
+
+/// Compose a planning prompt from a free-text project description (for empty
+/// projects with no source tree).
+fn compose_description_planning_prompt(
+    description: &str,
+    max_agents: usize,
+    project_root: &Path,
+) -> String {
+    format!(
+        r#"# Biplane Project Analysis
+
+You are analyzing a new, empty project at `{}` to determine how to split it across multiple AI agents using the Trelane coordination protocol.
+
+## Project Description (from the user)
+
+{}
+
+## Your Task
+
+This is a greenfield project with no existing source files. Based on the description above, propose a domain split for up to {} agents. Each agent should own a distinct area of the codebase that will be created. Consider:
+
+- Natural separation of concerns (e.g., UI vs API vs data vs tests)
+- File paths that can be grouped into writable globs (these will be created from scratch)
+- Dependencies between areas (agents that need to coordinate)
+- Balanced workload
+
+Output your plan as a JSON object with this exact structure (and nothing else after the JSON):
+
+```json
+{{
+  "agents": [
+    {{
+      "name": "short-name",
+      "description": "what this agent owns",
+      "writable": ["src/path/**", "other/path/**"]
+    }}
+  ],
+  "initial_tasks": [
+    {{
+      "agent": "short-name",
+      "subject": "first task for this agent",
+      "body": "detailed instructions for what to build first"
+    }}
+  ]
+}}
+```
+
+Rules:
+- Use 2-{} agents
+- Agent names must be lowercase with hyphens only (e.g., "frontend", "data-model")
+- Each agent must have at least one writable glob
+- writable globs should be specific enough to avoid overlap
+- Provide one initial task per agent
+- Do not include .trelane/** or .git/** in writable (those are forbidden automatically)
+"#,
+        project_root.display(),
+        description,
         max_agents,
         max_agents
     )
