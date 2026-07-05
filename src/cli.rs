@@ -310,4 +310,7 @@ pub enum Command {
         #[arg(long)]
         rater: String,
     },
+
+    /// Kill all trelane tmux sessions and stop all running agents
+    Kill,
 }

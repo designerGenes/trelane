@@ -744,6 +744,7 @@ pub fn handle(cli: Cli) -> Result<()> {
             println!("rating recorded: {rater} rated {agent} = {rating}/10");
             Ok(())
         }
+        Some(Command::Kill) => cmd_kill(),
     }
 }
 
@@ -833,4 +834,73 @@ fn print_metrics(m: &telemetry::MetricsSummary) {
     println!();
 
     let _ = write!(String::new(), ""); // suppress unused import warning
+}
+
+fn cmd_kill() -> Result<()> {
+    use crate::logo;
+
+    logo::print_logo();
+    println!();
+    println!("  Killing all Trelane sessions...");
+    println!();
+
+    // Find all tmux sessions whose name starts with "trelane-"
+    let output = std::process::Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output();
+
+    let sessions: Vec<String> = match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|s| s.starts_with("trelane-"))
+            .map(|s| s.to_string())
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    if sessions.is_empty() {
+        println!("  No Trelane tmux sessions found.");
+    } else {
+        for session in &sessions {
+            print!("  Killing session: {session}... ");
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+
+            let result = std::process::Command::new("tmux")
+                .args(["kill-session", "-t", session])
+                .status();
+
+            match result {
+                Ok(s) if s.success() => println!("done"),
+                _ => println!("failed (may already be dead)"),
+            }
+        }
+    }
+
+    // Also kill any lingering opencode processes spawned by trelane
+    let opencode_killed = std::process::Command::new("pkill")
+        .args(["-f", "opencode.*trelane"])
+        .status();
+    if let Ok(s) = opencode_killed
+        && s.success()
+    {
+        println!("  Killed lingering opencode processes.");
+    }
+
+    // Kill any lingering squire processes
+    let squire_killed = std::process::Command::new("pkill")
+        .args(["-f", "trelane.*squire.*--watch"])
+        .status();
+    if let Ok(s) = squire_killed
+        && s.success()
+    {
+        println!("  Killed lingering squire processes.");
+    }
+
+    println!();
+    println!("  All Trelane sessions terminated.");
+    println!("  Running 'trelane status' on any project will show all agents as stopped.");
+    println!();
+
+    Ok(())
 }
