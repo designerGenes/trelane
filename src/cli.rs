@@ -288,7 +288,7 @@ pub enum Command {
         interactive: bool,
         #[arg(
             long = "ui",
-            help = "open the interactive Biplane editor TUI (amber-themed) to review and edit domains"
+            help = "open the interactive Biplane editor TUI (the default when no headless flags are given)"
         )]
         ui: bool,
         #[arg(

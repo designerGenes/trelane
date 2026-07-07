@@ -27,6 +27,78 @@ pub struct BiplanePlanTask {
     pub body: String,
 }
 
+/// Convert an AI-generated `BiplanePlan` into an editable `ProjectDescription`.
+/// Each plan agent becomes a domain; the plan's initial tasks are attached to
+/// their agent's domain as `PlannedWork`. Used so the interactive Biplane UI
+/// can present AI-detected domains for review/editing.
+pub fn plan_to_description(
+    plan: &BiplanePlan,
+    project_name: &str,
+    max_agents: usize,
+) -> ProjectDescription {
+    let domains = plan
+        .agents
+        .iter()
+        .map(|a| {
+            let planned_work = plan
+                .initial_tasks
+                .iter()
+                .filter(|t| t.agent == a.name)
+                .map(|t| PlannedWork {
+                    subject: t.subject.clone(),
+                    body: t.body.clone(),
+                    priority: default_work_priority(),
+                })
+                .collect();
+            DomainSpec {
+                name: a.name.clone(),
+                description: a.description.clone(),
+                writable: if a.writable.is_empty() {
+                    vec![format!("src/{}/**", a.name)]
+                } else {
+                    a.writable.clone()
+                },
+                forbidden_write: vec![],
+                depends_on: vec![],
+                planned_work,
+                agents: default_agent_count(),
+                model: None,
+            }
+        })
+        .collect();
+
+    ProjectDescription {
+        name: project_name.to_string(),
+        description: String::new(),
+        domains,
+        max_agents: Some(max_agents.max(1)),
+        default_model: None,
+    }
+}
+
+/// The model Biplane uses for its own analysis when the caller hasn't chosen
+/// one. Matches the launch path's default so `trelane` and `trelane biplane`
+/// agree on which planner model runs out of the box.
+pub fn default_biplane_model() -> String {
+    "glm-5.2".to_string()
+}
+
+/// Register agents and queue initial tasks for a curated `ProjectDescription`
+/// (e.g. one saved by the Biplane UI). Derives the deterministic plan from the
+/// description, then applies it to the session: each included domain becomes a
+/// registered agent (carrying its writable globs, model, and description) and
+/// its planned work is queued as inbox messages. Idempotent for agents that
+/// already exist. Returns the number of agents newly registered.
+pub fn apply_description_to_session(
+    ctx: &crate::Context,
+    desc: &ProjectDescription,
+) -> Result<usize> {
+    validate_description(desc)?;
+    let budget = desc.max_agents.unwrap_or_else(|| desc.domains.len().max(1));
+    let plan = plan_from_description(desc, budget)?;
+    apply_plan_to_session(ctx, desc, &plan)
+}
+
 pub fn run_biplane_plan(
     project_root: &Path,
     model: &str,
@@ -41,65 +113,68 @@ pub fn run_biplane_plan(
         max_agents,
         project_root,
     );
-
-    run_biplane_plan_with_prompt(project_root, model, max_agents, &prompt, "(empty project)")
+    execute_biplane_plan(project_root, model, max_agents, &prompt)
 }
 
-/// Run the Biplane planner from a free-text project description (for empty
-/// projects where there is no source tree to scaffold from).
-pub fn run_biplane_plan_from_description(
+/// Run the planner over an explicit list of source folders, with no automatic
+/// safe-pocket detection. Every folder in `sources` is scanned for both its
+/// directory structure and any markdown documentation it contains; the
+/// combined material is what the model uses to propose domains. `project_root`
+/// is still where the session lives (scaffolding, prompt/output files) and is
+/// always included as a source. Empty `sources` falls back to just the root.
+pub fn run_biplane_plan_from_sources(
     project_root: &Path,
-    description: &str,
+    sources: &[PathBuf],
+    model: &str,
     max_agents: usize,
-) -> Result<ProjectDescription> {
-    let model = "glm-5.2";
-    let prompt = compose_description_planning_prompt(description, max_agents, project_root);
-    let plan = run_biplane_plan_with_prompt(project_root, model, max_agents, &prompt, description)?;
-
-    // Convert the BiplanePlan into a ProjectDescription.
-    let domains: Vec<DomainSpec> = plan
-        .agents
-        .iter()
-        .map(|a| DomainSpec {
-            name: a.name.clone(),
-            description: a.description.clone(),
-            writable: a.writable.clone(),
-            forbidden_write: vec![],
-            depends_on: vec![],
-            planned_work: plan
-                .initial_tasks
-                .iter()
-                .filter(|t| t.agent == a.name)
-                .map(|t| PlannedWork {
-                    subject: t.subject.clone(),
-                    body: t.body.clone(),
-                    priority: "normal".to_string(),
-                })
-                .collect(),
-            agents: 1,
-            model: None,
-        })
-        .collect();
-
-    Ok(ProjectDescription {
-        name: project_root
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "project".to_string()),
-        description: description.to_string(),
-        domains,
-        max_agents: Some(max_agents),
-        default_model: None,
-    })
+) -> Result<BiplanePlan> {
+    let prompt = compose_sources_prompt(project_root, sources, max_agents);
+    execute_biplane_plan(project_root, model, max_agents, &prompt)
 }
 
-/// Shared inner: write prompt, run planner, parse result.
-fn run_biplane_plan_with_prompt(
+/// Build the planning prompt from an explicit list of source folders (plus the
+/// always-included project root). Pure — no model call — so the scanning logic
+/// is testable. Every folder contributes both its structure and any markdown
+/// docs it contains; there is no automatic safe-pocket detection.
+fn compose_sources_prompt(project_root: &Path, sources: &[PathBuf], max_agents: usize) -> String {
+    // Deduplicate, always including the project root itself.
+    let mut scan: Vec<PathBuf> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for p in std::iter::once(project_root.to_path_buf()).chain(sources.iter().cloned()) {
+        let canon = p.canonicalize().unwrap_or(p);
+        if seen.insert(canon.clone()) {
+            scan.push(canon);
+        }
+    }
+
+    let mut structure_blocks = Vec::new();
+    let mut doc_blocks = Vec::new();
+    for dir in &scan {
+        if !dir.is_dir() {
+            structure_blocks.push(format!("## {} (not found or not a directory)", dir.display()));
+            continue;
+        }
+        structure_blocks.push(format!("## {}\n{}", dir.display(), scan_project_structure(dir)));
+        let mut texts = Vec::new();
+        collect_feature_text(dir, dir, &mut texts);
+        if !texts.is_empty() {
+            doc_blocks.push(format!("### from {}\n\n{}", dir.display(), texts.join("\n\n---\n\n")));
+        }
+    }
+
+    let structure = structure_blocks.join("\n\n");
+    let docs = doc_blocks.join("\n\n===\n\n");
+    compose_biplane_planning_prompt(&structure, &docs, max_agents, project_root)
+}
+
+/// Shared executor: writes the prompt, runs the launcher with retries, and
+/// parses the plan. Split out so both the legacy and explicit-source planners
+/// share one code path.
+fn execute_biplane_plan(
     project_root: &Path,
     model: &str,
     max_agents: usize,
     prompt: &str,
-    _context_label: &str,
 ) -> Result<BiplanePlan> {
     let prompt_file = project_root.join(".trelane").join("biplane-plan-prompt.md");
     if let Some(parent) = prompt_file.parent() {
@@ -259,6 +334,9 @@ fn compose_biplane_planning_prompt(
     max_agents: usize,
     project_root: &Path,
 ) -> String {
+    // Bias toward an actual split: ask for at least 2 agents whenever the cap
+    // permits, so a greenfield project doesn't collapse to a single catch-all.
+    let suggested_min = max_agents.min(2).max(1);
     format!(
         r#"# Biplane Project Analysis
 
@@ -276,7 +354,7 @@ You are analyzing the project at `{}` to determine how to split it across multip
 
 ## Your Task
 
-Analyze this project and propose a domain split for up to {} agents. Each agent should own a distinct area of the codebase. Consider:
+Analyze this project and propose a domain split of {} to {} agents. Each agent should own a distinct area of the codebase. Even for a greenfield project being built from scratch, prefer a meaningful split (for example a frontend/backend/data/tests separation) over a single catch-all agent — a single agent should only be proposed if the project is genuinely trivial. Consider:
 
 - Natural separation of concerns (e.g., UI vs API vs data vs tests)
 - File paths that can be grouped into writable globs
@@ -305,7 +383,7 @@ Output your plan as a JSON object with this exact structure (and nothing else af
 ```
 
 Rules:
-- Use 2-{} agents
+- Propose {} to {} agents; favor the higher end when the project has clearly separable concerns
 - Agent names must be lowercase with hyphens only (e.g., "frontend", "data-model")
 - Each agent must have at least one writable glob
 - writable globs should be specific enough to avoid overlap
@@ -319,68 +397,9 @@ Rules:
         } else {
             features
         },
+        suggested_min,
         max_agents,
-        max_agents
-    )
-}
-
-/// Compose a planning prompt from a free-text project description (for empty
-/// projects with no source tree).
-fn compose_description_planning_prompt(
-    description: &str,
-    max_agents: usize,
-    project_root: &Path,
-) -> String {
-    format!(
-        r#"# Biplane Project Analysis
-
-You are analyzing a new, empty project at `{}` to determine how to split it across multiple AI agents using the Trelane coordination protocol.
-
-## Project Description (from the user)
-
-{}
-
-## Your Task
-
-This is a greenfield project with no existing source files. Based on the description above, propose a domain split for up to {} agents. Each agent should own a distinct area of the codebase that will be created. Consider:
-
-- Natural separation of concerns (e.g., UI vs API vs data vs tests)
-- File paths that can be grouped into writable globs (these will be created from scratch)
-- Dependencies between areas (agents that need to coordinate)
-- Balanced workload
-
-Output your plan as a JSON object with this exact structure (and nothing else after the JSON):
-
-```json
-{{
-  "agents": [
-    {{
-      "name": "short-name",
-      "description": "what this agent owns",
-      "writable": ["src/path/**", "other/path/**"]
-    }}
-  ],
-  "initial_tasks": [
-    {{
-      "agent": "short-name",
-      "subject": "first task for this agent",
-      "body": "detailed instructions for what to build first"
-    }}
-  ]
-}}
-```
-
-Rules:
-- Use 2-{} agents
-- Agent names must be lowercase with hyphens only (e.g., "frontend", "data-model")
-- Each agent must have at least one writable glob
-- writable globs should be specific enough to avoid overlap
-- Provide one initial task per agent
-- Do not include .trelane/** or .git/** in writable (those are forbidden automatically)
-"#,
-        project_root.display(),
-        description,
-        max_agents,
+        suggested_min,
         max_agents
     )
 }
@@ -1889,6 +1908,53 @@ pub fn cmd_biplane_interactive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planning_prompt_requests_a_multi_agent_split() {
+        let prompt = compose_biplane_planning_prompt(
+            "src/\n  main.rs",
+            "(no safe_pocket feature files found)",
+            8,
+            std::path::Path::new("/tmp/proj"),
+        );
+        // No contradictory "up to 1" / "2-1" guidance; asks for a real range.
+        assert!(prompt.contains("2 to 8 agents"));
+        assert!(!prompt.contains("up to 1 agents"));
+        assert!(!prompt.contains("2-1"));
+        // The greenfield-split nudge is present.
+        assert!(prompt.contains("greenfield"));
+    }
+
+    #[test]
+    fn sources_prompt_scans_only_given_folders() {
+        // A target project folder with a doc describing a juice shop, and an
+        // unrelated folder that must NOT be pulled in unless listed.
+        let base = std::env::temp_dir().join(format!(
+            "trelane-src-test-{}-{}",
+            std::process::id(),
+            "scan"
+        ));
+        let proj = base.join("juice");
+        let extra = base.join("extra_features");
+        let unrelated = base.join("unrelated");
+        for d in [&proj, &extra, &unrelated] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(proj.join("README.md"), "# Juice Shop\nA shop that sells juice.").unwrap();
+        std::fs::write(extra.join("spec.md"), "Backend API for payment codes.").unwrap();
+        std::fs::write(unrelated.join("trelane.md"), "Trelane coordination protocol internals.").unwrap();
+
+        // Only proj (root) + extra are sources; unrelated is omitted.
+        let prompt = compose_sources_prompt(&proj, &[extra.clone()], 8);
+
+        assert!(prompt.contains("Juice Shop"));
+        assert!(prompt.contains("payment codes"));
+        // The unrelated Trelane doc must not leak in.
+        assert!(!prompt.contains("coordination protocol internals"));
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
 
     fn domain(name: &str, deps: &[&str], agents: usize) -> DomainSpec {
         DomainSpec {

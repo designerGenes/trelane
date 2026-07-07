@@ -191,14 +191,72 @@ fn cmd_launch(cli: Cli) -> Result<()> {
             }
             println!();
         } else {
-            println!("[launch] No agents registered. Use --with-biplane or add agents manually.");
-            println!(
-                "[launch] Run: trelane {} --models {} --max-agents {} --with-biplane",
-                root.display(),
-                primary_model,
-                max_agents
-            );
-            return Ok(());
+            // No agents yet and --with-biplane not given. Instead of dead-ending,
+            // look for a saved Biplane report (the curated description written by
+            // `trelane biplane`) and offer a one-key launch from it. In a
+            // non-interactive context, keep the old scriptable behavior.
+            use std::io::IsTerminal;
+            let desc_path = root.join(TRELANE_DIR).join("biplane-description.json");
+            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+                println!("[launch] No agents registered. Use --with-biplane or add agents manually.");
+                println!(
+                    "[launch] Run: trelane {} --models {} --max-agents {} --with-biplane",
+                    root.display(),
+                    primary_model,
+                    max_agents
+                );
+                return Ok(());
+            }
+
+            if desc_path.exists() {
+                let desc = biplane::load_project_description(&desc_path)?;
+                println!("[launch] Found Biplane report: {}", desc_path.display());
+                println!(
+                    "  Project : {}  |  {} domain(s), budget {} agent(s)",
+                    desc.name,
+                    desc.domains.len(),
+                    desc.max_agents.unwrap_or_else(|| desc.domains.len().max(1))
+                );
+                for d in &desc.domains {
+                    println!(
+                        "    - {:<16} agents:{} model:{} writable:{}",
+                        d.name,
+                        d.agents,
+                        d.model.as_deref().unwrap_or("(default)"),
+                        d.writable.join(",")
+                    );
+                }
+                println!();
+                print!("  [Enter] launch from this report   b: edit in Biplane UI   q: quit > ");
+                use std::io::Write;
+                std::io::stdout().flush()?;
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                match line.trim() {
+                    "" => {
+                        let ctx = Context::open(Some(&root))?;
+                        let added = biplane::apply_description_to_session(&ctx, &desc)?;
+                        println!(
+                            "[launch] Registered {added} agent(s) from the Biplane report; starting session..."
+                        );
+                        println!();
+                        // fall through into the session startup below
+                    }
+                    "b" | "B" => return biplane_ui::run(&root),
+                    _ => return Ok(()),
+                }
+            } else {
+                println!("[launch] No agents registered and no Biplane report found.");
+                print!("  [Enter] open Biplane UI to create one   q: quit > ");
+                use std::io::Write;
+                std::io::stdout().flush()?;
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                if line.trim().is_empty() {
+                    return biplane_ui::run(&root);
+                }
+                return Ok(());
+            }
         }
     } else {
         // Resume mode: agents already exist. Clear ALL running locks since
@@ -432,7 +490,20 @@ pub fn handle(cli: Cli) -> Result<()> {
     }
 
     match cli.command {
-        None => biplane::cmd_welcome(cli.project),
+        None => {
+            // `trelane` by itself is the session entry point: on a real
+            // terminal it goes straight to the launch flow, which detects a
+            // saved Biplane report (offering a one-key launch from it), offers
+            // the Biplane UI when there is none, or resumes existing agents
+            // into the tmux session. The static welcome screen remains for
+            // non-interactive invocations.
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                cmd_launch(cli)
+            } else {
+                biplane::cmd_welcome(cli.project)
+            }
+        }
         Some(Command::Init { project }) => commands::cmd_init(project.or(cli.project)),
         Some(Command::Attach { project, no_inject }) => commands::cmd_attach_project(
             project.or(cli.project),
@@ -589,7 +660,16 @@ pub fn handle(cli: Cli) -> Result<()> {
             accept_defaults,
             json,
         }) => {
-            if ui {
+            // UI-first: `trelane biplane` with no headless-mode flags opens the
+            // interactive editor. Headless modes stay reachable via their flags
+            // (--describe, --interactive, --json, --safe-pocket-dir), and
+            // non-TTY invocations keep the old report output for scripts.
+            let is_tty = {
+                use std::io::IsTerminal;
+                std::io::stdout().is_terminal()
+            };
+            let bare = !interactive && describe.is_none() && !json && safe_pocket_dir.is_none();
+            if ui || (bare && is_tty) {
                 let root = match cli.root.as_deref() {
                     Some(p) => p.to_path_buf(),
                     None => std::env::current_dir()?,

@@ -77,6 +77,18 @@ mod hex {
 
 pub fn load_secret(trelane_dir: &std::path::Path) -> Result<Vec<u8>> {
     let path = trelane_dir.join("secret");
+    if !path.exists() {
+        // Self-heal: a missing secret means no message has ever been signed in
+        // this project (init was skipped or the session dir was created
+        // implicitly, e.g. by a biplane apply opening the DB directly), so
+        // generating one now is always safe and unblocks the signing path.
+        std::fs::create_dir_all(trelane_dir)?;
+        let secret = generate_secret();
+        std::fs::write(&path, &secret).map_err(|e| {
+            TrelaneError::Msg(format!("cannot create secret at {}: {e}", path.display()))
+        })?;
+        return Ok(secret.trim().as_bytes().to_vec());
+    }
     let data = std::fs::read_to_string(&path)
         .map_err(|e| TrelaneError::Msg(format!("cannot read secret at {}: {e}", path.display())))?;
     Ok(data.trim().as_bytes().to_vec())
@@ -149,5 +161,20 @@ mod tests {
         let id = new_id("msg");
         assert!(id.starts_with("msg-"));
         assert!(id.len() > "msg-".len() + 14); // timestamp + hex
+    }
+
+    #[test]
+    fn load_secret_self_heals_when_missing() {
+        let dir = std::env::temp_dir().join(format!("trelane-secret-test-{}", new_id("t")));
+        // dir intentionally does not exist yet: load_secret must create it,
+        // generate a secret, persist it, and return it.
+        let first = load_secret(&dir).expect("self-heal generates a secret");
+        assert!(!first.is_empty());
+        assert!(dir.join("secret").exists());
+        // Subsequent reads return the same persisted secret, so signatures
+        // made after the heal keep verifying.
+        let second = load_secret(&dir).expect("second read");
+        assert_eq!(first, second);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
