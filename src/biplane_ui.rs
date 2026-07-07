@@ -59,8 +59,8 @@ pub enum EditTarget {
     DomainName,
     /// Edit the subject of planned-work item `index` on the focused domain.
     WorkSubject { index: usize },
-    /// Edit writable glob `index` on the focused domain.
-    Writable { index: usize },
+    /// Edit the comma-separated writable globs of the focused domain.
+    Writable,
 }
 
 /// An active text edit: the buffer plus where it commits.
@@ -100,6 +100,15 @@ pub struct BiplaneUiState {
     pub model_cursor: usize,
     /// When true, the model selector only shows free models.
     pub free_only: bool,
+    /// Emergent domains surfaced by a reconciliation report, awaiting the
+    /// user's accept/reject decision. Empty when there is nothing to review.
+    pub pending_suggestions: Vec<DomainSpec>,
+    /// Cursor within the pending-suggestions review overlay.
+    pub suggestion_cursor: usize,
+    /// True when the reconciliation review overlay is open.
+    pub reviewing_suggestions: bool,
+    /// Human-readable stalled-domain notices (read-only) from the last report.
+    pub stalled_notices: Vec<String>,
 }
 
 impl BiplaneUiState {
@@ -130,6 +139,10 @@ impl BiplaneUiState {
             model_selector_open: false,
             model_cursor: 0,
             free_only: false,
+            pending_suggestions: Vec::new(),
+            suggestion_cursor: 0,
+            reviewing_suggestions: false,
+            stalled_notices: Vec::new(),
         }
     }
 
@@ -208,6 +221,35 @@ impl BiplaneUiState {
         self.dirty = true;
     }
 
+    /// Valid planned-work priority levels, low→high. Mirrors the set accepted
+    /// by `biplane::normalize_urgency`.
+    pub const PRIORITIES: [&'static str; 4] = ["low", "normal", "high", "critical"];
+
+    /// Cycle the focused domain's first planned-work item priority to the next
+    /// (or previous) level. No-op if the domain has no planned work.
+    pub fn cycle_work_priority(&mut self, forward: bool) {
+        let Some(row) = self.rows.get_mut(self.cursor) else {
+            return;
+        };
+        let Some(work) = row.spec.planned_work.first_mut() else {
+            self.last_error = Some("this domain has no planned work".to_string());
+            return;
+        };
+        let cur = Self::PRIORITIES
+            .iter()
+            .position(|p| *p == work.priority)
+            .unwrap_or(1); // default to "normal" if unrecognized
+        let n = Self::PRIORITIES.len();
+        let next = if forward {
+            (cur + 1) % n
+        } else {
+            (cur + n - 1) % n
+        };
+        work.priority = Self::PRIORITIES[next].to_string();
+        self.last_error = None;
+        self.dirty = true;
+    }
+
     /// Move the focused domain up one position (reordering priority).
     pub fn move_up(&mut self) {
         if self.cursor > 0 && self.cursor < self.rows.len() {
@@ -229,6 +271,92 @@ impl BiplaneUiState {
     /// Number of currently included domains.
     pub fn included_count(&self) -> usize {
         self.rows.iter().filter(|r| r.include).count()
+    }
+
+    // -- Reconciliation: accept/reject emergent domains, view stalled ones --
+
+    /// Ingest a reconciliation report: queue its emergent domains as pending
+    /// suggestions for accept/reject, and record human-readable notices for
+    /// any stalled domains (including cycle members when present). Opens the
+    /// review overlay when there is at least one emergent suggestion.
+    pub fn ingest_reconciliation(&mut self, report: &crate::biplane::ReconciliationReport) {
+        // Only queue emergent domains whose names aren't already present, so a
+        // report applied twice doesn't create duplicates.
+        let existing: std::collections::HashSet<String> =
+            self.rows.iter().map(|r| r.spec.name.clone()).collect();
+        self.pending_suggestions = report
+            .emergent_domains
+            .iter()
+            .filter(|d| !existing.contains(&d.name))
+            .cloned()
+            .collect();
+        self.suggestion_cursor = 0;
+        self.reviewing_suggestions = !self.pending_suggestions.is_empty();
+
+        self.stalled_notices = report
+            .stalled_domains
+            .iter()
+            .map(|s| match &s.blocked_by_cycle {
+                Some(cycle) => format!("{}: blocked by cycle [{}]", s.domain, cycle.join(" → ")),
+                None => format!("{}: {}", s.domain, s.evidence),
+            })
+            .collect();
+    }
+
+    /// Number of emergent suggestions still awaiting a decision.
+    pub fn pending_count(&self) -> usize {
+        self.pending_suggestions.len()
+    }
+
+    fn clamp_suggestion_cursor(&mut self) {
+        if self.pending_suggestions.is_empty() {
+            self.suggestion_cursor = 0;
+            self.reviewing_suggestions = false;
+        } else if self.suggestion_cursor >= self.pending_suggestions.len() {
+            self.suggestion_cursor = self.pending_suggestions.len() - 1;
+        }
+    }
+
+    pub fn suggestion_up(&mut self) {
+        if self.suggestion_cursor > 0 {
+            self.suggestion_cursor -= 1;
+        }
+    }
+
+    pub fn suggestion_down(&mut self) {
+        if self.suggestion_cursor + 1 < self.pending_suggestions.len() {
+            self.suggestion_cursor += 1;
+        }
+    }
+
+    /// Accept the focused suggestion: append it as an included domain and
+    /// remove it from the pending queue. Returns the accepted domain name.
+    pub fn accept_suggestion(&mut self) -> Option<String> {
+        if self.suggestion_cursor >= self.pending_suggestions.len() {
+            return None;
+        }
+        let spec = self.pending_suggestions.remove(self.suggestion_cursor);
+        let name = spec.name.clone();
+        self.rows.push(DomainRow { spec, include: true });
+        self.dirty = true;
+        self.clamp_suggestion_cursor();
+        Some(name)
+    }
+
+    /// Reject the focused suggestion: drop it from the pending queue without
+    /// adding it. Returns the rejected domain name.
+    pub fn reject_suggestion(&mut self) -> Option<String> {
+        if self.suggestion_cursor >= self.pending_suggestions.len() {
+            return None;
+        }
+        let name = self.pending_suggestions.remove(self.suggestion_cursor).name;
+        self.clamp_suggestion_cursor();
+        Some(name)
+    }
+
+    /// Close the review overlay, leaving any undecided suggestions queued.
+    pub fn close_review(&mut self) {
+        self.reviewing_suggestions = false;
     }
 
     /// Validate the current curated description. On success clears any error
@@ -291,6 +419,19 @@ impl BiplaneUiState {
         }
     }
 
+    /// Begin editing the focused domain's writable globs, seeded with the
+    /// current globs joined by ", ".
+    pub fn begin_edit_writable(&mut self) {
+        if let Some(row) = self.rows.get(self.cursor) {
+            let seed = row.spec.writable.join(", ");
+            self.editing = Some(ActiveEdit {
+                input: crate::text_input::TextInput::with_text(&seed),
+                target: EditTarget::Writable,
+            });
+            self.last_error = None;
+        }
+    }
+
     /// Cancel an in-progress edit, discarding the buffer.
     pub fn cancel_edit(&mut self) {
         self.editing = None;
@@ -306,7 +447,7 @@ impl BiplaneUiState {
         match edit.target.clone() {
             EditTarget::DomainName => self.commit_rename(),
             EditTarget::WorkSubject { index } => self.commit_work_subject(index),
-            EditTarget::Writable { index } => self.commit_writable(index),
+            EditTarget::Writable => self.commit_writable(),
         }
     }
 
@@ -402,57 +543,31 @@ impl BiplaneUiState {
         }
     }
 
-    /// Feed a character into the active edit buffer (no-op if not editing).
-    pub fn edit_insert(&mut self, c: char) {
-        if let Some(edit) = self.editing.as_mut() {
-            edit.input.insert(c);
-        }
-    }
-
-    /// Backspace in the active edit buffer.
-    pub fn edit_backspace(&mut self) {
-        if let Some(edit) = self.editing.as_mut() {
-            edit.input.backspace();
-        }
-    }
-
-    // -- Writable glob editing --
-
-    /// Begin editing writable glob `index` on the focused domain.
-    pub fn begin_edit_writable(&mut self, index: usize) {
-        if let Some(row) = self.rows.get(self.cursor)
-            && let Some(glob) = row.spec.writable.get(index)
-        {
-            self.editing = Some(ActiveEdit {
-                input: crate::text_input::TextInput::with_text(glob),
-                target: EditTarget::Writable { index },
-            });
-            self.last_error = None;
-        }
-    }
-
-    /// Commit the in-progress writable glob edit. Rejects empty globs.
-    fn commit_writable(&mut self, index: usize) -> bool {
+    /// Commit the in-progress writable-globs edit. Parses the comma-separated
+    /// buffer into globs; rejects an empty set (keeping the editor open).
+    fn commit_writable(&mut self) -> bool {
         let Some(edit) = self.editing.as_ref() else {
             return false;
         };
-        let new_glob = edit.input.value().trim().to_string();
-        if new_glob.is_empty() {
-            self.last_error = Some("writable glob must not be empty".to_string());
+        let globs: Vec<String> = edit
+            .input
+            .value()
+            .split(',')
+            .map(|g| g.trim().to_string())
+            .filter(|g| !g.is_empty())
+            .collect();
+        if globs.is_empty() {
+            self.last_error = Some("a domain needs at least one writable glob".to_string());
             return false;
         }
-        match self
-            .rows
-            .get_mut(self.cursor)
-            .and_then(|r| r.spec.writable.get_mut(index))
-        {
-            Some(glob) => {
-                if *glob == new_glob {
+        match self.rows.get_mut(self.cursor) {
+            Some(row) => {
+                if row.spec.writable == globs {
                     self.editing = None;
                     self.last_error = None;
                     return false;
                 }
-                *glob = new_glob;
+                row.spec.writable = globs;
                 self.editing = None;
                 self.last_error = None;
                 self.dirty = true;
@@ -465,77 +580,96 @@ impl BiplaneUiState {
         }
     }
 
-    // -- Domain add/remove --
+    // -- Structural edits: add/remove domains and planned-work items --
 
-    /// Add a new empty domain at the end of the list and focus it.
-    pub fn add_domain(&mut self) {
-        let mut n = 1;
-        loop {
-            let name = format!("domain-{n}");
-            if !self.rows.iter().any(|r| r.spec.name == name) {
-                self.rows.push(DomainRow {
-                    spec: DomainSpec {
-                        name,
-                        description: String::new(),
-                        writable: vec!["src/**".to_string()],
-                        forbidden_write: vec![],
-                        depends_on: vec![],
-                        planned_work: vec![],
-                        agents: 1,
-                        model: None,
-                    },
-                    include: true,
-                });
-                self.cursor = self.rows.len() - 1;
-                self.dirty = true;
-                self.status = Some("domain added -- press 'e' to rename".to_string());
-                return;
-            }
+    /// Add a new domain with a unique placeholder name and a single writable
+    /// glob, inserted after the cursor, and focus it. Returns the new name.
+    pub fn add_domain(&mut self) -> String {
+        let mut n = self.rows.len() + 1;
+        let mut name = format!("domain-{n}");
+        while self.rows.iter().any(|r| r.spec.name == name) {
             n += 1;
+            name = format!("domain-{n}");
         }
+        let spec = DomainSpec {
+            name: name.clone(),
+            description: String::new(),
+            writable: vec![format!("src/{name}/**")],
+            forbidden_write: vec![],
+            depends_on: vec![],
+            planned_work: vec![],
+            agents: 1,
+            model: None,
+        };
+        let insert_at = if self.rows.is_empty() {
+            0
+        } else {
+            (self.cursor + 1).min(self.rows.len())
+        };
+        self.rows.insert(insert_at, DomainRow { spec, include: true });
+        self.cursor = insert_at;
+        self.dirty = true;
+        name
     }
 
-    /// Remove the focused domain. Does nothing if there are no rows.
-    pub fn remove_domain(&mut self) {
+    /// Remove the focused domain, pruning any other domain's dependency edges
+    /// that referenced it. No-op if there are no rows. Returns true if removed.
+    pub fn remove_domain(&mut self) -> bool {
         if self.rows.is_empty() {
-            return;
+            return false;
         }
-        let removed_name = self.rows[self.cursor].spec.name.clone();
-        self.rows.remove(self.cursor);
-        if self.cursor >= self.rows.len() && !self.rows.is_empty() {
-            self.cursor = self.rows.len() - 1;
+        let removed = self.rows.remove(self.cursor).spec.name;
+        for row in self.rows.iter_mut() {
+            row.spec.depends_on.retain(|d| d != &removed);
         }
-        // Prune dangling depends_on references.
-        for row in &mut self.rows {
-            row.spec.depends_on.retain(|d| *d != removed_name);
+        if self.cursor >= self.rows.len() && self.cursor > 0 {
+            self.cursor -= 1;
         }
         self.dirty = true;
-        self.status = Some(format!("domain '{removed_name}' removed"));
+        true
     }
 
-    // -- Planned-work add/remove --
-
-    /// Add a new planned-work item to the focused domain.
-    pub fn add_work(&mut self) {
-        if let Some(row) = self.rows.get_mut(self.cursor) {
+    /// Append a new planned-work item to the focused domain with a placeholder
+    /// subject, and immediately open it for editing. Returns the new index.
+    pub fn add_work_item(&mut self) -> Option<usize> {
+        let idx = {
+            let row = self.rows.get_mut(self.cursor)?;
             row.spec.planned_work.push(crate::biplane::PlannedWork {
                 subject: "new task".to_string(),
                 body: String::new(),
                 priority: "normal".to_string(),
             });
-            self.dirty = true;
-            self.status = Some("work item added -- press 'w' to edit".to_string());
+            row.spec.planned_work.len() - 1
+        };
+        self.dirty = true;
+        self.begin_edit_work(idx);
+        Some(idx)
+    }
+
+    /// Remove planned-work item `index` from the focused domain. Returns true
+    /// if an item was removed.
+    pub fn remove_work_item(&mut self, index: usize) -> bool {
+        match self.rows.get_mut(self.cursor) {
+            Some(row) if index < row.spec.planned_work.len() => {
+                row.spec.planned_work.remove(index);
+                self.dirty = true;
+                true
+            }
+            _ => false,
         }
     }
 
-    /// Remove planned-work item `index` from the focused domain.
-    pub fn remove_work(&mut self, index: usize) {
-        if let Some(row) = self.rows.get_mut(self.cursor)
-            && index < row.spec.planned_work.len()
-        {
-            row.spec.planned_work.remove(index);
-            self.dirty = true;
-            self.status = Some(format!("work item {index} removed"));
+    /// Feed a character into the active edit buffer (no-op if not editing).
+    pub fn edit_insert(&mut self, c: char) {
+        if let Some(edit) = self.editing.as_mut() {
+            edit.input.insert(c);
+        }
+    }
+
+    /// Backspace in the active edit buffer.
+    pub fn edit_backspace(&mut self) {
+        if let Some(edit) = self.editing.as_mut() {
+            edit.input.backspace();
         }
     }
 
@@ -666,9 +800,6 @@ impl BiplaneUiState {
 /// Entry point for `trelane biplane --ui`. Loads the stored description if one
 /// exists, otherwise scaffolds from the project structure, then runs the
 /// editor. No-ops with a message when stdout is not a TTY.
-///
-/// For empty projects (no source files), falls through to a "describe your
-/// project" prompt that uses an LLM to generate the initial description.
 pub fn run(root: &std::path::Path) -> Result<()> {
     use std::io::IsTerminal;
     if !std::io::stdout().is_terminal() {
@@ -683,19 +814,23 @@ pub fn run(root: &std::path::Path) -> Result<()> {
             format!("loaded from {}", desc_path.display()),
         )
     } else {
-        let scaffolded = crate::biplane::scaffold_description_from_structure(root);
-        if scaffolded.domains.is_empty() {
-            // Empty project: ask the user to describe it, then use an LLM
-            // to generate the domain split.
-            return run_empty_project_flow(root);
-        }
         (
-            scaffolded,
+            crate::biplane::scaffold_description_from_structure(root),
             "scaffolded from project source layout".to_string(),
         )
     };
 
     let mut state = BiplaneUiState::from_description(&desc, source);
+
+    // Best-effort: if a live session DB is present, run a reconciliation scan
+    // and surface any emergent/stalled domains for accept/reject review. This
+    // is purely additive — failure (e.g. no session yet) leaves the editor in
+    // its normal pre-session state rather than aborting.
+    if let Ok(ctx) = crate::Context::open(Some(root)) {
+        if let Ok(report) = crate::biplane::reconcile_against_reality(&ctx, &desc) {
+            state.ingest_reconciliation(&report);
+        }
+    }
     run_loop(root, &mut state)
 }
 
@@ -705,284 +840,6 @@ fn save_description(root: &std::path::Path, desc: &ProjectDescription) -> Result
     let path = dir.join("biplane-description.json");
     std::fs::write(&path, serde_json::to_string_pretty(desc)?)?;
     Ok(())
-}
-
-/// Flow for empty projects: show a text input asking the user to describe
-/// their project, then use an LLM to generate a domain split from that
-/// description.  The result is loaded into the normal Biplane UI for
-/// review/editing before the user decides whether to begin work.
-fn run_empty_project_flow(root: &std::path::Path) -> Result<()> {
-    use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-    use crossterm::execute;
-    use crossterm::terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    };
-    use ratatui::prelude::*;
-    #[allow(unused_imports)]
-    use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-    use std::time::Duration;
-
-    // Phase 1: collect the project description from the user.
-    let mut description_input = crate::text_input::TextInput::new();
-    let mut max_agents_input = String::from("3");
-    let mut focused_field = 0usize; // 0 = description, 1 = max_agents
-    let mut phase = EmptyProjectPhase::Input;
-    let mut status_msg = String::new();
-    let mut generated_desc: Option<ProjectDescription> = None;
-
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let outcome = (|| -> Result<()> {
-        loop {
-            terminal.draw(|f| {
-                render_empty_project_input(
-                    f,
-                    &description_input,
-                    &max_agents_input,
-                    focused_field,
-                    &phase,
-                    &status_msg,
-                )
-            })?;
-
-            match &phase {
-                EmptyProjectPhase::Input => {
-                    if event::poll(Duration::from_millis(250))?
-                        && let Event::Key(key) = event::read()?
-                        && key.kind == KeyEventKind::Press
-                    {
-                        match key.code {
-                            KeyCode::Tab => focused_field = 1 - focused_field,
-                            KeyCode::Enter if focused_field == 1 => {
-                                // Generate
-                                let desc_text = description_input.value().trim().to_string();
-                                if desc_text.is_empty() {
-                                    status_msg = "Please describe your project first.".into();
-                                    continue;
-                                }
-                                let max_agents: usize =
-                                    max_agents_input.trim().parse().unwrap_or(3).clamp(1, 10);
-                                phase = EmptyProjectPhase::Generating;
-                                status_msg =
-                                    format!("Analyzing with LLM (max {} agents)...", max_agents);
-                                terminal.draw(|f| {
-                                    render_empty_project_input(
-                                        f,
-                                        &description_input,
-                                        &max_agents_input,
-                                        focused_field,
-                                        &phase,
-                                        &status_msg,
-                                    )
-                                })?;
-
-                                // Run the LLM planner.
-                                let plan = crate::biplane::run_biplane_plan_from_description(
-                                    root, &desc_text, max_agents,
-                                );
-                                match plan {
-                                    Ok(desc) => {
-                                        generated_desc = Some(desc);
-                                        phase = EmptyProjectPhase::Review;
-                                        status_msg =
-                                            "Plan generated. Review and edit below.".into();
-                                    }
-                                    Err(e) => {
-                                        status_msg = format!("Failed: {e}");
-                                        phase = EmptyProjectPhase::Input;
-                                    }
-                                }
-                            }
-                            KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
-                            KeyCode::Backspace => {
-                                if focused_field == 0 {
-                                    description_input.backspace();
-                                } else {
-                                    max_agents_input.pop();
-                                }
-                            }
-                            KeyCode::Left => {
-                                if focused_field == 0 {
-                                    description_input.move_left();
-                                }
-                            }
-                            KeyCode::Right => {
-                                if focused_field == 0 {
-                                    description_input.move_right();
-                                }
-                            }
-                            KeyCode::Char(c) => {
-                                if focused_field == 0 {
-                                    description_input.insert(c);
-                                } else if c.is_ascii_digit() {
-                                    max_agents_input.push(c);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                EmptyProjectPhase::Generating => {
-                    // Handled inline above; just keep the loop alive.
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                EmptyProjectPhase::Review => {
-                    // Drop out of the alt screen and hand off to the normal
-                    // Biplane UI editor with the generated description.
-                    if let Some(desc) = generated_desc.take() {
-                        // Save it so the editor can load from file on future runs.
-                        save_description(root, &desc)?;
-                        // Exit this loop; the caller will start the editor.
-                        return Ok(());
-                    }
-                    return Ok(());
-                }
-            }
-        }
-    })();
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    outcome?;
-
-    // If we got a generated description, launch the normal editor.
-    let desc_path = root.join(".trelane").join("biplane-description.json");
-    if desc_path.exists() {
-        let desc = crate::biplane::load_project_description(&desc_path)?;
-        let mut state =
-            BiplaneUiState::from_description(&desc, "generated from project description");
-        run_loop(root, &mut state)?;
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EmptyProjectPhase {
-    Input,
-    Generating,
-    Review,
-}
-
-fn render_empty_project_input(
-    f: &mut ratatui::Frame,
-    desc_input: &crate::text_input::TextInput,
-    max_agents_input: &str,
-    focused: usize,
-    phase: &EmptyProjectPhase,
-    status: &str,
-) {
-    use crate::diagnostic::{THEME_BIPLANE_ACCENT, THEME_DIM, THEME_OK, THEME_WARN};
-    use ratatui::prelude::*;
-    use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-
-    let accent = tc(THEME_BIPLANE_ACCENT);
-    let dim = tc(THEME_DIM);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(5), // header
-            Constraint::Min(8),    // description input
-            Constraint::Length(3), // max agents
-            Constraint::Length(3), // status / hints
-        ])
-        .split(f.area());
-
-    // Header
-    let header = Paragraph::new(vec![
-        Line::from(Span::styled(
-            "Biplane :: New Project",
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            "This project is empty. Describe what you want to build and Biplane\nwill propose a domain split using an LLM.",
-            Style::default().fg(dim),
-        )),
-    ])
-    .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(accent)));
-    f.render_widget(header, chunks[0]);
-
-    // Description input
-    let desc_focused = focused == 0 && *phase == EmptyProjectPhase::Input;
-    let desc_display = if desc_focused {
-        desc_input.render_with_caret()
-    } else {
-        desc_input.value().to_string()
-    };
-    let desc_style = if desc_focused {
-        Style::default().fg(accent)
-    } else {
-        Style::default().fg(dim)
-    };
-    let desc_title = if desc_focused {
-        " Project Description (editing) "
-    } else {
-        " Project Description "
-    };
-    let desc_para = Paragraph::new(desc_display)
-        .style(desc_style)
-        .wrap(Wrap { trim: false })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(desc_title)
-                .border_style(Style::default().fg(accent)),
-        );
-    f.render_widget(desc_para, chunks[1]);
-
-    // Max agents input
-    let ma_focused = focused == 1 && *phase == EmptyProjectPhase::Input;
-    let ma_style = if ma_focused {
-        Style::default().fg(accent).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(dim)
-    };
-    let ma_title = if ma_focused {
-        " Max Agents (editing) "
-    } else {
-        " Max Agents "
-    };
-    let ma_para = Paragraph::new(format!("{}  (press Enter to generate)", max_agents_input))
-        .style(ma_style)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(ma_title)
-                .border_style(Style::default().fg(accent)),
-        );
-    f.render_widget(ma_para, chunks[2]);
-
-    // Status / hints
-    let status_color = if status.starts_with("Failed") {
-        tc(THEME_WARN)
-    } else if status.starts_with("Plan generated") {
-        tc(THEME_OK)
-    } else {
-        dim
-    };
-    let hint = if *phase == EmptyProjectPhase::Generating {
-        status.to_string()
-    } else {
-        format!(
-            "{}  |  Tab: switch field  Enter: generate  Esc: quit",
-            status
-        )
-    };
-    let footer = Paragraph::new(Line::from(Span::styled(
-        hint,
-        Style::default().fg(status_color),
-    )))
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(dim)),
-    );
-    f.render_widget(footer, chunks[3]);
 }
 
 fn run_loop(root: &std::path::Path, state: &mut BiplaneUiState) -> Result<()> {
@@ -1007,6 +864,22 @@ fn run_loop(root: &std::path::Path, state: &mut BiplaneUiState) -> Result<()> {
                 && let Event::Key(key) = event::read()?
             {
                 if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                // Reconciliation review overlay: keys route here when open.
+                if state.reviewing_suggestions {
+                    match key.code {
+                        KeyCode::Esc => state.close_review(),
+                        KeyCode::Up => state.suggestion_up(),
+                        KeyCode::Down => state.suggestion_down(),
+                        KeyCode::Char('y') | KeyCode::Enter => {
+                            state.accept_suggestion();
+                        }
+                        KeyCode::Char('n') => {
+                            state.reject_suggestion();
+                        }
+                        _ => {}
+                    }
                     continue;
                 }
                 // Model selector popup: keys route here when open.
@@ -1051,11 +924,33 @@ fn run_loop(root: &std::path::Path, state: &mut BiplaneUiState) -> Result<()> {
                     KeyCode::Char('J') => state.move_down(),
                     KeyCode::Char('e') => state.begin_rename(),
                     KeyCode::Char('w') => state.begin_edit_work(0),
-                    KeyCode::Char('W') => state.begin_edit_writable(0),
-                    KeyCode::Char('a') => state.add_domain(),
-                    KeyCode::Char('D') => state.remove_domain(),
-                    KeyCode::Char('+') => state.add_work(),
-                    KeyCode::Char('-') => state.remove_work(0),
+                    KeyCode::Char('g') => state.begin_edit_writable(),
+                    KeyCode::Char('a') => {
+                        state.add_domain();
+                    }
+                    KeyCode::Char('d') => {
+                        state.remove_domain();
+                    }
+                    KeyCode::Char('A') => {
+                        state.add_work_item();
+                    }
+                    KeyCode::Char('D') => {
+                        // Remove the last planned-work item of the focused domain.
+                        if let Some(row) = state.rows.get(state.cursor) {
+                            let n = row.spec.planned_work.len();
+                            if n > 0 {
+                                state.remove_work_item(n - 1);
+                            }
+                        }
+                    }
+                    KeyCode::Char('p') => state.cycle_work_priority(true),
+                    KeyCode::Char('P') => state.cycle_work_priority(false),
+                    KeyCode::Char('r') => {
+                        // Reopen the review overlay if suggestions remain.
+                        if state.pending_count() > 0 {
+                            state.reviewing_suggestions = true;
+                        }
+                    }
                     KeyCode::Char('m') => state.open_model_selector(),
                     KeyCode::Char('M') => {
                         // Quick: set all included domains to the first free model
@@ -1181,45 +1076,50 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
             };
             // When editing the focused row, show the live buffer with a caret
             // in the cell matching the edit target.
-            let editing_name = i == state.cursor
-                && matches!(
-                    state.editing.as_ref().map(|e| &e.target),
-                    Some(EditTarget::DomainName)
-                );
-            let editing_work = i == state.cursor
-                && matches!(
-                    state.editing.as_ref().map(|e| &e.target),
-                    Some(EditTarget::WorkSubject { .. })
-                );
+            let target = state.editing.as_ref().map(|e| &e.target);
+            let editing_name =
+                i == state.cursor && matches!(target, Some(EditTarget::DomainName));
+            let editing_work =
+                i == state.cursor && matches!(target, Some(EditTarget::WorkSubject { .. }));
+            let editing_writable =
+                i == state.cursor && matches!(target, Some(EditTarget::Writable));
+            let warn_bold = Style::default().fg(tc(THEME_WARN)).add_modifier(Modifier::BOLD);
+
             let name_cell = if editing_name {
                 format!(" {:<16}", state.edit_input().unwrap().render_with_caret())
             } else {
                 format!(" {:<16}", row.spec.name)
             };
             let name_span = if editing_name {
-                Span::styled(
-                    name_cell,
-                    Style::default()
-                        .fg(tc(THEME_WARN))
-                        .add_modifier(Modifier::BOLD),
-                )
+                Span::styled(name_cell, warn_bold)
             } else {
                 Span::styled(name_cell, name_style)
             };
             let work_cell = if editing_work {
                 format!("work:{} ", state.edit_input().unwrap().render_with_caret())
             } else {
-                format!("work:{:<3} ", row.spec.planned_work.len())
+                let prio = row
+                    .spec
+                    .planned_work
+                    .first()
+                    .map(|w| w.priority.as_str())
+                    .unwrap_or("-");
+                format!("work:{:<2}[{}] ", row.spec.planned_work.len(), prio)
             };
             let work_span = if editing_work {
-                Span::styled(
-                    work_cell,
-                    Style::default()
-                        .fg(tc(THEME_WARN))
-                        .add_modifier(Modifier::BOLD),
-                )
+                Span::styled(work_cell, warn_bold)
             } else {
                 Span::styled(work_cell, Style::default().fg(dim))
+            };
+            let writable_str = if editing_writable {
+                state.edit_input().unwrap().render_with_caret()
+            } else {
+                row.spec.writable.join(",")
+            };
+            let writable_span = if editing_writable {
+                Span::styled(writable_str, warn_bold)
+            } else {
+                Span::styled(writable_str, Style::default().fg(dim))
             };
             let model_str = row.spec.model.as_deref().unwrap_or("(default)");
             ListItem::new(Line::from(vec![
@@ -1240,7 +1140,7 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
                         dim
                     }),
                 ),
-                Span::styled(row.spec.writable.join(","), Style::default().fg(dim)),
+                writable_span,
             ]))
         })
         .collect();
@@ -1257,15 +1157,26 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
         render_model_selector(f, state);
     }
 
+    // Reconciliation review overlay
+    if state.reviewing_suggestions {
+        render_review_overlay(f, state);
+    }
+
     // Footer
     let hint = state.status.clone().unwrap_or_else(|| {
-        if state.model_selector_open {
+        if state.reviewing_suggestions {
+            "↑↓ select  y/Enter accept  n reject  Esc close review".to_string()
+        } else if state.model_selector_open {
             "↑↓ select model  Enter apply  f free-only  a apply-to-all  c clear  Esc close".to_string()
         } else if state.editing.is_some() {
             "typing… Enter save  Esc cancel  ←→ move caret  Backspace delete".to_string()
         } else {
-            "↑↓ move  space include  ←→ agents  [ ] budget  K/J reorder  e rename  w work  W glob  a add-domain  D del-domain  + add-work  - del-work  m model  s save  q quit"
-                .to_string()
+            let base = "↑↓ move  spc incl  ←→ agents  [ ] budget  K/J reorder  e name  w work  g globs  p prio  a/d domain  A/D task  m model  s save  q quit";
+            if state.pending_count() > 0 {
+                format!("{} · r review ({})", base, state.pending_count())
+            } else {
+                base.to_string()
+            }
         }
     });
     let footer = Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(dim)))).block(
@@ -1338,6 +1249,79 @@ fn render_model_selector(f: &mut ratatui::Frame, state: &BiplaneUiState) {
     );
     let hint_para = Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(dim))));
     f.render_widget(hint_para, hint_area);
+}
+
+/// Reconciliation review overlay: pending emergent-domain suggestions to
+/// accept/reject, plus a read-only list of stalled-domain notices.
+fn render_review_overlay(f: &mut ratatui::Frame, state: &BiplaneUiState) {
+    use crate::diagnostic::{THEME_BIPLANE_ACCENT, THEME_DIM, THEME_OK, THEME_WARN};
+    use ratatui::prelude::*;
+    use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+
+    let accent = tc(THEME_BIPLANE_ACCENT);
+    let dim = tc(THEME_DIM);
+
+    let area = centered_rect_pct(70, 70, f.area());
+    f.render_widget(Clear, area);
+
+    // Split: suggestions list on top, stalled notices below.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(6)])
+        .split(area);
+
+    let items: Vec<ListItem> = state
+        .pending_suggestions
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let marker = if i == state.suggestion_cursor {
+                "▶ "
+            } else {
+                "  "
+            };
+            ListItem::new(Line::from(vec![
+                Span::raw(marker),
+                Span::styled(
+                    format!("{:<16}", d.name),
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("writable: {}", d.writable.join(",")),
+                    Style::default().fg(dim),
+                ),
+            ]))
+        })
+        .collect();
+    let title = format!(" Emergent Domains — review ({}) ", state.pending_suggestions.len());
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(tc(THEME_OK))),
+    );
+    f.render_widget(list, rows[0]);
+
+    // Stalled notices (read-only).
+    let stalled_lines: Vec<Line> = if state.stalled_notices.is_empty() {
+        vec![Line::from(Span::styled(
+            "  no stalled domains",
+            Style::default().fg(dim),
+        ))]
+    } else {
+        state
+            .stalled_notices
+            .iter()
+            .map(|n| Line::from(Span::styled(format!("  {n}"), Style::default().fg(tc(THEME_WARN)))))
+            .collect()
+    };
+    let stalled = Paragraph::new(stalled_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Stalled (read-only) ")
+            .border_style(Style::default().fg(tc(THEME_WARN))),
+    );
+    f.render_widget(stalled, rows[1]);
 }
 
 fn centered_rect_pct(pct_x: u16, pct_y: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
@@ -1604,6 +1588,8 @@ mod tests {
         assert_eq!(s.rows[0].spec.name, "engine"); // unchanged
     }
 
+    // --- planned-work subject editing ---
+
     #[test]
     fn begin_edit_work_seeds_subject() {
         let mut s = state();
@@ -1635,7 +1621,7 @@ mod tests {
         s.begin_edit_work(0);
         s.editing.as_mut().unwrap().input.clear();
         assert!(!s.commit_edit());
-        assert!(s.is_editing()); // stays open to fix
+        assert!(s.is_editing());
         assert!(s.last_error.is_some());
         assert_eq!(s.rows[0].spec.planned_work[0].subject, "build engine");
     }
@@ -1650,8 +1636,115 @@ mod tests {
         assert!(s.last_error.is_some());
     }
 
+    // --- writable-glob editing ---
+
     #[test]
-    fn commit_edit_dispatches_rename_via_generic_entry() {
+    fn begin_edit_writable_seeds_joined_globs() {
+        let mut s = state();
+        s.cursor = 0;
+        s.begin_edit_writable();
+        assert_eq!(s.edit_input().unwrap().value(), "src/engine/**");
+    }
+
+    #[test]
+    fn commit_writable_parses_comma_list() {
+        let mut s = state();
+        s.cursor = 0;
+        s.begin_edit_writable();
+        s.editing.as_mut().unwrap().input.clear();
+        for c in "src/a/**, src/b/**".chars() {
+            s.edit_insert(c);
+        }
+        assert!(s.commit_edit());
+        assert_eq!(s.rows[0].spec.writable, vec!["src/a/**", "src/b/**"]);
+        assert!(s.dirty);
+    }
+
+    #[test]
+    fn commit_writable_rejects_empty_set() {
+        let mut s = state();
+        s.cursor = 0;
+        s.begin_edit_writable();
+        s.editing.as_mut().unwrap().input.clear();
+        for c in " , , ".chars() {
+            s.edit_insert(c);
+        }
+        assert!(!s.commit_edit());
+        assert!(s.is_editing());
+        assert!(s.last_error.is_some());
+        assert_eq!(s.rows[0].spec.writable, vec!["src/engine/**"]); // unchanged
+    }
+
+    // --- add / remove domain ---
+
+    #[test]
+    fn add_domain_inserts_unique_and_focuses() {
+        let mut s = state();
+        s.cursor = 0;
+        let before = s.rows.len();
+        let name = s.add_domain();
+        assert_eq!(s.rows.len(), before + 1);
+        // inserted right after the cursor, and cursor follows it
+        assert_eq!(s.rows[1].spec.name, name);
+        assert_eq!(s.cursor, 1);
+        assert!(s.dirty);
+        // unique + at least one writable glob so it validates
+        assert!(!name.is_empty());
+        assert!(!s.rows[1].spec.writable.is_empty());
+    }
+
+    #[test]
+    fn add_domain_then_validate_ok() {
+        let mut s = state();
+        s.add_domain();
+        assert!(s.validated().is_some());
+    }
+
+    #[test]
+    fn remove_domain_prunes_dependents_and_bounds_cursor() {
+        let mut s = state();
+        s.cursor = 0; // engine, depended on by ui and api
+        assert!(s.remove_domain());
+        assert!(s.rows.iter().all(|r| r.spec.name != "engine"));
+        assert!(s.rows.iter().all(|r| !r.spec.depends_on.contains(&"engine".to_string())));
+        assert!(s.cursor < s.rows.len());
+    }
+
+    #[test]
+    fn remove_domain_at_end_moves_cursor_back() {
+        let mut s = state();
+        s.cursor = s.rows.len() - 1; // api
+        s.remove_domain();
+        assert_eq!(s.cursor, s.rows.len() - 1);
+    }
+
+    // --- add / remove planned-work item ---
+
+    #[test]
+    fn add_work_item_appends_and_opens_editor() {
+        let mut s = state();
+        s.cursor = 0;
+        let before = s.rows[0].spec.planned_work.len();
+        let idx = s.add_work_item().unwrap();
+        assert_eq!(s.rows[0].spec.planned_work.len(), before + 1);
+        assert_eq!(idx, before);
+        // editor is open on the new item, seeded with its placeholder
+        assert!(s.is_editing());
+        assert_eq!(s.edit_input().unwrap().value(), "new task");
+    }
+
+    #[test]
+    fn remove_work_item_deletes() {
+        let mut s = state();
+        s.cursor = 0;
+        assert!(s.remove_work_item(0));
+        assert!(s.rows[0].spec.planned_work.is_empty());
+        assert!(!s.remove_work_item(0)); // nothing left
+    }
+
+    #[test]
+    fn commit_edit_dispatches_by_target() {
+        // rename, work, and writable all route through the one entry point.
         let mut s = state();
         s.cursor = 1; // ui
         s.begin_rename();
@@ -1663,15 +1756,134 @@ mod tests {
         assert_eq!(s.rows[1].spec.name, "frontend");
     }
 
+    // --- planned-work priority cycling ---
+
     #[test]
-    fn work_edit_does_not_touch_domain_name() {
+    fn cycle_work_priority_advances_and_wraps() {
+        let mut s = state();
+        s.cursor = 0; // engine, planned_work[0] priority "normal"
+        assert_eq!(s.rows[0].spec.planned_work[0].priority, "normal");
+        s.cycle_work_priority(true); // normal -> high
+        assert_eq!(s.rows[0].spec.planned_work[0].priority, "high");
+        s.cycle_work_priority(true); // high -> critical
+        s.cycle_work_priority(true); // critical -> low (wrap)
+        assert_eq!(s.rows[0].spec.planned_work[0].priority, "low");
+        assert!(s.dirty);
+    }
+
+    #[test]
+    fn cycle_work_priority_backward() {
         let mut s = state();
         s.cursor = 0;
-        s.begin_edit_work(0);
-        s.editing.as_mut().unwrap().input.clear();
-        s.edit_insert('x');
-        s.commit_edit();
-        assert_eq!(s.rows[0].spec.name, "engine"); // name untouched
+        s.cycle_work_priority(false); // normal -> low
+        assert_eq!(s.rows[0].spec.planned_work[0].priority, "low");
+        s.cycle_work_priority(false); // low -> critical (wrap)
+        assert_eq!(s.rows[0].spec.planned_work[0].priority, "critical");
+    }
+
+    #[test]
+    fn cycle_work_priority_no_work_sets_error() {
+        let mut s = state();
+        s.cursor = 0;
+        s.rows[0].spec.planned_work.clear();
+        s.cycle_work_priority(true);
+        assert!(s.last_error.is_some());
+    }
+
+    // --- reconciliation accept/reject ---
+
+    fn report_with(emergent: &[&str], stalled: &[(&str, &str)]) -> crate::biplane::ReconciliationReport {
+        crate::biplane::ReconciliationReport {
+            emergent_domains: emergent
+                .iter()
+                .map(|n| domain(n, &[], 1))
+                .collect(),
+            stalled_domains: stalled
+                .iter()
+                .map(|(d, e)| crate::biplane::StalledDomain {
+                    domain: d.to_string(),
+                    evidence: e.to_string(),
+                    blocked_by_cycle: None,
+                })
+                .collect(),
+            healthy_domains: vec![],
+        }
+    }
+
+    #[test]
+    fn ingest_queues_emergent_and_opens_review() {
+        let mut s = state();
+        let report = report_with(&["cache", "telemetry"], &[]);
+        s.ingest_reconciliation(&report);
+        assert_eq!(s.pending_count(), 2);
+        assert!(s.reviewing_suggestions);
+    }
+
+    #[test]
+    fn ingest_skips_already_present_domains() {
+        let mut s = state();
+        // "engine" already exists in the fixture; only "cache" is new.
+        let report = report_with(&["engine", "cache"], &[]);
+        s.ingest_reconciliation(&report);
+        assert_eq!(s.pending_count(), 1);
+        assert_eq!(s.pending_suggestions[0].name, "cache");
+    }
+
+    #[test]
+    fn accept_suggestion_adds_domain() {
+        let mut s = state();
+        let before = s.rows.len();
+        s.ingest_reconciliation(&report_with(&["cache"], &[]));
+        let name = s.accept_suggestion().unwrap();
+        assert_eq!(name, "cache");
+        assert_eq!(s.rows.len(), before + 1);
+        assert!(s.rows.iter().any(|r| r.spec.name == "cache"));
+        assert_eq!(s.pending_count(), 0);
+        // queue empty -> review auto-closes
+        assert!(!s.reviewing_suggestions);
+        assert!(s.dirty);
+    }
+
+    #[test]
+    fn reject_suggestion_drops_without_adding() {
+        let mut s = state();
+        let before = s.rows.len();
+        s.ingest_reconciliation(&report_with(&["cache"], &[]));
+        let name = s.reject_suggestion().unwrap();
+        assert_eq!(name, "cache");
+        assert_eq!(s.rows.len(), before); // not added
+        assert_eq!(s.pending_count(), 0);
+    }
+
+    #[test]
+    fn accepted_emergent_domain_validates() {
+        let mut s = state();
+        s.ingest_reconciliation(&report_with(&["cache"], &[]));
+        s.accept_suggestion();
+        assert!(s.validated().is_some());
+    }
+
+    #[test]
+    fn ingest_records_stalled_notices() {
+        let mut s = state();
+        s.ingest_reconciliation(&report_with(&[], &[("ui", "no commits in 2h")]));
+        assert_eq!(s.stalled_notices.len(), 1);
+        assert!(s.stalled_notices[0].contains("ui"));
+        // no emergent -> review not opened
+        assert!(!s.reviewing_suggestions);
+    }
+
+    #[test]
+    fn stalled_cycle_notice_lists_members() {
+        let mut s = state();
+        let mut report = report_with(&[], &[]);
+        report.stalled_domains.push(crate::biplane::StalledDomain {
+            domain: "a".into(),
+            evidence: "waiting".into(),
+            blocked_by_cycle: Some(vec!["a".into(), "b".into()]),
+        });
+        s.ingest_reconciliation(&report);
+        assert!(s.stalled_notices[0].contains("cycle"));
     }
 
     #[test]
@@ -1772,131 +1984,5 @@ mod tests {
         assert_eq!(s.model_cursor, 0);
         s.model_cursor_up(); // at top
         assert_eq!(s.model_cursor, 0);
-    }
-
-    #[test]
-    fn begin_edit_writable_seeds_buffer() {
-        let mut s = state();
-        s.cursor = 0; // engine, writable ["src/engine/**"]
-        s.begin_edit_writable(0);
-        assert!(s.is_editing());
-        assert_eq!(s.editing.as_ref().unwrap().input.value(), "src/engine/**");
-    }
-
-    #[test]
-    fn commit_writable_updates_glob() {
-        let mut s = state();
-        s.cursor = 0;
-        s.begin_edit_writable(0);
-        s.editing.as_mut().unwrap().input.clear();
-        for c in "src/core/**".chars() {
-            s.edit_insert(c);
-        }
-        assert!(s.commit_edit());
-        assert_eq!(s.rows[0].spec.writable[0], "src/core/**");
-        assert!(s.dirty);
-        assert!(!s.is_editing());
-    }
-
-    #[test]
-    fn commit_writable_rejects_empty() {
-        let mut s = state();
-        s.cursor = 0;
-        s.begin_edit_writable(0);
-        s.editing.as_mut().unwrap().input.clear();
-        assert!(!s.commit_edit());
-        assert!(s.is_editing()); // stays open
-        assert!(s.last_error.is_some());
-    }
-
-    #[test]
-    fn add_domain_appends_and_focuses() {
-        let mut s = state();
-        let initial_len = s.rows.len();
-        s.add_domain();
-        assert_eq!(s.rows.len(), initial_len + 1);
-        assert_eq!(s.cursor, initial_len); // focused on new domain
-        assert!(s.dirty);
-        assert!(s.rows[s.cursor].spec.name.starts_with("domain-"));
-    }
-
-    #[test]
-    fn add_domain_avoids_name_collision() {
-        let mut s = state();
-        // Add a domain named "domain-1" manually
-        s.rows.push(DomainRow {
-            spec: DomainSpec {
-                name: "domain-1".into(),
-                description: "".into(),
-                writable: vec!["x/**".into()],
-                forbidden_write: vec![],
-                depends_on: vec![],
-                planned_work: vec![],
-                agents: 1,
-                model: None,
-            },
-            include: true,
-        });
-        s.add_domain();
-        // Should skip "domain-1" and use "domain-2"
-        let last = s.rows.last().unwrap();
-        assert_eq!(last.spec.name, "domain-2");
-    }
-
-    #[test]
-    fn remove_domain_deletes_and_prunes_deps() {
-        let mut s = state();
-        // engine is at index 0; ui and api depend on it
-        s.cursor = 0;
-        s.remove_domain();
-        // engine should be gone
-        assert!(!s.rows.iter().any(|r| r.spec.name == "engine"));
-        // ui and api should have empty depends_on (pruned)
-        assert!(s.rows.iter().all(|r| r.spec.depends_on.is_empty()));
-        assert!(s.dirty);
-    }
-
-    #[test]
-    fn remove_domain_adjusts_cursor() {
-        let mut s = state();
-        s.cursor = 2; // api (last)
-        s.remove_domain();
-        // cursor should clamp to last remaining row
-        assert_eq!(s.cursor, 1);
-    }
-
-    #[test]
-    fn add_work_appends_to_focused_domain() {
-        let mut s = state();
-        s.cursor = 0; // engine has 1 work item
-        let initial_work = s.rows[0].spec.planned_work.len();
-        s.add_work();
-        assert_eq!(s.rows[0].spec.planned_work.len(), initial_work + 1);
-        assert_eq!(
-            s.rows[0].spec.planned_work.last().unwrap().subject,
-            "new task"
-        );
-        assert!(s.dirty);
-    }
-
-    #[test]
-    fn remove_work_deletes_at_index() {
-        let mut s = state();
-        s.cursor = 0;
-        s.add_work(); // now 2 items
-        let len_before = s.rows[0].spec.planned_work.len();
-        s.remove_work(0);
-        assert_eq!(s.rows[0].spec.planned_work.len(), len_before - 1);
-        assert!(s.dirty);
-    }
-
-    #[test]
-    fn remove_work_out_of_bounds_is_noop() {
-        let mut s = state();
-        s.cursor = 0;
-        let len = s.rows[0].spec.planned_work.len();
-        s.remove_work(99);
-        assert_eq!(s.rows[0].spec.planned_work.len(), len);
-        assert!(!s.dirty);
     }
 }
