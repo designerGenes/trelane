@@ -185,8 +185,8 @@ fn cmd_launch(cli: Cli) -> Result<()> {
                     &task.agent,
                     "question",
                     "normal",
-                    &task.subject,
-                    &task.body,
+                    &task.work.subject,
+                    &task.work.body,
                     &None,
                     &None,
                     &[],
@@ -778,7 +778,11 @@ pub fn handle(cli: Cli) -> Result<()> {
                 .iter()
                 .filter(|s| s.name == format!("agent.run:{agent}"))
                 .max_by_key(|s| s.start_time_unix_nano);
-            let run_span_id = last_run.map(|s| s.span_id.clone()).unwrap_or_default();
+        Some(Command::Config { action }) => cmd_config(&action),
+        Some(Command::Work { action }) => {
+            let ctx = Context::open(cli.root.as_deref())?;
+            commands::cmd_work(&ctx, &action)
+        }
             tracer.record_rating(&rater, &agent, &run_span_id, rating, &rationale)?;
             println!("rating recorded: {rater} rated {agent} = {rating}/10");
             Ok(())
@@ -805,7 +809,8 @@ pub fn handle(cli: Cli) -> Result<()> {
 /// Comma-separated list of config keys the `config` command understands, for
 /// use in "unknown key" errors. Keep in sync with the match arms below.
 const KNOWN_CONFIG_KEYS: &str =
-    "squire.max_concurrent, squire.interval_s, squire.reply_timeout_s, claims.default_ttl_s";
+    "squire.max_concurrent, squire.interval_s, squire.reply_timeout_s, \
+     claims.default_ttl_s, workspace.mode";
 
 fn unknown_config_key(key: &str) -> TrelaneError {
     TrelaneError::msg(format!(
@@ -824,6 +829,7 @@ fn config_get(config: &Config, key: &str) -> Result<String> {
             .map(|v| v.to_string())
             .unwrap_or_else(|| "none".to_string()),
         "claims.default_ttl_s" => config.claims.default_ttl_s.to_string(),
+        "workspace.mode" => config.workspace.mode.as_str().to_string(),
         _ => return Err(unknown_config_key(key)),
     })
 }
@@ -856,6 +862,12 @@ fn config_set(config: &mut Config, key: &str, value: &str) -> Result<()> {
             };
         }
         "claims.default_ttl_s" => config.claims.default_ttl_s = parse_u64(value)?,
+        "workspace.mode" => {
+            config.workspace.mode = crate::models::WorkspaceMode::parse(value)
+                .ok_or_else(|| TrelaneError::msg(format!(
+                    "'{value}' is not a valid workspace mode (use 'shared' or 'worktree')"
+                )))?;
+        }
         _ => return Err(unknown_config_key(key)),
     }
     Ok(())
@@ -900,6 +912,11 @@ fn cmd_config_explain(key: &str) -> Result<()> {
         }
         "claims.default_ttl_s" => {
             "Default lease duration (in seconds) for a file claim when --ttl is not given."
+        }
+        "workspace.mode" => {
+            "Workspace mode for delegated changes. 'shared' (default) uses the main checkout.\n\
+             'worktree' creates an isolated git worktree per delegation so helpers work in\n\
+             a separate directory. Worktree mode requires git."
         }
         _ => return Err(unknown_config_key(key)),
     };

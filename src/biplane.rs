@@ -23,8 +23,8 @@ pub struct BiplanePlanAgent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BiplanePlanTask {
     pub agent: String,
-    pub subject: String,
-    pub body: String,
+    #[serde(flatten)]
+    pub work: PlannedWork,
 }
 
 /// Convert an AI-generated `BiplanePlan` into an editable `ProjectDescription`.
@@ -44,11 +44,7 @@ pub fn plan_to_description(
                 .initial_tasks
                 .iter()
                 .filter(|t| t.agent == a.name)
-                .map(|t| PlannedWork {
-                    subject: t.subject.clone(),
-                    body: t.body.clone(),
-                    priority: default_work_priority(),
-                })
+                .map(|t| t.work.clone())
                 .collect();
             DomainSpec {
                 name: a.name.clone(),
@@ -1076,6 +1072,27 @@ fn default_agent_count() -> usize {
     1
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkKind {
+    Implementation,
+    Investigation,
+}
+
+impl Default for WorkKind {
+    fn default() -> Self {
+        WorkKind::Implementation
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CollisionRisk {
+    Low,
+    Medium,
+    High,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlannedWork {
     pub subject: String,
@@ -1083,10 +1100,54 @@ pub struct PlannedWork {
     pub body: String,
     #[serde(default = "default_work_priority")]
     pub priority: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    #[serde(default = "default_desired_parallelism")]
+    pub desired_parallelism: u32,
+    #[serde(default)]
+    pub assist_policy: crate::models::AssistPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subtasks: Vec<PlannedWork>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collision_risk: Option<CollisionRisk>,
+    #[serde(default)]
+    pub work_kind: WorkKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_scope: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptance: Vec<String>,
 }
 
 fn default_work_priority() -> String {
     "normal".to_string()
+}
+
+fn default_desired_parallelism() -> u32 {
+    1
+}
+
+impl Default for PlannedWork {
+    fn default() -> Self {
+        PlannedWork {
+            subject: String::new(),
+            body: String::new(),
+            priority: default_work_priority(),
+            id: None,
+            depends_on: vec![],
+            desired_parallelism: default_desired_parallelism(),
+            assist_policy: crate::models::AssistPolicy::default(),
+            reviewer: None,
+            subtasks: vec![],
+            collision_risk: None,
+            work_kind: WorkKind::default(),
+            path_scope: vec![],
+            acceptance: vec![],
+        }
+    }
 }
 
 /// Read and validate a project-description JSON file.
@@ -1300,8 +1361,7 @@ pub fn plan_from_description(desc: &ProjectDescription, max_agents: usize) -> Re
         for w in &d.planned_work {
             initial_tasks.push(BiplanePlanTask {
                 agent: d.name.clone(),
-                subject: w.subject.clone(),
-                body: w.body.clone(),
+                work: w.clone(),
             });
         }
     }
@@ -1686,13 +1746,50 @@ pub fn scaffold_description_from_structure(root: &Path) -> ProjectDescription {
 
 fn normalize_urgency(priority: &str) -> String {
     match priority {
-        "low" | "normal" | "high" | "critical" => priority.to_string(),
+
+    // C1: record each planned item as a first-class task in the ledger, so the
+    // durable work record no longer lives only in the initial message. The
+    // message is still sent as the agent's notification, but now carries the
+    // task id. Re-applying a plan must not duplicate tasks: if the owner
+    // already has a task with the same subject, reuse it instead of creating a
+    // new one (mirrors the agent re-sync above).
+    let now = crate::crypto::now_iso();
         _ => "normal".to_string(),
     }
 }
 
 /// Register the plan's agents in a live session and queue their planned work as
-/// initial questions from `user`. Existing agents are left untouched. Returns
+            .unwrap_or_else(|| "normal".to_string());
+
+        let existing = crate::store::list_tasks_for_owner(&ctx.conn, &t.agent)?;
+        let task_id = if let Some(found) = existing.iter().find(|et| et.subject == t.subject) {
+            found.id.clone()
+        } else {
+            let path_scope = spec
+                .get(t.agent.as_str())
+                .map(|d| d.writable.clone())
+                .unwrap_or_default();
+            let task = crate::models::Task {
+                id: crate::crypto::new_id("task"),
+                owner_agent: t.agent.clone(),
+                domain: t.agent.clone(),
+                parent_task: None,
+                subject: t.subject.clone(),
+                body: t.body.clone(),
+                state: crate::models::TaskState::Ready,
+                priority: urgency.clone(),
+                assist_policy: crate::models::AssistPolicy::Open,
+                desired_parallelism: 1,
+                path_scope,
+                acceptance: vec![],
+                blocked_by: vec![],
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            };
+            crate::store::insert_task(&ctx.conn, &task)?;
+            task.id
+        };
+
 /// the number of agents newly registered.
 fn apply_plan_to_session(
     ctx: &crate::Context,
@@ -1702,7 +1799,7 @@ fn apply_plan_to_session(
     let existing = crate::store::list_agents(&ctx.conn)?;
     let spec: std::collections::HashMap<&str, &DomainSpec> =
         desc.domains.iter().map(|d| (d.name.as_str(), d)).collect();
-
+            &Some(task_id),
     let mut added = 0;
     let mut resynced = 0;
     for a in &plan.agents {
@@ -1760,48 +1857,102 @@ fn apply_plan_to_session(
         );
     }
 
-    // C1: record each planned item as a first-class task in the ledger, so the
-    // durable work record no longer lives only in the initial message. The
-    // message is still sent as the agent's notification, but now carries the
-    // task id. Re-applying a plan must not duplicate tasks: if the owner
-    // already has a task with the same subject, reuse it instead of creating a
-    // new one (mirrors the agent re-sync above).
+    // C1/C6: record each planned item as a first-class task in the ledger.
+    // Re-applying a plan must not duplicate tasks: if the owner already has a
+    // task with the same subject, reuse it. Explicit IDs (when provided) are
+    // used as stable task IDs.
     let now = crate::crypto::now_iso();
-    for t in &plan.initial_tasks {
-        let urgency = spec
-            .get(t.agent.as_str())
-            .and_then(|d| d.planned_work.iter().find(|w| w.subject == t.subject))
-            .map(|w| normalize_urgency(&w.priority))
-            .unwrap_or_else(|| "normal".to_string());
+    let mut id_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
+    for t in &plan.initial_tasks {
+        let urgency = normalize_urgency(&t.work.priority);
+        let path_scope = if !t.work.path_scope.is_empty() {
+            t.work.path_scope.clone()
+        } else {
+            spec.get(t.agent.as_str())
+                .map(|d| d.writable.clone())
+                .unwrap_or_default()
+        };
         let existing = crate::store::list_tasks_for_owner(&ctx.conn, &t.agent)?;
-        let task_id = if let Some(found) = existing.iter().find(|et| et.subject == t.subject) {
+        let task_id = if let Some(found) = existing.iter().find(|et| et.subject == t.work.subject) {
             found.id.clone()
         } else {
-            let path_scope = spec
-                .get(t.agent.as_str())
-                .map(|d| d.writable.clone())
-                .unwrap_or_default();
+            let id = t.work.id.clone().unwrap_or_else(|| crate::crypto::new_id("task"));
             let task = crate::models::Task {
-                id: crate::crypto::new_id("task"),
+                id: id.clone(),
                 owner_agent: t.agent.clone(),
                 domain: t.agent.clone(),
                 parent_task: None,
-                subject: t.subject.clone(),
-                body: t.body.clone(),
+                subject: t.work.subject.clone(),
+                body: t.work.body.clone(),
                 state: crate::models::TaskState::Ready,
                 priority: urgency.clone(),
-                assist_policy: crate::models::AssistPolicy::Open,
-                desired_parallelism: 1,
-                path_scope,
-                acceptance: vec![],
+                assist_policy: t.work.assist_policy,
+                desired_parallelism: t.work.desired_parallelism.max(1),
+                path_scope: path_scope.clone(),
+                acceptance: t.work.acceptance.clone(),
                 blocked_by: vec![],
                 created_at: now.clone(),
                 updated_at: now.clone(),
             };
             crate::store::insert_task(&ctx.conn, &task)?;
-            task.id
+            id
         };
+        if let Some(ref logical) = t.work.id {
+            id_map.insert(logical.clone(), task_id.clone());
+        }
+        id_map.insert(t.work.subject.clone(), task_id.clone());
+
+        // Create subtasks with parent_task set.
+        for sub in &t.work.subtasks {
+            let sub_existing = crate::store::list_tasks_for_owner(&ctx.conn, &t.agent)?;
+            if sub_existing.iter().any(|et| et.subject == sub.subject) {
+                continue;
+            }
+            let sub_id = sub.id.clone().unwrap_or_else(|| crate::crypto::new_id("task"));
+            let sub_path = if !sub.path_scope.is_empty() {
+                sub.path_scope.clone()
+            } else {
+                path_scope.clone()
+            };
+            let sub_task = crate::models::Task {
+                id: sub_id.clone(),
+                owner_agent: t.agent.clone(),
+                domain: t.agent.clone(),
+                parent_task: Some(task_id.clone()),
+                subject: sub.subject.clone(),
+                body: sub.body.clone(),
+                state: crate::models::TaskState::Ready,
+                priority: normalize_urgency(&sub.priority),
+                assist_policy: sub.assist_policy,
+                desired_parallelism: sub.desired_parallelism.max(1),
+                path_scope: sub_path,
+                acceptance: sub.acceptance.clone(),
+                blocked_by: vec![],
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            };
+            crate::store::insert_task(&ctx.conn, &sub_task)?;
+            if let Some(ref logical) = sub.id {
+                id_map.insert(logical.clone(), sub_id.clone());
+            }
+        }
+
+        // Create reviewer assignment if designated.
+        if let Some(ref reviewer) = t.work.reviewer {
+            if crate::store::agent_exists(&ctx.conn, reviewer)? {
+                crate::store::upsert_assignment(&ctx.conn, &crate::models::TaskAssignment {
+                    task_id: task_id.clone(),
+                    agent: reviewer.clone(),
+                    role: crate::models::TaskRole::Reviewer,
+                    state: "assigned".to_string(),
+                    offer_id: None,
+                    delegation_id: None,
+                    started_at: None,
+                    completed_at: None,
+                })?;
+            }
+        }
 
         crate::commands::cmd_send(
             ctx,
@@ -1809,13 +1960,34 @@ fn apply_plan_to_session(
             &t.agent,
             "question",
             &urgency,
-            &t.subject,
-            &t.body,
+            &t.work.subject,
+            &t.work.body,
             &None,
             &Some(task_id),
             &[],
         )?;
     }
+
+    // Second pass: resolve depends_on to real task IDs and update blocked_by.
+    for t in &plan.initial_tasks {
+        if t.work.depends_on.is_empty() {
+            continue;
+        }
+        let existing = crate::store::list_tasks_for_owner(&ctx.conn, &t.agent)?;
+        if let Some(found) = existing.iter().find(|et| et.subject == t.work.subject) {
+            let resolved: Vec<String> = t.work.depends_on
+                .iter()
+                .filter_map(|dep| id_map.get(dep).cloned())
+                .collect();
+            if resolved != found.blocked_by {
+                let mut updated = found.clone();
+                updated.blocked_by = resolved;
+                updated.updated_at = crate::crypto::now_iso();
+                crate::store::update_task(&ctx.conn, &updated)?;
+            }
+        }
+    }
+
     Ok(added)
 }
 
@@ -1870,6 +2042,104 @@ pub fn cmd_biplane_interactive(
             } else {
                 "scaffolded from source layout"
             }
+        assert_eq!(solo.launcher_agent.as_deref(), Some("fallback-model"));
+    }
+
+    #[test]
+    fn apply_plan_records_planned_work_as_ledger_tasks() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = migrated_ctx(&temp);
+        let mut backend = plan_domain("backend", Some("opencode/x"));
+        backend.planned_work = vec![
+            PlannedWork {
+                subject: "wire up the API".to_string(),
+                body: "add the /v1 routes".to_string(),
+                priority: "high".to_string(),
+            },
+            PlannedWork {
+                subject: "add integration tests".to_string(),
+                body: String::new(),
+                priority: "normal".to_string(),
+            },
+        ];
+        let desc = ProjectDescription {
+            name: "demo".into(),
+            description: String::new(),
+            domains: vec![backend],
+            max_agents: Some(1),
+            default_model: None,
+        };
+        let plan = plan_from_description(&desc, 1).unwrap();
+        apply_plan_to_session(&ctx, &desc, &plan).unwrap();
+
+        let tasks = crate::store::list_tasks_for_owner(&ctx.conn, "backend").unwrap();
+        assert_eq!(tasks.len(), 2, "each planned item becomes a ledger task");
+        let api = tasks
+            .iter()
+            .find(|t| t.subject == "wire up the API")
+            .expect("api task present");
+        assert_eq!(api.state, crate::models::TaskState::Ready);
+        assert_eq!(api.priority, "high");
+        assert_eq!(api.owner_agent, "backend");
+        assert_eq!(api.path_scope, vec!["src/backend/**".to_string()]);
+
+        // Re-applying the same plan must not duplicate tasks.
+        apply_plan_to_session(&ctx, &desc, &plan).unwrap();
+        let tasks2 = crate::store::list_tasks_for_owner(&ctx.conn, "backend").unwrap();
+        assert_eq!(
+            tasks2.len(),
+            2,
+            "re-apply reuses existing tasks by subject, no duplicates"
+        );
+        println!("  Proposed domains: {}", base.domains.len());
+        println!();
+    }
+
+    #[test]
+    fn apply_plan_records_planned_work_as_ledger_tasks() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = migrated_ctx(&temp);
+        let mut backend = plan_domain("backend", Some("opencode/x"));
+        backend.planned_work = vec![
+            PlannedWork {
+                subject: "wire up the API".to_string(),
+                body: "add the /v1 routes".to_string(),
+                priority: "high".to_string(),
+                ..Default::default()
+            },
+            PlannedWork {
+                subject: "add integration tests".to_string(),
+                ..Default::default()
+            },
+        ];
+        let desc = ProjectDescription {
+            name: "demo".into(),
+            description: String::new(),
+            domains: vec![backend],
+            max_agents: Some(1),
+            default_model: None,
+        };
+        let plan = plan_from_description(&desc, 1).unwrap();
+        apply_plan_to_session(&ctx, &desc, &plan).unwrap();
+
+        let tasks = crate::store::list_tasks_for_owner(&ctx.conn, "backend").unwrap();
+        assert_eq!(tasks.len(), 2, "each planned item becomes a ledger task");
+        let api = tasks
+            .iter()
+            .find(|t| t.subject == "wire up the API")
+            .expect("api task present");
+        assert_eq!(api.state, crate::models::TaskState::Ready);
+        assert_eq!(api.priority, "high");
+        assert_eq!(api.owner_agent, "backend");
+        assert_eq!(api.path_scope, vec!["src/backend/**".to_string()]);
+
+        // Re-applying the same plan must not duplicate tasks.
+        apply_plan_to_session(&ctx, &desc, &plan).unwrap();
+        let tasks2 = crate::store::list_tasks_for_owner(&ctx.conn, "backend").unwrap();
+        assert_eq!(
+            tasks2.len(),
+            2,
+            "re-apply reuses existing tasks by subject, no duplicates"
         );
         println!("  Proposed domains: {}", base.domains.len());
         println!();
@@ -2084,11 +2354,11 @@ mod tests {
                 subject: "wire up the API".to_string(),
                 body: "add the /v1 routes".to_string(),
                 priority: "high".to_string(),
+                ..Default::default()
             },
             PlannedWork {
                 subject: "add integration tests".to_string(),
-                body: String::new(),
-                priority: "normal".to_string(),
+                ..Default::default()
             },
         ];
         let desc = ProjectDescription {
@@ -2234,8 +2504,7 @@ mod tests {
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             planned_work: vec![PlannedWork {
                 subject: format!("build {name}"),
-                body: String::new(),
-                priority: "normal".to_string(),
+                ..Default::default()
             }],
             agents,
             model: None,
@@ -2472,6 +2741,145 @@ mod tests {
         let existing = vec!["alpha".to_string()];
         assert!(new_agents_since(&existing, &plan).is_empty());
     }
+
+    // ------------------------------------------------------------- C6 tests
+
+    #[test]
+    fn legacy_planned_work_defaults() {
+        let json = r#"{"subject":"test","body":"hello","priority":"high"}"#;
+        let w: PlannedWork = serde_json::from_str(json).unwrap();
+        assert_eq!(w.subject, "test");
+        assert_eq!(w.body, "hello");
+        assert_eq!(w.priority, "high");
+        assert!(w.id.is_none());
+        assert!(w.depends_on.is_empty());
+        assert_eq!(w.desired_parallelism, 1);
+        assert_eq!(w.assist_policy, crate::models::AssistPolicy::Open);
+        assert!(w.reviewer.is_none());
+        assert!(w.subtasks.is_empty());
+        assert!(w.collision_risk.is_none());
+        assert_eq!(w.work_kind, WorkKind::Implementation);
+        assert!(w.path_scope.is_empty());
+        assert!(w.acceptance.is_empty());
+    }
+
+    #[test]
+    fn enriched_planned_work_round_trips() {
+        let w = PlannedWork {
+            subject: "build API".to_string(),
+            body: "add routes".to_string(),
+            priority: "high".to_string(),
+            id: Some("task-api".to_string()),
+            depends_on: vec!["task-setup".to_string()],
+            desired_parallelism: 2,
+            assist_policy: crate::models::AssistPolicy::Open,
+            reviewer: Some("integration".to_string()),
+            subtasks: vec![PlannedWork {
+                subject: "add tests".to_string(),
+                ..Default::default()
+            }],
+            collision_risk: Some(CollisionRisk::Medium),
+            work_kind: WorkKind::Implementation,
+            path_scope: vec!["src/api/**".to_string()],
+            acceptance: vec!["tests pass".to_string()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&w).unwrap();
+        let parsed: PlannedWork = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.subject, w.subject);
+        assert_eq!(parsed.id, w.id);
+        assert_eq!(parsed.depends_on, w.depends_on);
+        assert_eq!(parsed.desired_parallelism, w.desired_parallelism);
+        assert_eq!(parsed.reviewer, w.reviewer);
+        assert_eq!(parsed.collision_risk, w.collision_risk);
+        assert_eq!(parsed.work_kind, w.work_kind);
+        assert_eq!(parsed.path_scope, w.path_scope);
+        assert_eq!(parsed.acceptance, w.acceptance);
+        assert_eq!(parsed.subtasks.len(), 1);
+        assert_eq!(parsed.subtasks[0].subject, "add tests");
+    }
+
+    #[test]
+    fn apply_plan_creates_subtasks_with_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = migrated_ctx(&temp);
+        let mut domain = plan_domain("backend", None);
+        domain.planned_work = vec![PlannedWork {
+            subject: "build API".to_string(),
+            subtasks: vec![PlannedWork {
+                subject: "add API tests".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        let desc = ProjectDescription {
+            name: "demo".into(),
+            description: String::new(),
+            domains: vec![domain],
+            max_agents: Some(1),
+            default_model: None,
+        };
+        let plan = plan_from_description(&desc, 1).unwrap();
+        apply_plan_to_session(&ctx, &desc, &plan).unwrap();
+        let tasks = crate::store::list_tasks_for_owner(&ctx.conn, "backend").unwrap();
+        assert_eq!(tasks.len(), 2, "parent and child task");
+        let child = tasks.iter().find(|t| t.subject == "add API tests").unwrap();
+        assert!(child.parent_task.is_some(), "child must have parent_task set");
+        let parent = tasks.iter().find(|t| t.subject == "build API").unwrap();
+        assert_eq!(child.parent_task.as_ref().unwrap(), &parent.id);
+    }
+
+    #[test]
+    fn apply_plan_creates_reviewer_assignment() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = migrated_ctx(&temp);
+        let mut domain = plan_domain("backend", None);
+        domain.planned_work = vec![PlannedWork {
+            subject: "build API".to_string(),
+            reviewer: Some("backend".to_string()),
+            ..Default::default()
+        }];
+        let desc = ProjectDescription {
+            name: "demo".into(),
+            description: String::new(),
+            domains: vec![domain],
+            max_agents: Some(1),
+            default_model: None,
+        };
+        let plan = plan_from_description(&desc, 1).unwrap();
+        apply_plan_to_session(&ctx, &desc, &plan).unwrap();
+        let tasks = crate::store::list_tasks_for_owner(&ctx.conn, "backend").unwrap();
+        let task = tasks.iter().find(|t| t.subject == "build API").unwrap();
+        let assignments = crate::store::list_assignments_for_task(&ctx.conn, &task.id).unwrap();
+        assert!(assignments.iter().any(|a| a.role == crate::models::TaskRole::Reviewer),
+            "reviewer assignment must be created");
+    }
+
+    #[test]
+    fn apply_plan_preserves_parallelism_and_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = migrated_ctx(&temp);
+        let mut domain = plan_domain("backend", None);
+        domain.planned_work = vec![PlannedWork {
+            subject: "build API".to_string(),
+            desired_parallelism: 3,
+            assist_policy: crate::models::AssistPolicy::Solo,
+            ..Default::default()
+        }];
+        let desc = ProjectDescription {
+            name: "demo".into(),
+            description: String::new(),
+            domains: vec![domain],
+            max_agents: Some(1),
+            default_model: None,
+        };
+        let plan = plan_from_description(&desc, 1).unwrap();
+        apply_plan_to_session(&ctx, &desc, &plan).unwrap();
+        let tasks = crate::store::list_tasks_for_owner(&ctx.conn, "backend").unwrap();
+        let task = tasks.iter().find(|t| t.subject == "build API").unwrap();
+        assert_eq!(task.desired_parallelism, 3);
+        assert_eq!(task.assist_policy, crate::models::AssistPolicy::Solo);
+    }
 }
 
 /// Return only the plan agents whose name is NOT in `existing`, preserving
@@ -2536,8 +2944,8 @@ pub fn reanalyze_on_stop(ctx: &crate::Context) -> Result<()> {
                     &task.agent,
                     "question",
                     "normal",
-                    &task.subject,
-                    &task.body,
+                    &task.work.subject,
+                    &task.work.body,
                     &None,
                     &None,
                     &[],

@@ -164,7 +164,18 @@ CREATE INDEX IF NOT EXISTS idx_reviews_task ON task_reviews(task_id);
 "#;
 
 /// C2 assistance protocol. The links are additive so existing C1 ledgers are
-/// upgraded without rewriting claims or delegations.
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+    )?;
+    migrate(&conn)?;
+    Ok(conn)
+}
+
+/// Open an in-memory database with the full migrated schema. Intended for
+/// tests and ephemeral tooling; avoids tempfile lifetime concerns.
+pub fn open_in_memory() -> Result<Connection> {
+    let conn = Connection::open_in_memory()?;
 const SCHEMA_C2: &str = r#"
 ALTER TABLE claims ADD COLUMN delegation_id TEXT;
 ALTER TABLE delegations ADD COLUMN offer_message TEXT NOT NULL DEFAULT '';
@@ -181,7 +192,12 @@ CREATE TABLE IF NOT EXISTS task_submissions (
     summary           TEXT NOT NULL DEFAULT '',
     tests             TEXT NOT NULL DEFAULT '',
     changed_paths_json TEXT NOT NULL DEFAULT '[]',
-    message_id        TEXT NOT NULL,
+        // Fall through (instead of returning) so table-creating migrations
+        // that are NOT part of SCHEMA_V1 -- cycle_break_attempts (v5) and the
+        // C1 work ledger (v6) -- also run on a brand-new database. The v2..v4
+        // steps are ALTER TABLEs already covered by SCHEMA_V1, and are skipped
+        // because `version` is now 4.
+        version = 4;
     status            TEXT NOT NULL DEFAULT 'pending',
     created_at        TEXT NOT NULL,
     reviewed_at       TEXT
@@ -218,6 +234,57 @@ CREATE INDEX IF NOT EXISTS idx_discovery_cooldown
     ON assist_discovery_state(cooldown_until);
 CREATE INDEX IF NOT EXISTS idx_rejection_retry
     ON assist_rejection_backoff(helper_agent, owner_agent, retry_after);
+"#;
+
+/// C5 workspace isolation: per-delegation workspace records.
+const SCHEMA_C5: &str = r#"
+CREATE TABLE IF NOT EXISTS delegation_workspaces (
+    delegation_id TEXT PRIMARY KEY,
+    mode          TEXT NOT NULL DEFAULT 'shared',
+        conn.execute_batch("PRAGMA user_version = 5;")?;
+        version = 5;
+    }
+    if version < 6 {
+        // C1: durable work ledger (tasks, assignments, delegations, reviews).
+        conn.execute_batch(SCHEMA_C1)?;
+        conn.execute_batch("PRAGMA user_version = 6;")?;
+    branch        TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL
+);
+"#;
+
+/// C7 observability and completion: project roles, validation checks, and
+/// completion attestations so project completion is derived from durable
+/// work state, not silence.
+const SCHEMA_C7: &str = r#"
+CREATE TABLE IF NOT EXISTS project_roles (
+    agent         TEXT NOT NULL,
+    role          TEXT NOT NULL,
+    designated_by TEXT NOT NULL,
+    designated_at TEXT NOT NULL,
+    PRIMARY KEY(agent, role)
+);
+
+CREATE TABLE IF NOT EXISTS validation_checks (
+    name       TEXT PRIMARY KEY,
+    required   INTEGER NOT NULL DEFAULT 1,
+    status     TEXT NOT NULL DEFAULT 'pending',
+    revision   TEXT,
+    details    TEXT NOT NULL DEFAULT '',
+    checked_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS completion_attestations (
+    id                   TEXT PRIMARY KEY,
+    recorded_by          TEXT NOT NULL,
+    role                 TEXT NOT NULL,
+    snapshot_fingerprint TEXT NOT NULL,
+    note                 TEXT NOT NULL DEFAULT '',
+    recorded_at          TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_completion_recorded_at
+    ON completion_attestations(recorded_at);
 "#;
 
 pub fn open(db_path: &std::path::Path) -> Result<Connection> {
@@ -317,6 +384,18 @@ fn migrate(conn: &Connection) -> Result<()> {
         // C3: bounded assist-discovery anti-churn state.
         conn.execute_batch(SCHEMA_C3)?;
         conn.execute_batch("PRAGMA user_version = 8;")?;
+        version = 8;
+    }
+    if version < 9 {
+        // C5: workspace isolation records.
+        conn.execute_batch(SCHEMA_C5)?;
+        conn.execute_batch("PRAGMA user_version = 9;")?;
+        version = 9;
+    }
+    if version < 10 {
+        // C7: project completion and validation state.
+        conn.execute_batch(SCHEMA_C7)?;
+        conn.execute_batch("PRAGMA user_version = 10;")?;
     }
     Ok(())
 }
@@ -342,7 +421,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 10);
         assert!(has_column(&conn, "claims", "delegation_id"));
         assert!(has_column(&conn, "delegations", "offer_message"));
         assert!(has_column(&conn, "task_submissions", "message_id"));
@@ -356,6 +435,10 @@ mod tests {
             "assist_rejection_backoff",
             "rejection_count"
         ));
+        assert!(has_column(&conn, "delegation_workspaces", "mode"));
+        assert!(has_column(&conn, "completion_attestations", "snapshot_fingerprint"));
+        assert!(has_column(&conn, "validation_checks", "status"));
+        assert!(has_column(&conn, "project_roles", "role"));
     }
 
     #[test]
@@ -374,7 +457,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 10);
     }
 
     #[test]
@@ -391,12 +474,14 @@ mod tests {
             "assist_rejection_backoff",
             "retry_after"
         ));
+        assert!(has_column(&conn, "delegation_workspaces", "mode"));
+        assert!(has_column(&conn, "completion_attestations", "recorded_by"));
         let version: u32 = conn
             .query_row("SELECT user_version FROM pragma_user_version", [], |r| {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 10);
     }
 
     #[test]

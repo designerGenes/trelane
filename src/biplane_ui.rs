@@ -433,8 +433,7 @@ mod tests {
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             planned_work: vec![PlannedWork {
                 subject: format!("build {name}"),
-                body: String::new(),
-                priority: "normal".to_string(),
+                ..Default::default()
             }],
             agents,
             model: None,

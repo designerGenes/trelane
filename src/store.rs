@@ -1,8 +1,11 @@
 use crate::error::{Result, TrelaneError};
 use crate::models::{
-    AssistDiscoveryState, AssistPolicy, Delegation, DelegationStatus,
-    Domain, LaunchTarget, Lease, Message, ParkedTask, ReviewDecision, RunningLock, Task,
-    TaskAssignment, TaskReview, TaskRole, TaskState, TaskSubmission, Violation,
+    AssistPolicy, Delegation, DelegationStatus, Domain, LaunchTarget, Lease, Message, ParkedTask,
+    ReviewDecision, RunningLock, Task, TaskAssignment, TaskReview, TaskRole, TaskState, Violation,
+};
+    AssistDiscoveryState, AssistPolicy, CompletionBlocker, Delegation, DelegationStatus,
+    Domain, LaunchTarget, Lease, Message, ParkedTask, ProjectCompletionReport, ReviewDecision,
+    RunningLock, Task, TaskAssignment, TaskReview, TaskRole, TaskState, TaskSubmission, Violation,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::HashMap;
@@ -652,7 +655,507 @@ pub struct CycleBreakAttempt {
     pub designated: String,
     pub attempts: i64,
     pub last_attempt_at: Option<String>,
-    pub escalated: bool,
+}
+
+// --------------------------------------------------------------------- tasks
+//
+// C1 work-ledger persistence. list/get helpers reconstruct typed models from
+// the JSON-encoded columns; enum columns are validated on read and fall back
+// to a safe default rather than erroring, so a hand-edited or
+// forward-versioned DB can never panic the scheduler.
+
+const TASK_COLUMNS: &str =
+    "id, owner_agent, domain, parent_task, subject, body, state, priority, \
+     assist_policy, desired_parallelism, path_scope_json, acceptance_json, \
+     blocked_by_json, created_at, updated_at";
+
+fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<Task> {
+    let state_s: String = row.get("state")?;
+    let policy_s: String = row.get("assist_policy")?;
+    let path_scope: Vec<String> =
+        serde_json::from_str(&row.get::<_, String>("path_scope_json")?).unwrap_or_default();
+    let acceptance: Vec<String> =
+        serde_json::from_str(&row.get::<_, String>("acceptance_json")?).unwrap_or_default();
+    let blocked_by: Vec<String> =
+        serde_json::from_str(&row.get::<_, String>("blocked_by_json")?).unwrap_or_default();
+    Ok(Task {
+        id: row.get("id")?,
+        owner_agent: row.get("owner_agent")?,
+        domain: row.get("domain")?,
+        parent_task: row.get("parent_task")?,
+        subject: row.get("subject")?,
+        body: row.get("body")?,
+        state: TaskState::parse(&state_s).unwrap_or(TaskState::Draft),
+        priority: row.get("priority")?,
+        assist_policy: AssistPolicy::parse(&policy_s).unwrap_or(AssistPolicy::Open),
+        desired_parallelism: row.get::<_, i64>("desired_parallelism")?.max(1) as u32,
+        path_scope,
+        acceptance,
+        blocked_by,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
+pub fn insert_task(conn: &Connection, task: &Task) -> Result<()> {
+    conn.execute(
+        "INSERT INTO tasks
+            (id, owner_agent, domain, parent_task, subject, body, state, priority,
+             assist_policy, desired_parallelism, path_scope_json, acceptance_json,
+             blocked_by_json, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        params![
+            task.id,
+            task.owner_agent,
+            task.domain,
+            task.parent_task,
+            task.subject,
+            task.body,
+            task.state.as_str(),
+            task.priority,
+            task.assist_policy.as_str(),
+            task.desired_parallelism as i64,
+            serde_json::to_string(&task.path_scope)?,
+            serde_json::to_string(&task.acceptance)?,
+            serde_json::to_string(&task.blocked_by)?,
+            task.created_at,
+            task.updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_task(conn: &Connection, id: &str) -> Result<Option<Task>> {
+    let sql = format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1");
+    let result = conn.query_row(&sql, params![id], row_to_task).optional()?;
+    Ok(result)
+}
+
+pub fn list_tasks(conn: &Connection) -> Result<Vec<Task>> {
+    let sql = format!("SELECT {TASK_COLUMNS} FROM tasks ORDER BY created_at, id");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], row_to_task)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn list_tasks_for_owner(conn: &Connection, owner: &str) -> Result<Vec<Task>> {
+    let sql =
+        format!("SELECT {TASK_COLUMNS} FROM tasks WHERE owner_agent = ?1 ORDER BY created_at, id");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![owner], row_to_task)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn list_tasks_in_state(conn: &Connection, state: TaskState) -> Result<Vec<Task>> {
+    let sql = format!("SELECT {TASK_COLUMNS} FROM tasks WHERE state = ?1 ORDER BY created_at, id");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![state.as_str()], row_to_task)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Set of task ids that have reached the `done` state -- used to evaluate
+/// dependency satisfaction for readiness.
+pub fn done_task_ids(conn: &Connection) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT id FROM tasks WHERE state = 'done'")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut out = std::collections::HashSet::new();
+    for row in rows {
+        out.insert(row?);
+    }
+    Ok(out)
+}
+
+/// Update a task's state and bump `updated_at`. Returns true if a row changed.
+pub fn set_task_state(
+    conn: &Connection,
+    id: &str,
+    state: TaskState,
+    updated_at: &str,
+) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE tasks SET state = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, state.as_str(), updated_at],
+    )?;
+    Ok(n > 0)
+}
+
+/// Replace the full mutable body of a task (everything except id/created_at).
+pub fn update_task(conn: &Connection, task: &Task) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE tasks SET
+            owner_agent = ?2, domain = ?3, parent_task = ?4, subject = ?5, body = ?6,
+            state = ?7, priority = ?8, assist_policy = ?9, desired_parallelism = ?10,
+            path_scope_json = ?11, acceptance_json = ?12, blocked_by_json = ?13,
+            updated_at = ?14
+         WHERE id = ?1",
+        params![
+            task.id,
+            task.owner_agent,
+            task.domain,
+            task.parent_task,
+            task.subject,
+            task.body,
+            task.state.as_str(),
+            task.priority,
+            task.assist_policy.as_str(),
+            task.desired_parallelism as i64,
+            serde_json::to_string(&task.path_scope)?,
+            serde_json::to_string(&task.acceptance)?,
+            serde_json::to_string(&task.blocked_by)?,
+            task.updated_at,
+        ],
+    )?;
+    Ok(n > 0)
+}
+
+// --------------------------------------------------------------- assignments
+
+pub fn upsert_assignment(conn: &Connection, a: &TaskAssignment) -> Result<()> {
+    conn.execute(
+        "INSERT INTO task_assignments
+            (task_id, agent, role, state, offer_id, delegation_id, started_at, completed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(task_id, agent, role) DO UPDATE SET
+            state = excluded.state,
+            offer_id = excluded.offer_id,
+            delegation_id = excluded.delegation_id,
+            started_at = excluded.started_at,
+            completed_at = excluded.completed_at",
+        params![
+            a.task_id,
+            a.agent,
+            a.role.as_str(),
+            a.state,
+            a.offer_id,
+            a.delegation_id,
+            a.started_at,
+            a.completed_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn row_to_assignment(row: &rusqlite::Row) -> rusqlite::Result<TaskAssignment> {
+    let role_s: String = row.get("role")?;
+    Ok(TaskAssignment {
+        task_id: row.get("task_id")?,
+        agent: row.get("agent")?,
+        role: TaskRole::parse(&role_s).unwrap_or(TaskRole::Helper),
+        state: row.get("state")?,
+        offer_id: row.get("offer_id")?,
+        delegation_id: row.get("delegation_id")?,
+        started_at: row.get("started_at")?,
+        completed_at: row.get("completed_at")?,
+    })
+}
+
+const ASSIGNMENT_COLUMNS: &str =
+    "task_id, agent, role, state, offer_id, delegation_id, started_at, completed_at";
+
+pub fn list_assignments_for_task(conn: &Connection, task_id: &str) -> Result<Vec<TaskAssignment>> {
+    let sql = format!(
+        "SELECT {ASSIGNMENT_COLUMNS} FROM task_assignments WHERE task_id = ?1 ORDER BY role, agent"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![task_id], row_to_assignment)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn list_assignments_for_agent(conn: &Connection, agent: &str) -> Result<Vec<TaskAssignment>> {
+    let sql = format!(
+        "SELECT {ASSIGNMENT_COLUMNS} FROM task_assignments WHERE agent = ?1 ORDER BY task_id, role"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![agent], row_to_assignment)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------- delegations
+
+const DELEGATION_COLUMNS: &str =
+    "id, task_id, owner_agent, helper_agent, scope_json, allowed_ops_json, \
+     constraints_json, base_revision, grant_message, issued_at, expires_at, status";
+
+pub fn insert_delegation(conn: &Connection, d: &Delegation) -> Result<()> {
+    conn.execute(
+        "INSERT INTO delegations
+            (id, task_id, owner_agent, helper_agent, scope_json, allowed_ops_json,
+             constraints_json, base_revision, grant_message, issued_at, expires_at, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            d.id,
+            d.task_id,
+            d.owner_agent,
+            d.helper_agent,
+            serde_json::to_string(&d.scope)?,
+            serde_json::to_string(&d.allowed_ops)?,
+            d.constraints_json,
+            d.base_revision,
+            d.grant_message,
+            d.issued_at,
+            d.expires_at,
+            d.status.as_str(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn row_to_delegation(row: &rusqlite::Row) -> rusqlite::Result<Delegation> {
+    let status_s: String = row.get("status")?;
+    let scope: Vec<String> =
+        serde_json::from_str(&row.get::<_, String>("scope_json")?).unwrap_or_default();
+    let allowed_ops: Vec<String> =
+        serde_json::from_str(&row.get::<_, String>("allowed_ops_json")?).unwrap_or_default();
+    Ok(Delegation {
+        id: row.get("id")?,
+        task_id: row.get("task_id")?,
+        owner_agent: row.get("owner_agent")?,
+        helper_agent: row.get("helper_agent")?,
+        scope,
+        allowed_ops,
+        constraints_json: row.get("constraints_json")?,
+        base_revision: row.get("base_revision")?,
+        grant_message: row.get("grant_message")?,
+        issued_at: row.get("issued_at")?,
+        expires_at: row.get("expires_at")?,
+        status: DelegationStatus::parse(&status_s).unwrap_or(DelegationStatus::Offered),
+    })
+}
+
+pub fn get_delegation(conn: &Connection, id: &str) -> Result<Option<Delegation>> {
+    let sql = format!("SELECT {DELEGATION_COLUMNS} FROM delegations WHERE id = ?1");
+    let result = conn
+        .query_row(&sql, params![id], row_to_delegation)
+        .optional()?;
+    Ok(result)
+}
+
+pub fn list_delegations_for_task(conn: &Connection, task_id: &str) -> Result<Vec<Delegation>> {
+    let sql = format!(
+        "SELECT {DELEGATION_COLUMNS} FROM delegations WHERE task_id = ?1 ORDER BY issued_at, id"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![task_id], row_to_delegation)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn set_delegation_status(
+    conn: &Connection,
+    id: &str,
+    status: DelegationStatus,
+) -> Result<bool> {
+    let n = conn.execute(
+        "UPDATE delegations SET status = ?2 WHERE id = ?1",
+        params![id, status.as_str()],
+    )?;
+    Ok(n > 0)
+}
+
+// --------------------------------------------------------------- task reviews
+
+pub fn insert_review(conn: &Connection, rv: &TaskReview) -> Result<()> {
+    conn.execute(
+        "INSERT INTO task_reviews
+            (id, task_id, delegation_id, reviewer_agent, submission_ref, decision, notes, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            rv.id,
+            rv.task_id,
+            rv.delegation_id,
+            rv.reviewer_agent,
+            rv.submission_ref,
+            rv.decision.as_str(),
+            rv.notes,
+            rv.created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn row_to_review(row: &rusqlite::Row) -> rusqlite::Result<TaskReview> {
+    let decision_s: String = row.get("decision")?;
+    Ok(TaskReview {
+        id: row.get("id")?,
+        task_id: row.get("task_id")?,
+        delegation_id: row.get("delegation_id")?,
+        reviewer_agent: row.get("reviewer_agent")?,
+        submission_ref: row.get("submission_ref")?,
+        decision: ReviewDecision::parse(&decision_s).unwrap_or(ReviewDecision::RequestChanges),
+        notes: row.get("notes")?,
+        created_at: row.get("created_at")?,
+    })
+}
+
+pub fn list_reviews_for_task(conn: &Connection, task_id: &str) -> Result<Vec<TaskReview>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, task_id, delegation_id, reviewer_agent, submission_ref, decision, notes, created_at
+         FROM task_reviews WHERE task_id = ?1 ORDER BY created_at, id",
+    )?;
+    let rows = stmt.query_map(params![task_id], row_to_review)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod ledger_tests {
+    use super::*;
+
+    fn conn() -> Connection {
+        crate::db::open_in_memory().unwrap()
+    }
+
+    fn sample_task(id: &str) -> Task {
+        Task {
+            id: id.to_string(),
+            owner_agent: "alpha".to_string(),
+            domain: "alpha".to_string(),
+            parent_task: None,
+            subject: "do the thing".to_string(),
+            body: "details".to_string(),
+            state: TaskState::Ready,
+            priority: "high".to_string(),
+            assist_policy: AssistPolicy::Open,
+            desired_parallelism: 2,
+            path_scope: vec!["src/alpha/**".to_string()],
+            acceptance: vec!["tests pass".to_string()],
+            blocked_by: vec![],
+            created_at: "2026-07-11T00:00:00Z".to_string(),
+            updated_at: "2026-07-11T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn task_round_trips_all_fields() {
+        let c = conn();
+        insert_task(&c, &sample_task("task_1")).unwrap();
+        let got = get_task(&c, "task_1").unwrap().expect("task should exist");
+        assert_eq!(got.owner_agent, "alpha");
+        assert_eq!(got.state, TaskState::Ready);
+        assert_eq!(got.assist_policy, AssistPolicy::Open);
+        assert_eq!(got.desired_parallelism, 2);
+        assert_eq!(got.path_scope, vec!["src/alpha/**".to_string()]);
+        assert_eq!(got.acceptance, vec!["tests pass".to_string()]);
+        assert_eq!(got.priority, "high");
+    }
+
+    #[test]
+    fn set_task_state_transitions_and_lists() {
+        let c = conn();
+        insert_task(&c, &sample_task("task_1")).unwrap();
+        assert_eq!(list_tasks_in_state(&c, TaskState::Ready).unwrap().len(), 1);
+        assert!(set_task_state(&c, "task_1", TaskState::Done, "2026-07-11T01:00:00Z").unwrap());
+        assert_eq!(list_tasks_in_state(&c, TaskState::Ready).unwrap().len(), 0);
+        assert_eq!(list_tasks_in_state(&c, TaskState::Done).unwrap().len(), 1);
+        assert!(done_task_ids(&c).unwrap().contains("task_1"));
+    }
+
+    #[test]
+    fn dependencies_gate_readiness() {
+        let c = conn();
+        let mut child = sample_task("child");
+        child.blocked_by = vec!["parent".to_string()];
+        insert_task(&c, &sample_task("parent")).unwrap();
+        insert_task(&c, &child).unwrap();
+        let done = done_task_ids(&c).unwrap();
+        assert!(!get_task(&c, "child").unwrap().unwrap().deps_satisfied(&done));
+        set_task_state(&c, "parent", TaskState::Done, "x").unwrap();
+        let done = done_task_ids(&c).unwrap();
+        assert!(get_task(&c, "child").unwrap().unwrap().deps_satisfied(&done));
+    }
+
+    #[test]
+    fn assignment_upsert_is_idempotent_per_role() {
+        let c = conn();
+        insert_task(&c, &sample_task("task_1")).unwrap();
+        let mut a = TaskAssignment {
+            task_id: "task_1".to_string(),
+            agent: "beta".to_string(),
+            role: TaskRole::Helper,
+            state: "active".to_string(),
+            offer_id: None,
+            delegation_id: None,
+            started_at: Some("t0".to_string()),
+            completed_at: None,
+        };
+        upsert_assignment(&c, &a).unwrap();
+        a.completed_at = Some("t1".to_string());
+        a.state = "completed".to_string();
+        upsert_assignment(&c, &a).unwrap();
+        let list = list_assignments_for_task(&c, "task_1").unwrap();
+        assert_eq!(list.len(), 1, "same (task,agent,role) upserts in place");
+        assert_eq!(list[0].state, "completed");
+        assert_eq!(list[0].completed_at.as_deref(), Some("t1"));
+    }
+
+    #[test]
+    fn delegation_and_review_round_trip() {
+        let c = conn();
+        insert_task(&c, &sample_task("task_1")).unwrap();
+        let d = Delegation {
+            id: "del_1".to_string(),
+            task_id: "task_1".to_string(),
+            owner_agent: "alpha".to_string(),
+            helper_agent: "beta".to_string(),
+            scope: vec!["src/alpha/util.rs".to_string()],
+            allowed_ops: vec!["edit".to_string()],
+            constraints_json: "{\"tests_only\":true}".to_string(),
+            base_revision: Some("abc123".to_string()),
+            grant_message: "help with util".to_string(),
+            issued_at: "t0".to_string(),
+            expires_at: Some("t9".to_string()),
+            status: DelegationStatus::Active,
+        };
+        insert_delegation(&c, &d).unwrap();
+        let got = get_delegation(&c, "del_1").unwrap().unwrap();
+        assert_eq!(got.helper_agent, "beta");
+        assert_eq!(got.scope, vec!["src/alpha/util.rs".to_string()]);
+        assert!(got.status.is_live());
+        assert!(set_delegation_status(&c, "del_1", DelegationStatus::Revoked).unwrap());
+        assert!(!get_delegation(&c, "del_1").unwrap().unwrap().status.is_live());
+
+        let rv = TaskReview {
+            id: "rev_1".to_string(),
+            task_id: "task_1".to_string(),
+            delegation_id: Some("del_1".to_string()),
+            reviewer_agent: "alpha".to_string(),
+            submission_ref: "patch:1".to_string(),
+            decision: ReviewDecision::Accept,
+            notes: "lgtm".to_string(),
+            created_at: "t2".to_string(),
+        };
+        insert_review(&c, &rv).unwrap();
+        let reviews = list_reviews_for_task(&c, "task_1").unwrap();
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].decision, ReviewDecision::Accept);
+    }
+}
 }
 
 /// List all cycle break attempt records (for diagnostics and cleanup).
@@ -1838,6 +2341,317 @@ pub fn rejection_backoff_active(
     }
 }
 
+// --------------------------------------------------- C5 workspace isolation
+
+pub fn insert_delegation_workspace(
+    conn: &Connection,
+    delegation_id: &str,
+    mode: &str,
+    path: &str,
+    branch: &str,
+    created_at: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO delegation_workspaces
+            (delegation_id, mode, path, branch, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![delegation_id, mode, path, branch, created_at],
+    )?;
+    Ok(())
+}
+
+pub fn get_delegation_workspace(
+    conn: &Connection,
+    delegation_id: &str,
+) -> Result<Option<(String, String, String, String)>> {
+    let result = conn
+        .query_row(
+            "SELECT mode, path, branch, created_at FROM delegation_workspaces
+             WHERE delegation_id = ?1",
+            params![delegation_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    Ok(result)
+}
+
+// ----------------------------------------------------- C7 completion evaluator
+
+/// Evaluate project completion from durable work state. Completion is NOT
+/// silence — quiet state with unresolved blocked work is explicitly not
+/// complete. Returns a report with eligible/complete flags and blockers.
+pub fn evaluate_project_completion(conn: &Connection) -> Result<ProjectCompletionReport> {
+    let mut blockers = Vec::new();
+
+    // Count running agents.
+    let running_agents = list_agents(conn)?;
+    let running_count = running_agents
+        .iter()
+        .filter(|a| crate::commands::is_running(conn, a).unwrap_or(false))
+        .count();
+    if running_count > 0 {
+        blockers.push(CompletionBlocker {
+            kind: "running_agents".to_string(),
+            count: running_count,
+            detail: format!("{running_count} agent(s) still running"),
+        });
+    }
+
+    // Count non-terminal tasks.
+    let tasks = list_tasks(conn)?;
+    let draft = tasks.iter().filter(|t| t.state == TaskState::Draft).count();
+    let ready = tasks.iter().filter(|t| t.state == TaskState::Ready).count();
+    let active = tasks.iter().filter(|t| t.state == TaskState::Active).count();
+    let blocked = tasks.iter().filter(|t| t.state == TaskState::Blocked).count();
+    let review = tasks.iter().filter(|t| t.state == TaskState::Review).count();
+    if draft > 0 {
+        blockers.push(CompletionBlocker {
+            kind: "draft_tasks".to_string(),
+            count: draft,
+            detail: format!("{draft} draft task(s)"),
+        });
+    }
+    if ready > 0 {
+        blockers.push(CompletionBlocker {
+            kind: "ready_tasks".to_string(),
+            count: ready,
+            detail: format!("{ready} ready task(s)"),
+        });
+    }
+    if active > 0 {
+        blockers.push(CompletionBlocker {
+            kind: "active_tasks".to_string(),
+            count: active,
+            detail: format!("{active} active task(s)"),
+        });
+    }
+    if blocked > 0 {
+        blockers.push(CompletionBlocker {
+            kind: "blocked_tasks".to_string(),
+            count: blocked,
+            detail: format!("{blocked} blocked task(s)"),
+        });
+    }
+    if review > 0 {
+        blockers.push(CompletionBlocker {
+            kind: "review_tasks".to_string(),
+            count: review,
+            detail: format!("{review} task(s) awaiting review"),
+        });
+    }
+
+    // Count open delegations.
+    let offered: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM delegations WHERE status = 'offered'",
+        [],
+        |r| r.get(0),
+    )?;
+    let active_del: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM delegations WHERE status = 'active'",
+        [],
+        |r| r.get(0),
+    )?;
+    let submitted: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM delegations WHERE status = 'submitted'",
+        [],
+        |r| r.get(0),
+    )?;
+    if offered > 0 {
+        blockers.push(CompletionBlocker {
+            kind: "offered_delegations".to_string(),
+            count: offered as usize,
+            detail: format!("{offered} offered delegation(s)"),
+        });
+    }
+    if active_del > 0 {
+        blockers.push(CompletionBlocker {
+            kind: "active_delegations".to_string(),
+            count: active_del as usize,
+            detail: format!("{active_del} active delegation(s)"),
+        });
+    }
+    if submitted > 0 {
+        blockers.push(CompletionBlocker {
+            kind: "submitted_delegations".to_string(),
+            count: submitted as usize,
+            detail: format!("{submitted} submitted delegation(s) awaiting review"),
+        });
+    }
+
+    // Check required validation checks.
+    let failed_validation: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM validation_checks WHERE required = 1 AND status != 'passed'",
+        [],
+        |r| r.get(0),
+    )?;
+    if failed_validation > 0 {
+        blockers.push(CompletionBlocker {
+            kind: "failed_validation".to_string(),
+            count: failed_validation as usize,
+            detail: format!("{failed_validation} required validation check(s) not passed"),
+        });
+    }
+
+    // Compute snapshot fingerprint.
+    let fingerprint = completion_fingerprint(conn)?;
+
+    // Check for a matching attestation.
+    let attested_by: Option<String> = conn
+        .query_row(
+            "SELECT recorded_by FROM completion_attestations
+             WHERE snapshot_fingerprint = ?1
+             ORDER BY recorded_at DESC LIMIT 1",
+            params![fingerprint],
+            |r| r.get(0),
+        )
+        .optional()?;
+
+    let eligible = blockers.is_empty();
+    let complete = eligible && attested_by.is_some();
+
+    Ok(ProjectCompletionReport {
+        eligible,
+        complete,
+        snapshot_fingerprint: fingerprint,
+        attested_by,
+        blockers,
+    })
+}
+
+/// Stable fingerprint of the current durable work state. Any task, delegation,
+/// review, or validation change invalidates a prior attestation.
+pub fn completion_fingerprint(conn: &Connection) -> Result<String> {
+    let mut hasher = sha2::Sha256::new();
+    use sha2::Digest;
+
+    // Tasks: sorted by id.
+    let mut task_ids: Vec<String> = conn
+        .prepare("SELECT id, state, updated_at FROM tasks ORDER BY id")?
+        .query_map([], |r| Ok(format!("{}|{}|{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+    task_ids.sort();
+    for t in &task_ids {
+        hasher.update(t.as_bytes());
+        hasher.update(b"\0");
+    }
+
+    // Delegations: sorted by id.
+    let mut del_rows: Vec<String> = conn
+        .prepare("SELECT id, task_id, status FROM delegations ORDER BY id")?
+        .query_map([], |r| Ok(format!("{}|{}|{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+    del_rows.sort();
+    for d in &del_rows {
+        hasher.update(d.as_bytes());
+        hasher.update(b"\0");
+    }
+
+    // Reviews: sorted by id.
+    let mut rev_rows: Vec<String> = conn
+        .prepare("SELECT id, task_id, decision FROM task_reviews ORDER BY id")?
+        .query_map([], |r| Ok(format!("{}|{}|{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+    rev_rows.sort();
+    for r in &rev_rows {
+        hasher.update(r.as_bytes());
+        hasher.update(b"\0");
+    }
+
+    // Validation checks: sorted by name.
+    let mut val_rows: Vec<String> = conn
+        .prepare("SELECT name, status FROM validation_checks ORDER BY name")?
+        .query_map([], |r| Ok(format!("{}|{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+    val_rows.sort();
+    for v in &val_rows {
+        hasher.update(v.as_bytes());
+        hasher.update(b"\0");
+    }
+
+    Ok(crate::crypto::hex_encode(&hasher.finalize()))
+}
+
+/// Record a project completion attestation. The actor must be designated as
+/// a project owner or integrator.
+pub fn record_completion_attestation(
+    conn: &Connection,
+    actor: &str,
+    role: &str,
+    note: &str,
+    now: &str,
+) -> Result<()> {
+    let fingerprint = completion_fingerprint(conn)?;
+    let report = evaluate_project_completion(conn)?;
+    if !report.eligible {
+        return Err(TrelaneError::msg(format!(
+            "cannot attest completion: {} blocker(s) remain",
+            report.blockers.len()
+        )));
+    }
+    // Verify the actor has the designated role.
+    let has_role: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM project_roles WHERE agent = ?1 AND role = ?2",
+        params![actor, role],
+        |r| r.get(0),
+    )?;
+    if has_role == 0 {
+        return Err(TrelaneError::msg(format!(
+            "agent '{actor}' does not have role '{role}'"
+        )));
+    }
+    conn.execute(
+        "INSERT INTO completion_attestations
+            (id, recorded_by, role, snapshot_fingerprint, note, recorded_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            crate::crypto::new_id("attestation"),
+            actor,
+            role,
+            fingerprint,
+            note,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn designate_project_role(
+    conn: &Connection,
+    agent: &str,
+    role: &str,
+    designated_by: &str,
+    now: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO project_roles (agent, role, designated_by, designated_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![agent, role, designated_by, now],
+    )?;
+    Ok(())
+}
+
+pub fn upsert_validation_check(
+    conn: &Connection,
+    name: &str,
+    required: bool,
+    status: &str,
+    revision: Option<&str>,
+    details: &str,
+    now: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO validation_checks
+            (name, required, status, revision, details, checked_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![name, required as i32, status, revision, details, now],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod ledger_tests {
     use super::*;
@@ -2281,5 +3095,108 @@ mod ledger_tests {
             get_delegation(&rejected, "del_1").unwrap().unwrap().status,
             DelegationStatus::Rejected
         );
+    }
+
+    // ----------------------------------------------------------- C5 tests
+
+    #[test]
+    fn delegation_workspace_round_trips() {
+        let c = conn();
+        insert_delegation_workspace(&c, "del_1", "worktree", "/tmp/wt1", "trelane/del_1", "2026-07-12T00:00:00Z").unwrap();
+        let ws = get_delegation_workspace(&c, "del_1").unwrap().unwrap();
+        assert_eq!(ws.0, "worktree");
+        assert_eq!(ws.1, "/tmp/wt1");
+        assert_eq!(ws.2, "trelane/del_1");
+    }
+
+    // ----------------------------------------------------------- C7 tests
+
+    #[test]
+    fn quiet_blocked_project_is_not_complete() {
+        let c = conn();
+        insert_task(&c, &sample_task("task_1")).unwrap();
+        set_task_state(&c, "task_1", TaskState::Blocked, "2026-07-12T01:00:00Z").unwrap();
+        let report = evaluate_project_completion(&c).unwrap();
+        assert!(!report.eligible);
+        assert!(!report.complete);
+        assert!(report.blockers.iter().any(|b| b.kind == "blocked_tasks"));
+    }
+
+    #[test]
+    fn empty_project_is_eligible_for_completion() {
+        let c = conn();
+        let report = evaluate_project_completion(&c).unwrap();
+        assert!(report.eligible);
+        assert!(!report.complete, "eligible but not attested");
+        assert!(report.blockers.is_empty());
+    }
+
+    #[test]
+    fn active_task_blocks_completion() {
+        let c = conn();
+        let mut task = sample_task("task_1");
+        task.state = TaskState::Active;
+        insert_task(&c, &task).unwrap();
+        let report = evaluate_project_completion(&c).unwrap();
+        assert!(!report.eligible);
+        assert!(report.blockers.iter().any(|b| b.kind == "active_tasks"));
+    }
+
+    #[test]
+    fn submitted_delegation_blocks_completion() {
+        let c = conn();
+        insert_task(&c, &sample_task("task_1")).unwrap();
+        insert_delegation(&c, &sample_delegation("del_1", "beta", DelegationStatus::Submitted)).unwrap();
+        let report = evaluate_project_completion(&c).unwrap();
+        assert!(!report.eligible);
+        assert!(report.blockers.iter().any(|b| b.kind == "submitted_delegations"));
+    }
+
+    #[test]
+    fn completion_fingerprint_is_stable() {
+        let c = conn();
+        insert_task(&c, &sample_task("task_1")).unwrap();
+        let fp1 = completion_fingerprint(&c).unwrap();
+        let fp2 = completion_fingerprint(&c).unwrap();
+        assert_eq!(fp1, fp2);
+    }
+
+    #[test]
+    fn completion_fingerprint_changes_with_state() {
+        let c = conn();
+        insert_task(&c, &sample_task("task_1")).unwrap();
+        let fp1 = completion_fingerprint(&c).unwrap();
+        set_task_state(&c, "task_1", TaskState::Done, "2026-07-12T01:00:00Z").unwrap();
+        let fp2 = completion_fingerprint(&c).unwrap();
+        assert_ne!(fp1, fp2, "fingerprint must change when task state changes");
+    }
+
+    #[test]
+    fn attestation_requires_designated_role() {
+        let c = conn();
+        designate_project_role(&c, "owner", "integrator", "user", "2026-07-12T00:00:00Z").unwrap();
+        // No tasks, no blockers — eligible.
+        let report = evaluate_project_completion(&c).unwrap();
+        assert!(report.eligible);
+        // Record attestation.
+        record_completion_attestation(&c, "owner", "integrator", "all done", "2026-07-12T01:00:00Z").unwrap();
+        let report2 = evaluate_project_completion(&c).unwrap();
+        assert!(report2.complete);
+        assert_eq!(report2.attested_by.as_deref(), Some("owner"));
+        // Non-designated agent cannot attest.
+        let err = record_completion_attestation(&c, "other", "integrator", "nope", "2026-07-12T02:00:00Z").unwrap_err();
+        assert!(err.to_string().contains("does not have role"));
+    }
+
+    #[test]
+    fn new_task_invalidates_old_attestation() {
+        let c = conn();
+        designate_project_role(&c, "owner", "integrator", "user", "2026-07-12T00:00:00Z").unwrap();
+        record_completion_attestation(&c, "owner", "integrator", "done", "2026-07-12T01:00:00Z").unwrap();
+        assert!(evaluate_project_completion(&c).unwrap().complete);
+        // Add a task — this changes the fingerprint and invalidates the attestation.
+        insert_task(&c, &sample_task("task_new")).unwrap();
+        let report = evaluate_project_completion(&c).unwrap();
+        assert!(!report.complete, "new task must invalidate old attestation");
     }
 }

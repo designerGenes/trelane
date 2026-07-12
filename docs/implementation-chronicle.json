@@ -1,0 +1,263 @@
+{
+  "chronicle_date": "2026-07-12",
+  "repository": "/Users/jadennation/DEV/01_active_projects/trelane",
+  "branch": "master",
+  "base_commit": "150479f",
+  "dirty_files_count": 24,
+  "verified_checkpoint_before_c3": {
+    "test_count": 125,
+    "cargo_build": "pass",
+    "cargo_test": "pass",
+    "git_diff_check": "pass",
+    "description": "C0/C1/C2 implemented in dirty working tree. All 125 tests passing."
+  },
+  "completed_slices": {
+    "C3_capacity_aware_squire": {
+      "status": "completed",
+      "test_count_delta": "+12 (125->151 after C3+db tests, 156 after C6 tests)",
+      "files_changed": [
+        {
+          "file": "src/db.rs",
+          "changes": [
+            "Added SCHEMA_C3 const with assist_discovery_state, assist_rejection_backoff tables and indexes",
+            "Added migration step for user_version=8",
+            "Updated db tests: fresh_database_reaches_c2_schema now asserts version 10",
+            "Added version_seven_database_upgrades_to_c3_schema test",
+            "Added migration_is_idempotent_on_reopen test",
+            "Added SCHEMA_C5 const with delegation_workspaces table",
+            "Added SCHEMA_C7 const with project_roles, validation_checks, completion_attestations tables",
+            "Added migration steps for user_version=9 (C5) and user_version=10 (C7)"
+          ]
+        },
+        {
+          "file": "src/models.rs",
+          "changes": [
+            "Added AssistDiscoveryState struct",
+            "Added AssistRejectionBackoff struct",
+            "Added WakeKind enum (Inbox, AbandonedPark, ReadyPark, CycleBreak, OwnedTask, HelperAssignment, AssistDiscovery) with rank() method",
+            "Added WakeCandidate struct",
+            "Added AgentActivityState enum (Running, Blocked, OwnedWorkReady, HelpAssignmentReady, AvailableToHelp, ProjectComplete, Disabled, Idle) with as_str()",
+            "Added AgentStatus struct",
+            "Added WorkspaceConfig and WorkspaceMode structs/enums with serde support",
+            "Added WorkspaceMode::as_str() and parse()",
+            "Added ProjectCompletionReport and CompletionBlocker structs",
+            "Added Serialize/Deserialize/Default derives to AssistPolicy",
+            "Added workspace field to Config struct with #[serde(default)]",
+            "Added WorkspaceConfig to Config::default()",
+            "Added wake_kind_rank_is_in_priority_order test",
+            "Added agent_activity_state_as_str_is_stable test"
+          ]
+        },
+        {
+          "file": "src/store.rs",
+          "changes": [
+            "Added assist_backlog_fingerprint(tasks) -> String (SHA-256 of sorted task IDs)",
+            "Added list_ready_owned_tasks(conn, agent) (Ready state, deps satisfied)",
+            "Added list_runnable_helper_assignments(conn, agent, now) (active helper with active unexpired delegation)",
+            "Added list_assistable_tasks(conn, helper, now) (open policy, non-terminal, non-review, deps satisfied)",
+            "Added count_outstanding_offers_for_helper(conn, helper)",
+            "Added get_assist_discovery_state(conn, helper)",
+            "Added record_discovery_wake(conn, helper, fingerprint, now, cooldown_until)",
+            "Added record_offer_fingerprint(conn, helper, fingerprint, offer_id, now)",
+            "Added record_rejection_backoff(conn, helper, owner, now) with exponential backoff 5m/10m/20m/40m capped 24h",
+            "Added clear_rejection_backoff(conn, helper, owner)",
+            "Added rejection_backoff_active(conn, helper, owner, now)",
+            "Added insert_delegation_workspace(conn, delegation_id, mode, path, branch, created_at)",
+            "Added get_delegation_workspace(conn, delegation_id)",
+            "Added evaluate_project_completion(conn) -> ProjectCompletionReport (checks running agents, non-terminal tasks, open delegations, failed validation, attestation)",
+            "Added completion_fingerprint(conn) -> String (SHA-256 of sorted tasks/delegations/reviews/validations)",
+            "Added record_completion_attestation(conn, actor, role, note, now)",
+            "Added designate_project_role(conn, agent, role, designated_by, now)",
+            "Added upsert_validation_check(conn, name, required, status, revision, details, now)",
+            "Added C5 test: delegation_workspace_round_trips",
+            "Added C7 tests: quiet_blocked_project_is_not_complete, empty_project_is_eligible_for_completion, active_task_blocks_completion, submitted_delegation_blocks_completion, completion_fingerprint_is_stable, completion_fingerprint_changes_with_state, attestation_requires_designated_role, new_task_invalidates_old_attestation"
+          ]
+        },
+        {
+          "file": "src/squire.rs",
+          "changes": [
+            "Updated imports to include new model types",
+            "Added urgency_rank(priority) helper (critical=3, high=2, normal=1, low=0)",
+            "Added WakePlan struct with candidates, abandoned_parks, cycle: Option<CycleBreakPlan>",
+            "Added CycleBreakPlan struct",
+            "Added wake_plan(ctx) -> WakePlan (pure, side-effect-free planning)",
+            "Refactored wake_candidates to wrap wake_plan and clear resolved cycles",
+            "Refactored tick to use wake_plan and apply side effects (park deletion, cycle attempt recording, escalation messages, discovery cooldown) only after successful cmd_wake launch",
+            "Added agent_activity_status(ctx, agent) -> AgentStatus (read-only, does not call wake_plan)",
+            "Added agent_activity_statuses(ctx) -> Vec<AgentStatus>",
+            "New wake priorities: OwnedTask (pass 3), HelperAssignment (pass 4), AssistDiscovery (pass 5 during partial idleness)",
+            "Deterministic candidate sorting by (kind rank, urgency desc, agent asc, task asc, delegation asc)",
+            "One candidate per agent (first wins after sort)",
+            "Discovery anti-churn: cooldown, fingerprint, outstanding offer limit (1), rejection backoff",
+            "Added 12 C3 tests: ready_owned_task_requires_done_dependencies, active_helper_assignment_wakes_helper, offered_delegation_does_not_wake_helper, pending_offer_suppresses_assist_discovery, assist_discovery_occurs_during_partial_idleness, unchanged_offered_fingerprint_suppresses_repeat_discovery, candidate_order_is_deterministic, deferred_abandoned_park_is_not_deleted, deferred_cycle_break_does_not_increment_attempt_count, max_concurrent_two_preserves_c0_ceiling_report, agent_activity_status_idle_when_no_work, agent_activity_status_available_to_help"
+          ]
+        },
+        {
+          "file": "src/commands.rs",
+          "changes": [
+            "cmd_help_offer: records offer fingerprint via record_offer_fingerprint after offer insertion",
+            "cmd_help_deny: records rejection backoff via record_rejection_backoff after rejection",
+            "cmd_help_accept: clears rejection backoff via clear_rejection_backoff after acceptance",
+            "cmd_status: shows agent activity state from squire::agent_activity_status",
+            "cmd_status: shows project completion block from store::evaluate_project_completion"
+          ]
+        }
+      ]
+    },
+    "C4_prompt_and_lifecycle": {
+      "status": "completed",
+      "files_changed": [
+        {
+          "file": "src/prompt.rs",
+          "changes": [
+            "Changed 'prop' to 'squire' throughout BOOTSTRAP_TEMPLATE",
+            "Revised law 3: cross-domain writes now require active delegation + lease, not just claim-grant",
+            "Added 'Cross-domain assistance' section with work list --assistable, help offer, work submit, work review instructions",
+            "Updated command crib sheet with --delegation, work list, help offer, work submit, work review",
+            "Added 10 C4 tests: prompt_contains_assistable_listing_command, prompt_contains_one_offer_limit, prompt_contains_help_offer_command, prompt_prohibits_writes_before_delegation, prompt_requires_both_delegation_and_lease, prompt_contains_work_submit_command, prompt_contains_work_review_command, prompt_mentions_designated_reviewer, prompt_no_longer_claims_grant_alone_suffices, prompt_uses_squire_not_prop"
+          ]
+        }
+      ]
+    },
+    "C6_biplane_decomposition": {
+      "status": "completed",
+      "files_changed": [
+        {
+          "file": "src/biplane.rs",
+          "changes": [
+            "Added WorkKind enum (Implementation, Investigation) with Default",
+            "Added CollisionRisk enum (Low, Medium, High)",
+            "Extended PlannedWork with: id (Option<String>), depends_on (Vec<String>), desired_parallelism (u32 default 1), assist_policy (AssistPolicy default Open), reviewer (Option<String>), subtasks (Vec<PlannedWork>), collision_risk (Option<CollisionRisk>), work_kind (WorkKind default Implementation), path_scope (Vec<String>), acceptance (Vec<String>)",
+            "Added Default impl for PlannedWork",
+            "Changed BiplanePlanTask to use #[serde(flatten)] work: PlannedWork instead of separate subject/body fields",
+            "Updated plan_to_description to clone t.work instead of constructing PlannedWork from scratch",
+            "Updated plan_from_description to use work: w.clone() instead of subject: w.subject.clone()",
+            "Updated apply_plan_to_session: uses t.work.subject/t.work.body, creates tasks with desired_parallelism/assist_policy/path_scope/acceptance from PlannedWork, creates subtasks with parent_task set, creates reviewer assignments, resolves depends_on to real task IDs in second pass",
+            "Updated lib.rs and biplane.rs references from task.subject/task.body to task.work.subject/task.work.body",
+            "Added 5 C6 tests: legacy_planned_work_defaults, enriched_planned_work_round_trips, apply_plan_creates_subtasks_with_parent, apply_plan_creates_reviewer_assignment, apply_plan_preserves_parallelism_and_policy"
+          ]
+        },
+        {
+          "file": "src/biplane_ui.rs",
+          "changes": [
+            "Updated PlannedWork test literal to use ..Default::default()"
+          ]
+        },
+        {
+          "file": "src/models.rs",
+          "changes": [
+            "Added Serialize/Deserialize/Default derives to AssistPolicy with #[serde(rename_all = \"lowercase\")]"
+          ]
+        }
+      ]
+    },
+    "C5_workspace_isolation": {
+      "status": "partially_implemented",
+      "what_is_done": [
+        "WorkspaceConfig and WorkspaceMode added to models.rs with serde",
+        "workspace field added to Config with #[serde(default)]",
+        "workspace.mode added to KNOWN_CONFIG_KEYS, config_get, config_set, cmd_config_explain in lib.rs",
+        "delegation_workspaces table added as schema v9",
+        "insert_delegation_workspace and get_delegation_workspace store functions added",
+        "delegation_workspace_round_trips test added"
+      ],
+      "what_is_not_done": [
+        "Worktree creation on help accept (git worktree add)",
+        "Worktree mode submission validation (clean index, HEAD check)",
+        "Review accept stale-base validation strengthening",
+        "Patch submission support"
+      ]
+    },
+    "C7_observability_and_completion": {
+      "status": "partially_implemented",
+      "what_is_done": [
+        "project_roles, validation_checks, completion_attestations tables added as schema v10",
+        "ProjectCompletionReport and CompletionBlocker models added",
+        "evaluate_project_completion store function added (checks running agents, non-terminal tasks, open delegations, failed validation, attestation fingerprint)",
+        "completion_fingerprint store function added (SHA-256 of sorted tasks/delegations/reviews/validations)",
+        "record_completion_attestation store function added (requires designated role, eligible state)",
+        "designate_project_role and upsert_validation_check store functions added",
+        "cmd_status shows agent activity state from C3 primitives",
+        "cmd_status shows project completion block (INCOMPLETE/ELIGIBLE/COMPLETE with blockers)",
+        "8 C7 tests added: quiet_blocked_project_is_not_complete, empty_project_is_eligible_for_completion, active_task_blocks_completion, submitted_delegation_blocks_completion, completion_fingerprint_is_stable, completion_fingerprint_changes_with_state, attestation_requires_designated_role, new_task_invalidates_old_attestation"
+      ],
+      "what_is_not_done": [
+        "Telemetry metrics (agent_capacity_seconds, idle_with_ready_backlog_seconds, help_offers_sent, etc.)",
+        "tick_detailed wrapper with TickOutcome struct",
+        "CLI commands for project roles/validation/completion attestation (currently only store APIs and status rendering)",
+        "idle_with_ready_backlog_seconds metric test"
+      ]
+    }
+  },
+  "current_compile_errors": [
+    {
+      "file": "src/biplane.rs",
+      "line": 2038,
+      "error": "mismatched closing delimiter - println! macro missing closing );",
+      "root_cause": "An edit to fix PlannedWork literals in the apply_plan_records_planned_work_as_ledger_tasks test accidentally left a println! macro in cmd_biplane_interactive without its closing );. The assert_eq! line from the apply_plan_falls_back_to_project_default_when_domain_has_no_model test ended up inside the println! call. Also, two PlannedWork literals in the test still use old format (body/priority fields) instead of ..Default::default().",
+      "fix": "Add ); after line 2044 (the } closing the if-else block). Update PlannedWork literals at lines 2054-2063 to use ..Default::default(). Restore the missing apply_plan_falls_back_to_project_default_when_domain_has_no_model test function that was accidentally truncated."
+    },
+    {
+      "file": "src/lib.rs",
+      "line": 781,
+      "error": "expected one of ., ;, ?, }, or an operator, found =>",
+      "root_cause": "A function body (likely cmd_relaunch or similar) is truncated at line 780 (.max_by_key call) and immediately followed by a match arm from the handle function at line 781. The code between the max_by_key and the match dispatch is missing - likely lost during an edit to add workspace.mode config support.",
+      "fix": "Need to restore the missing function body between the .max_by_key call and the Some(Command::Config) match arm. Check git diff for the original code."
+    }
+  ],
+  "work_remaining": [
+    {
+      "id": "FIX_COMPILE_ERRORS",
+      "priority": "critical",
+      "description": "Fix the two compile errors in biplane.rs and lib.rs described above. The biplane.rs fix requires adding ); after the if-else block at line 2044, updating two PlannedWork literals to use ..Default::default(), and restoring the truncated apply_plan_falls_back_to_project_default_when_domain_has_no_model test. The lib.rs fix requires restoring the missing function body between the .max_by_key call and the match arm."
+    },
+    {
+      "id": "C5_COMPLETION",
+      "priority": "high",
+      "description": "Complete C5 workspace isolation: add worktree creation on help accept, worktree mode submission validation, review accept stale-base validation. These are command-level changes in commands.rs."
+    },
+    {
+      "id": "C7_COMPLETION",
+      "priority": "medium",
+      "description": "Complete C7 telemetry metrics and tick_detailed. The completion evaluator and status rendering are done. Remaining: add telemetry spans for capacity/idle/offer/accept metrics, add tick_detailed wrapper."
+    },
+    {
+      "id": "README_UPDATE",
+      "priority": "medium",
+      "description": "Update README.md with: ownership vs assistance model, help/work CLI commands, delegated write requirements, forbidden paths, assist discovery behavior, workspace mode, completion model, config keys."
+    },
+    {
+      "id": "INSTALL_VERIFICATION",
+      "priority": "low",
+      "description": "Verify install.sh supports --bump-version and --set-version. Run install.sh --help."
+    },
+    {
+      "id": "FINAL_VERIFICATION_AND_COMMIT",
+      "priority": "high",
+      "description": "Run cargo fmt, cargo build, cargo test, git diff --check. Then create a local commit with all changes (excluding .trelane/trelane.db)."
+    }
+  ],
+  "files_changed_summary": {
+    "src/biplane.rs": "C6: PlannedWork extension, BiplanePlanTask flatten, apply_plan_to_session rewrite, tests",
+    "src/biplane_ui.rs": "C6: PlannedWork test literal fix",
+    "src/cli.rs": "C2: help/work/submit/review CLI (pre-existing from C2 checkpoint)",
+    "src/commands.rs": "C2: help protocol (pre-existing), C3: anti-churn state in help commands, C7: status activity/completion",
+    "src/db.rs": "C3: v8 migration, C5: v9 migration, C7: v10 migration",
+    "src/lib.rs": "C5: workspace.mode config, C2/C3: dispatch (pre-existing + broken match arm)",
+    "src/models.rs": "C3: WakeKind/WakeCandidate/AgentActivityState/AgentStatus, C5: WorkspaceConfig/WorkspaceMode, C7: ProjectCompletionReport/CompletionBlocker, C6: AssistPolicy serde",
+    "src/prompt.rs": "C4: squire terminology, cross-domain assistance section, updated command crib sheet",
+    "src/store.rs": "C3: discovery/backoff/fingerprint/assistable APIs, C5: workspace store, C7: completion evaluator/fingerprint/attestation APIs, tests",
+    "src/squire.rs": "C3: wake_plan refactor, tick side-effect deferral, activity status, new wake priorities, tests",
+    "src/testing.rs": "C2: stale call fixes (pre-existing from checkpoint repair)",
+    "src/prop.rs": "C0: shim (pre-existing)",
+    "src/pump.rs": "C0: shim (pre-existing)",
+    "src/splash.rs": "C0: (pre-existing)",
+    "src/diagnostic.rs": "C0: (pre-existing)",
+    "src/error.rs": "C0: (pre-existing)",
+    "src/logo.rs": "C0: (pre-existing)",
+    "src/text_input.rs": "C0: (pre-existing)",
+    "tests/large.json": "C0: (pre-existing)",
+    "tests/medium.json": "C0: (pre-existing)",
+    "tests/small.json": "C0: (pre-existing)"
+  }
+}
