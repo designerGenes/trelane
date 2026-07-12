@@ -599,33 +599,33 @@ fn run_loop(ctx: &crate::Context, state: &mut DiagnosticState) -> Result<()> {
     let outcome = (|| -> Result<()> {
         loop {
             terminal.draw(|f| render(f, state))?;
-            if event::poll(Duration::from_millis(250))?
-                && let Event::Key(key) = event::read()?
-            {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => state.should_quit = true,
-                    KeyCode::Tab => state.next_tab(),
-                    KeyCode::BackTab => state.prev_tab(),
-                    KeyCode::Up => state.cursor_up(),
-                    KeyCode::Down => state.cursor_down(),
-                    KeyCode::Left => state.adjust_left(),
-                    KeyCode::Right => state.adjust_right(),
-                    KeyCode::Char(' ') | KeyCode::Enter => state.toggle_focused(),
-                    KeyCode::Char('s') => {
-                        if state.dirty {
-                            save_config(state)?;
-                            state.mark_saved();
-                        }
-                        if state.models_dirty {
-                            save_agent_models(ctx, state)?;
-                            state.mark_models_saved();
-                        }
+            if event::poll(Duration::from_millis(250))? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
                     }
-                    KeyCode::Char('K') => confirm_and_kill(&mut terminal, state)?,
-                    _ => {}
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => state.should_quit = true,
+                        KeyCode::Tab => state.next_tab(),
+                        KeyCode::BackTab => state.prev_tab(),
+                        KeyCode::Up => state.cursor_up(),
+                        KeyCode::Down => state.cursor_down(),
+                        KeyCode::Left => state.adjust_left(),
+                        KeyCode::Right => state.adjust_right(),
+                        KeyCode::Char(' ') | KeyCode::Enter => state.toggle_focused(),
+                        KeyCode::Char('s') => {
+                            if state.dirty {
+                                save_config(state)?;
+                                state.mark_saved();
+                            }
+                            if state.models_dirty {
+                                save_agent_models(ctx, state)?;
+                                state.mark_models_saved();
+                            }
+                        }
+                        KeyCode::Char('K') => confirm_and_kill(&mut terminal, state)?,
+                        _ => {}
+                    }
                 }
             }
             if state.should_quit || state.kill_requested {
@@ -685,7 +685,7 @@ fn confirm_and_kill<B: ratatui::backend::Backend>(
 ) -> Result<()> {
     use crossterm::event::{self, Event, KeyCode};
     // Draw a confirm overlay, then block for a single y/n.
-    terminal.draw(render_kill_confirm)?;
+    terminal.draw(|f| render_kill_confirm(f))?;
     loop {
         if let Event::Key(key) = event::read()? {
             match key.code {

@@ -28,7 +28,9 @@ All coordination goes through the control tool (run from the project root):
 3. **Stay in your domain.** You may read anything, but only write files
    matching your `writable` globs. Any file that is contested (overlaps
    another domain) or outside your domain requires a lease via
-   `claim` — and outside your domain also a `claim-grant` from the owner.
+   `claim` — and outside your domain also an active, accepted delegation
+   from the owner. A `claim-grant` alone is not sufficient; you need both
+   the active delegation and a normal path lease.
 
 ## Your domain
 
@@ -47,6 +49,39 @@ All coordination goes through the control tool (run from the project root):
 Any task marked `DEPENDENCY SATISFIED` should be resumed now: do the work,
 then `unpark <task>`.
 
+## Cross-domain assistance
+
+Inbox, accepted assignments, and ready owned work come first.
+
+If you have no actionable owned work, run:
+
+    trelane work list --assistable --agent [[AGENT_ID]]
+
+Inspect candidate work read-only. A discovery run may produce at most ONE
+concrete scoped offer:
+
+    trelane help offer --from [[AGENT_ID]] --to <owner> --task <task-id> \
+        --path <path> --plan "..." --deliverable "..."
+
+Reconnaissance and offers do not grant write authority. Do not edit, claim,
+or otherwise mutate files in another domain until the owner accepts the offer
+and Trelane records an active delegation.
+
+Delegated writes require both the active delegation and a normal path lease.
+Either one alone is insufficient.
+
+Submit delegated implementation work through:
+
+    trelane work submit <task-id> --by [[AGENT_ID]] \
+        --delegation <delegation-id> --commit <sha> \
+        --summary "..." --tests "..."
+
+Do not mark a helper submission done yourself. The owner or designated
+reviewer must run:
+
+    trelane work review <task-id> --by <owner-or-reviewer> \
+        --delegation <delegation-id> --accept|--request-changes|--reject
+
 ## Command crib sheet
 
     trelane inbox [[AGENT_ID]] --json          # full message bodies
@@ -55,9 +90,14 @@ then `unpark <task>`.
         --subject "..." --body "..."            # prints the msg id
     trelane park [[AGENT_ID]] --wait-reply <msg-id> --waiting-on <agent> \
         --resume-hint "what to do when the answer arrives"
-    trelane claim [[AGENT_ID]] <path> [--grant <claim-grant-msg-id>]
+    trelane claim [[AGENT_ID]] <path> [--delegation <delegation-id>]
     trelane release [[AGENT_ID]] <path>
     trelane unpark <task-id>
+    trelane work list [--assistable] [--agent <helper>]
+    trelane work show <task-id>
+    trelane help offer --from [[AGENT_ID]] --to <owner> --task <id> ...
+    trelane work submit <task-id> --by [[AGENT_ID]] --delegation <id> ...
+    trelane work review <task-id> --by <reviewer> --delegation <id> ...
     trelane audit [[AGENT_ID]]                 # run before you exit
     trelane done [[AGENT_ID]]                  # your very last command
 
@@ -274,5 +314,62 @@ mod tests {
     fn park_age_exceeds_false_on_bad_timestamp() {
         let entry = make_parked("garbage", "beta");
         assert!(!park_age_exceeds(&entry, 1, "2026-01-01T00:00:00Z"));
+    }
+
+    // ------------------------------------------------------------- C4 tests
+
+    #[test]
+    fn prompt_contains_assistable_listing_command() {
+        assert!(bootstrap_template().contains("trelane work list --assistable --agent"));
+    }
+
+    #[test]
+    fn prompt_contains_one_offer_limit() {
+        assert!(bootstrap_template().contains("at most ONE"));
+    }
+
+    #[test]
+    fn prompt_contains_help_offer_command() {
+        assert!(bootstrap_template().contains("trelane help offer"));
+    }
+
+    #[test]
+    fn prompt_prohibits_writes_before_delegation() {
+        let tpl = bootstrap_template();
+        assert!(tpl.contains("Do not edit, claim, or otherwise mutate files in another domain until the owner accepts the offer"));
+    }
+
+    #[test]
+    fn prompt_requires_both_delegation_and_lease() {
+        let tpl = bootstrap_template();
+        assert!(tpl.contains("both the active delegation and a normal path lease"));
+    }
+
+    #[test]
+    fn prompt_contains_work_submit_command() {
+        assert!(bootstrap_template().contains("trelane work submit"));
+    }
+
+    #[test]
+    fn prompt_contains_work_review_command() {
+        assert!(bootstrap_template().contains("trelane work review"));
+    }
+
+    #[test]
+    fn prompt_mentions_designated_reviewer() {
+        assert!(bootstrap_template().contains("designated reviewer"));
+    }
+
+    #[test]
+    fn prompt_no_longer_claims_grant_alone_suffices() {
+        let tpl = bootstrap_template();
+        assert!(tpl.contains("A `claim-grant` alone is not sufficient"));
+    }
+
+    #[test]
+    fn prompt_uses_squire_not_prop() {
+        let tpl = bootstrap_template();
+        assert!(tpl.contains("squire"));
+        assert!(!tpl.contains("the prop"));
     }
 }

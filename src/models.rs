@@ -8,6 +8,13 @@ pub const MSG_TYPES: &[&str] = &[
     "claim-request",
     "claim-grant",
     "claim-deny",
+    "help-request",
+    "help-offer",
+    "help-accept",
+    "help-deny",
+    "help-revoke",
+    "submission",
+    "review-result",
     "handoff",
     "system",
 ];
@@ -61,6 +68,11 @@ impl Default for Config {
             },
             squire: SquireConfig {
                 interval_s: 20,
+                // Compiled default simultaneous-execution ceiling. Conservative
+                // on purpose (see `SquireConfig::max_concurrent` docs); raise it
+                // to use more registered agents at once via config.json,
+                // `trelane config set squire.max_concurrent N`, or
+                // `trelane squire --max-concurrent N`.
                 max_concurrent: 2,
                 // F2: Default to 1 hour. Protects new installs against
                 // enabled-but-silently-stuck counterparts without being
@@ -95,6 +107,16 @@ pub struct LauncherConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SquireConfig {
     pub interval_s: u64,
+    /// Maximum number of agents the squire runs *simultaneously*. This is a
+    /// scheduling ceiling, NOT the number of registered agents: a swarm may
+    /// have many more agents registered than this, and the squire will only
+    /// ever have this many awake at once -- the rest are deferred to a later
+    /// tick (which can look like "agents registered but idle"). The compiled
+    /// default is 2. Override it in config.json (`"squire": {
+    /// "max_concurrent": N }`), persistently with `trelane config set
+    /// squire.max_concurrent N`, or for a single run with `trelane squire
+    /// --max-concurrent N`. Inspect the effective value and live utilization
+    /// with `trelane config explain squire.max_concurrent`.
     pub max_concurrent: usize,
     /// Maximum seconds a reply-wait park can sit unsatisfied before the
     /// squire declares it abandoned and wakes the waiting agent with an
@@ -152,6 +174,17 @@ pub struct UiKeys {
     pub verbose_toggle: String,
     /// Open the interactive diagnostic TUI (`trelane diagnostic`) in a split.
     pub diagnostic_view: String,
+    /// Guaranteed, terminal-agnostic pane-navigation keys. Unlike the
+    /// best-effort Alt/Ctrl+arrow bindings in `resolve_pane_nav_bindings`
+    /// (which depend on per-terminal escape-sequence forwarding -- e.g.
+    /// macOS Terminal.app only sends Option as Meta if the user has manually
+    /// enabled that non-default preference), plain function keys are sent
+    /// identically by every terminal with no configuration required, so
+    /// these always work as a baseline regardless of terminal or settings.
+    pub pane_left: String,
+    pub pane_right: String,
+    pub pane_up: String,
+    pub pane_down: String,
 }
 
 impl Default for UiKeys {
@@ -161,6 +194,10 @@ impl Default for UiKeys {
             inbox: "F3".to_string(),
             verbose_toggle: "F4".to_string(),
             diagnostic_view: "F5".to_string(),
+            pane_left: "F6".to_string(),
+            pane_right: "F7".to_string(),
+            pane_up: "F8".to_string(),
+            pane_down: "F9".to_string(),
         }
     }
 }
@@ -307,6 +344,9 @@ pub struct Lease {
     pub holder: String,
     pub task: Option<String>,
     pub grant: Option<String>,
+    /// Delegation capability backing a cross-domain lease. `None` preserves
+    /// ordinary in-domain leases and legacy rows.
+    pub delegation_id: Option<String>,
     pub acquired_at: String,
     pub expires_at: f64,
     pub expires_human: String,
@@ -327,4 +367,471 @@ pub struct Violation {
     pub agent: String,
     pub paths: Vec<String>,
     pub at: String,
+}
+
+// ------------------------------------------------------------------- tasks
+//
+// C1: the durable work ledger. Messages remain the notification / protocol
+// channel; these types are the first-class record of what work exists, who
+// owns it, its readiness and dependencies, and (via delegations and reviews)
+// how cross-domain assistance is authorized and accepted. Everything here is
+// additive -- existing park / claim / message flows are unchanged.
+
+pub const TASK_STATES: &[&str] = &[
+    "draft",
+    "ready",
+    "active",
+    "blocked",
+    "review",
+    "done",
+    "cancelled",
+];
+
+/// Lifecycle state of a task in the ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskState {
+    Draft,
+    Ready,
+    Active,
+    Blocked,
+    Review,
+    Done,
+    Cancelled,
+}
+
+impl TaskState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskState::Draft => "draft",
+            TaskState::Ready => "ready",
+            TaskState::Active => "active",
+            TaskState::Blocked => "blocked",
+            TaskState::Review => "review",
+            TaskState::Done => "done",
+            TaskState::Cancelled => "cancelled",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "draft" => TaskState::Draft,
+            "ready" => TaskState::Ready,
+            "active" => TaskState::Active,
+            "blocked" => TaskState::Blocked,
+            "review" => TaskState::Review,
+            "done" => TaskState::Done,
+            "cancelled" => TaskState::Cancelled,
+            _ => return None,
+        })
+    }
+    /// True for closed states (no longer schedulable or assistable).
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, TaskState::Done | TaskState::Cancelled)
+    }
+    /// True for the success terminal state (satisfies a dependency).
+    pub fn is_done(&self) -> bool {
+        matches!(self, TaskState::Done)
+    }
+}
+
+/// Whether a task may be assisted by non-owner agents. C2 enforces this; C1
+/// only records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistPolicy {
+    /// Any eligible idle agent may offer to help (subject to owner approval).
+    Open,
+    /// Owner-only: not open to cross-domain assistance.
+    Solo,
+}
+
+impl AssistPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AssistPolicy::Open => "open",
+            AssistPolicy::Solo => "solo",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "open" => AssistPolicy::Open,
+            "solo" => AssistPolicy::Solo,
+            _ => return None,
+        })
+    }
+}
+
+/// A first-class unit of work in the ledger.
+#[derive(Debug, Clone)]
+pub struct Task {
+    pub id: String,
+    pub owner_agent: String,
+    /// Owning domain name (usually the same as `owner_agent`).
+    pub domain: String,
+    pub parent_task: Option<String>,
+    pub subject: String,
+    pub body: String,
+    pub state: TaskState,
+    /// Urgency using the same vocabulary as messages (see [`URGENCIES`]).
+    pub priority: String,
+    pub assist_policy: AssistPolicy,
+    /// How many agents may work this task at once (>= 1). Single-helper
+    /// subtasks use 1.
+    pub desired_parallelism: u32,
+    /// Path globs this task is scoped to (a subset of the owner's domain).
+    pub path_scope: Vec<String>,
+    /// Acceptance criteria, human/agent-readable.
+    pub acceptance: Vec<String>,
+    /// Task ids that must be `done` before this task becomes ready.
+    pub blocked_by: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl Task {
+    /// True when every dependency in `blocked_by` is present in the given set
+    /// of completed (done) task ids. A task with no dependencies is always
+    /// satisfied.
+    pub fn deps_satisfied(&self, done_ids: &std::collections::HashSet<String>) -> bool {
+        self.blocked_by.iter().all(|d| done_ids.contains(d))
+    }
+}
+
+/// Role an agent plays on a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskRole {
+    Owner,
+    Helper,
+    Reviewer,
+    Integrator,
+}
+
+impl TaskRole {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskRole::Owner => "owner",
+            TaskRole::Helper => "helper",
+            TaskRole::Reviewer => "reviewer",
+            TaskRole::Integrator => "integrator",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "owner" => TaskRole::Owner,
+            "helper" => TaskRole::Helper,
+            "reviewer" => TaskRole::Reviewer,
+            "integrator" => TaskRole::Integrator,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskAssignment {
+    pub task_id: String,
+    pub agent: String,
+    pub role: TaskRole,
+    /// Free-form lifecycle marker for the assignment (e.g. "active",
+    /// "completed"). Kept as a string so the assistance protocol (C2) can
+    /// extend the vocabulary without a migration.
+    pub state: String,
+    pub offer_id: Option<String>,
+    pub delegation_id: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+/// Status of a delegation capability. C2 drives the transitions; C1 records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegationStatus {
+    Offered,
+    Active,
+    Revoked,
+    Expired,
+    Submitted,
+    Accepted,
+    Rejected,
+}
+
+impl DelegationStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DelegationStatus::Offered => "offered",
+            DelegationStatus::Active => "active",
+            DelegationStatus::Revoked => "revoked",
+            DelegationStatus::Expired => "expired",
+            DelegationStatus::Submitted => "submitted",
+            DelegationStatus::Accepted => "accepted",
+            DelegationStatus::Rejected => "rejected",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "offered" => DelegationStatus::Offered,
+            "active" => DelegationStatus::Active,
+            "revoked" => DelegationStatus::Revoked,
+            "expired" => DelegationStatus::Expired,
+            "submitted" => DelegationStatus::Submitted,
+            "accepted" => DelegationStatus::Accepted,
+            "rejected" => DelegationStatus::Rejected,
+            _ => return None,
+        })
+    }
+    /// True while the delegation can still authorize writes.
+    pub fn is_live(&self) -> bool {
+        matches!(self, DelegationStatus::Active)
+    }
+}
+
+/// A signed, expiring, revocable, task-scoped grant of write authority from a
+/// domain owner to a helper. C1 stores it; C2 issues and enforces it.
+#[derive(Debug, Clone)]
+pub struct Delegation {
+    pub id: String,
+    pub task_id: String,
+    pub owner_agent: String,
+    pub helper_agent: String,
+    pub scope: Vec<String>,
+    pub allowed_ops: Vec<String>,
+    /// Opaque constraint object, stored as a raw JSON string.
+    pub constraints_json: String,
+    pub base_revision: Option<String>,
+    /// Signed `help-offer` message that created this proposed capability.
+    pub offer_message: String,
+    /// Signed `help-accept` message carrying the active capability.
+    pub grant_message: String,
+    pub issued_at: String,
+    pub expires_at: Option<String>,
+    pub status: DelegationStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewDecision {
+    Accept,
+    RequestChanges,
+    Reject,
+}
+
+impl ReviewDecision {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReviewDecision::Accept => "accept",
+            ReviewDecision::RequestChanges => "request-changes",
+            ReviewDecision::Reject => "reject",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "accept" => ReviewDecision::Accept,
+            "request-changes" => ReviewDecision::RequestChanges,
+            "reject" => ReviewDecision::Reject,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskReview {
+    pub id: String,
+    pub task_id: String,
+    pub delegation_id: Option<String>,
+    pub reviewer_agent: String,
+    pub submission_ref: String,
+    pub decision: ReviewDecision,
+    pub notes: String,
+    pub created_at: String,
+}
+
+/// A helper's validated Git submission. Pending submissions are deliberately
+/// separate from `TaskReview`: a submission is evidence presented for review,
+/// while a review is an owner's/reviewer's decision about that evidence.
+#[derive(Debug, Clone)]
+pub struct TaskSubmission {
+    pub id: String,
+    pub task_id: String,
+    pub delegation_id: String,
+    pub helper_agent: String,
+    pub commit_ref: String,
+    pub base_revision: String,
+    pub summary: String,
+    pub tests: String,
+    pub changed_paths: Vec<String>,
+    /// Signed `submission` notification linked to this row.
+    pub message_id: String,
+    /// `pending`, `changes-requested`, `accepted`, or `rejected`.
+    pub status: String,
+    pub created_at: String,
+    pub reviewed_at: Option<String>,
+}
+
+// ---------------------------------------------------------- C3 scheduling state
+//
+// Durable anti-churn state for bounded assist discovery and derived agent
+// activity states. These are scheduler/observability primitives, not work
+// items.
+
+/// Per-helper durable state for assist-discovery anti-churn.
+#[derive(Debug, Clone)]
+pub struct AssistDiscoveryState {
+    pub helper_agent: String,
+    pub last_discovery_at: Option<String>,
+    pub cooldown_until: Option<String>,
+    pub last_offered_fingerprint: String,
+    pub last_offer_id: Option<String>,
+    pub updated_at: String,
+}
+
+/// Per (helper, owner) exponential rejection backoff so a denied offer does
+/// not immediately re-fire on every tick.
+#[derive(Debug, Clone)]
+pub struct AssistRejectionBackoff {
+    pub helper_agent: String,
+    pub owner_agent: String,
+    pub rejection_count: u32,
+    pub last_rejected_at: Option<String>,
+    pub retry_after: Option<String>,
+}
+
+/// Why an agent should be woken, in scheduler priority order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeKind {
+    Inbox,
+    AbandonedPark,
+    ReadyPark,
+    CycleBreak,
+    OwnedTask,
+    HelperAssignment,
+    AssistDiscovery,
+}
+
+impl WakeKind {
+    /// Lower is higher priority.
+    pub fn rank(self) -> u8 {
+        match self {
+            WakeKind::Inbox => 0,
+            WakeKind::AbandonedPark => 1,
+            WakeKind::ReadyPark => 2,
+            WakeKind::CycleBreak => 3,
+            WakeKind::OwnedTask => 4,
+            WakeKind::HelperAssignment => 5,
+            WakeKind::AssistDiscovery => 6,
+        }
+    }
+}
+
+/// A single planned wake in the deterministic scheduler plan.
+#[derive(Debug, Clone)]
+pub struct WakeCandidate {
+    pub agent: String,
+    pub kind: WakeKind,
+    pub reason: String,
+    /// Urgency rank: critical=3, high=2, normal=1, low=0, unknown=1.
+    pub urgency_rank: u8,
+    pub task_id: Option<String>,
+    pub delegation_id: Option<String>,
+    pub discovery_fingerprint: Option<String>,
+    pub discovery_task_id: Option<String>,
+}
+
+/// Derived, read-only explanation of why an agent is in its current state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentActivityState {
+    Running,
+    Blocked,
+    OwnedWorkReady,
+    HelpAssignmentReady,
+    AvailableToHelp,
+    ProjectComplete,
+    Disabled,
+    Idle,
+}
+
+impl AgentActivityState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AgentActivityState::Running => "running",
+            AgentActivityState::Blocked => "blocked",
+            AgentActivityState::OwnedWorkReady => "owned-work-ready",
+            AgentActivityState::HelpAssignmentReady => "help-assignment-ready",
+            AgentActivityState::AvailableToHelp => "available-to-help",
+            AgentActivityState::ProjectComplete => "project-complete",
+            AgentActivityState::Disabled => "disabled",
+            AgentActivityState::Idle => "idle",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentStatus {
+    pub agent: String,
+    pub state: AgentActivityState,
+    pub reason: String,
+    pub task_ids: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assistance_protocol_message_types_are_explicit() {
+        for kind in [
+            "help-request",
+            "help-offer",
+            "help-accept",
+            "help-deny",
+            "help-revoke",
+            "submission",
+            "review-result",
+        ] {
+            assert!(MSG_TYPES.contains(&kind), "missing message type {kind}");
+        }
+    }
+
+    #[test]
+    fn wake_kind_rank_is_in_priority_order() {
+        assert!(WakeKind::Inbox.rank() < WakeKind::AbandonedPark.rank());
+        assert!(WakeKind::AbandonedPark.rank() < WakeKind::ReadyPark.rank());
+        assert!(WakeKind::ReadyPark.rank() < WakeKind::CycleBreak.rank());
+        assert!(WakeKind::CycleBreak.rank() < WakeKind::OwnedTask.rank());
+        assert!(WakeKind::OwnedTask.rank() < WakeKind::HelperAssignment.rank());
+        assert!(WakeKind::HelperAssignment.rank() < WakeKind::AssistDiscovery.rank());
+    }
+
+    #[test]
+    fn agent_activity_state_as_str_is_stable() {
+        assert_eq!(AgentActivityState::Running.as_str(), "running");
+        assert_eq!(AgentActivityState::AvailableToHelp.as_str(), "available-to-help");
+        assert_eq!(AgentActivityState::ProjectComplete.as_str(), "project-complete");
+    }
+
+    #[test]
+    fn ui_keys_default_pane_nav_uses_guaranteed_function_keys() {
+        // Function keys are sent identically by every terminal with no
+        // configuration required (unlike Alt/Option+arrow, which depends on
+        // per-terminal, often non-default settings), so these are the
+        // baseline that must always be present and always work.
+        let keys = UiKeys::default();
+        assert_eq!(keys.pane_left, "F6");
+        assert_eq!(keys.pane_right, "F7");
+        assert_eq!(keys.pane_up, "F8");
+        assert_eq!(keys.pane_down, "F9");
+    }
+
+    #[test]
+    fn ui_keys_deserializes_old_config_missing_pane_nav_fields() {
+        // An existing user's config.json from before pane_left/right/up/down
+        // existed must still parse cleanly, with the new fields silently
+        // defaulting rather than failing to deserialize.
+        let old_json = r#"{
+            "diagnostics": "F2",
+            "inbox": "F3",
+            "verbose_toggle": "F4",
+            "diagnostic_view": "F5"
+        }"#;
+        let keys: UiKeys = serde_json::from_str(old_json).unwrap();
+        assert_eq!(keys.diagnostics, "F2");
+        assert_eq!(keys.pane_left, "F6");
+        assert_eq!(keys.pane_right, "F7");
+        assert_eq!(keys.pane_up, "F8");
+        assert_eq!(keys.pane_down, "F9");
+    }
 }

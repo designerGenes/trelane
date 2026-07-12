@@ -151,14 +151,25 @@ fn compose_sources_prompt(project_root: &Path, sources: &[PathBuf], max_agents: 
     let mut doc_blocks = Vec::new();
     for dir in &scan {
         if !dir.is_dir() {
-            structure_blocks.push(format!("## {} (not found or not a directory)", dir.display()));
+            structure_blocks.push(format!(
+                "## {} (not found or not a directory)",
+                dir.display()
+            ));
             continue;
         }
-        structure_blocks.push(format!("## {}\n{}", dir.display(), scan_project_structure(dir)));
+        structure_blocks.push(format!(
+            "## {}\n{}",
+            dir.display(),
+            scan_project_structure(dir)
+        ));
         let mut texts = Vec::new();
         collect_feature_text(dir, dir, &mut texts);
         if !texts.is_empty() {
-            doc_blocks.push(format!("### from {}\n\n{}", dir.display(), texts.join("\n\n---\n\n")));
+            doc_blocks.push(format!(
+                "### from {}\n\n{}",
+                dir.display(),
+                texts.join("\n\n---\n\n")
+            ));
         }
     }
 
@@ -1688,37 +1699,110 @@ fn apply_plan_to_session(
     desc: &ProjectDescription,
     plan: &BiplanePlan,
 ) -> Result<usize> {
-    let model = desc.default_model.as_deref();
     let existing = crate::store::list_agents(&ctx.conn)?;
     let spec: std::collections::HashMap<&str, &DomainSpec> =
         desc.domains.iter().map(|d| (d.name.as_str(), d)).collect();
 
     let mut added = 0;
+    let mut resynced = 0;
     for a in &plan.agents {
-        if existing.contains(&a.name) {
-            continue;
-        }
         let fw = spec
             .get(a.name.as_str())
             .map(|d| d.forbidden_write.clone())
             .unwrap_or_default();
-        crate::commands::cmd_add_agent(
-            ctx,
-            &a.name,
-            &a.writable,
-            &fw,
-            Some(&a.description),
-            model,
-        )?;
-        added += 1;
+        // Each domain's own model (set per-domain in the Biplane UI's MODEL
+        // column) takes precedence; the project-level default_model is only a
+        // fallback for domains that didn't specify one.
+        let model = spec
+            .get(a.name.as_str())
+            .and_then(|d| d.model.as_deref())
+            .or(desc.default_model.as_deref());
+
+        if existing.contains(&a.name) {
+            // Re-sync an already-registered agent to the current description
+            // instead of silently skipping it forever. Without this, an agent
+            // created before its domain had a model assigned (or before the
+            // user changed models) would keep that stale config -- including
+            // no model at all -- no matter how many times the plan was
+            // re-applied, which is exactly what left some agents stuck on the
+            // (now safety-refused) default launcher while sibling agents
+            // created in a later apply picked up the right one.
+            let mut forbidden = vec![
+                format!("{}/**", crate::models::TRELANE_DIR),
+                ".git/**".to_string(),
+            ];
+            forbidden.extend(fw.iter().cloned());
+            crate::store::upsert_agent(
+                &ctx.conn,
+                &a.name,
+                &a.description,
+                &a.writable,
+                model,
+                &forbidden,
+                &crate::crypto::now_iso(),
+            )?;
+            resynced += 1;
+        } else {
+            crate::commands::cmd_add_agent(
+                ctx,
+                &a.name,
+                &a.writable,
+                &fw,
+                Some(&a.description),
+                model,
+            )?;
+            added += 1;
+        }
+    }
+    if resynced > 0 {
+        println!(
+            "re-synced {resynced} existing agent(s) to the current description (writable/model/description)"
+        );
     }
 
+    // C1: record each planned item as a first-class task in the ledger, so the
+    // durable work record no longer lives only in the initial message. The
+    // message is still sent as the agent's notification, but now carries the
+    // task id. Re-applying a plan must not duplicate tasks: if the owner
+    // already has a task with the same subject, reuse it instead of creating a
+    // new one (mirrors the agent re-sync above).
+    let now = crate::crypto::now_iso();
     for t in &plan.initial_tasks {
         let urgency = spec
             .get(t.agent.as_str())
             .and_then(|d| d.planned_work.iter().find(|w| w.subject == t.subject))
             .map(|w| normalize_urgency(&w.priority))
             .unwrap_or_else(|| "normal".to_string());
+
+        let existing = crate::store::list_tasks_for_owner(&ctx.conn, &t.agent)?;
+        let task_id = if let Some(found) = existing.iter().find(|et| et.subject == t.subject) {
+            found.id.clone()
+        } else {
+            let path_scope = spec
+                .get(t.agent.as_str())
+                .map(|d| d.writable.clone())
+                .unwrap_or_default();
+            let task = crate::models::Task {
+                id: crate::crypto::new_id("task"),
+                owner_agent: t.agent.clone(),
+                domain: t.agent.clone(),
+                parent_task: None,
+                subject: t.subject.clone(),
+                body: t.body.clone(),
+                state: crate::models::TaskState::Ready,
+                priority: urgency.clone(),
+                assist_policy: crate::models::AssistPolicy::Open,
+                desired_parallelism: 1,
+                path_scope,
+                acceptance: vec![],
+                blocked_by: vec![],
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            };
+            crate::store::insert_task(&ctx.conn, &task)?;
+            task.id
+        };
+
         crate::commands::cmd_send(
             ctx,
             "user",
@@ -1728,7 +1812,7 @@ fn apply_plan_to_session(
             &t.subject,
             &t.body,
             &None,
-            &None,
+            &Some(task_id),
             &[],
         )?;
     }
@@ -1909,6 +1993,184 @@ pub fn cmd_biplane_interactive(
 mod tests {
     use super::*;
 
+    fn migrated_ctx(temp: &tempfile::TempDir) -> crate::Context {
+        let root = temp.path().to_path_buf();
+        let db_path = root.join(".trelane").join("trelane.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = crate::db::open(&db_path).unwrap();
+        crate::Context {
+            root,
+            conn,
+            config: crate::models::Config::default(),
+        }
+    }
+
+    fn plan_domain(name: &str, model: Option<&str>) -> DomainSpec {
+        DomainSpec {
+            name: name.to_string(),
+            description: format!("owns {name}"),
+            writable: vec![format!("src/{name}/**")],
+            forbidden_write: vec![],
+            depends_on: vec![],
+            planned_work: vec![],
+            agents: 1,
+            model: model.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn apply_plan_uses_each_domains_own_model_not_project_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = migrated_ctx(&temp);
+        let desc = ProjectDescription {
+            name: "demo".into(),
+            description: String::new(),
+            domains: vec![
+                plan_domain("frontend", Some("openrouter/z-ai/glm-5.2")),
+                plan_domain("backend", Some("anthropic/claude-sonnet-4")),
+            ],
+            max_agents: Some(2),
+            // A project-level default that must NOT override either domain's
+            // own explicit choice -- this is exactly the bug: previously this
+            // single value was applied to every agent, discarding the above.
+            default_model: Some("should-not-be-used".to_string()),
+        };
+        let plan = plan_from_description(&desc, 2).unwrap();
+        let added = apply_plan_to_session(&ctx, &desc, &plan).unwrap();
+        assert_eq!(added, 2);
+
+        let frontend = crate::store::get_domain(&ctx.conn, "frontend")
+            .unwrap()
+            .unwrap();
+        let backend = crate::store::get_domain(&ctx.conn, "backend")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            frontend.launcher_agent.as_deref(),
+            Some("openrouter/z-ai/glm-5.2")
+        );
+        assert_eq!(
+            backend.launcher_agent.as_deref(),
+            Some("anthropic/claude-sonnet-4")
+        );
+    }
+
+    #[test]
+    fn apply_plan_falls_back_to_project_default_when_domain_has_no_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = migrated_ctx(&temp);
+        let desc = ProjectDescription {
+            name: "demo".into(),
+            description: String::new(),
+            domains: vec![plan_domain("solo", None)],
+            max_agents: Some(1),
+            default_model: Some("fallback-model".to_string()),
+        };
+        let plan = plan_from_description(&desc, 1).unwrap();
+        apply_plan_to_session(&ctx, &desc, &plan).unwrap();
+        let solo = crate::store::get_domain(&ctx.conn, "solo")
+            .unwrap()
+            .unwrap();
+        assert_eq!(solo.launcher_agent.as_deref(), Some("fallback-model"));
+    }
+
+    #[test]
+    fn apply_plan_records_planned_work_as_ledger_tasks() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = migrated_ctx(&temp);
+        let mut backend = plan_domain("backend", Some("opencode/x"));
+        backend.planned_work = vec![
+            PlannedWork {
+                subject: "wire up the API".to_string(),
+                body: "add the /v1 routes".to_string(),
+                priority: "high".to_string(),
+            },
+            PlannedWork {
+                subject: "add integration tests".to_string(),
+                body: String::new(),
+                priority: "normal".to_string(),
+            },
+        ];
+        let desc = ProjectDescription {
+            name: "demo".into(),
+            description: String::new(),
+            domains: vec![backend],
+            max_agents: Some(1),
+            default_model: None,
+        };
+        let plan = plan_from_description(&desc, 1).unwrap();
+        apply_plan_to_session(&ctx, &desc, &plan).unwrap();
+
+        let tasks = crate::store::list_tasks_for_owner(&ctx.conn, "backend").unwrap();
+        assert_eq!(tasks.len(), 2, "each planned item becomes a ledger task");
+        let api = tasks
+            .iter()
+            .find(|t| t.subject == "wire up the API")
+            .expect("api task present");
+        assert_eq!(api.state, crate::models::TaskState::Ready);
+        assert_eq!(api.priority, "high");
+        assert_eq!(api.owner_agent, "backend");
+        assert_eq!(api.path_scope, vec!["src/backend/**".to_string()]);
+
+        // Re-applying the same plan must not duplicate tasks.
+        apply_plan_to_session(&ctx, &desc, &plan).unwrap();
+        let tasks2 = crate::store::list_tasks_for_owner(&ctx.conn, "backend").unwrap();
+        assert_eq!(
+            tasks2.len(),
+            2,
+            "re-apply reuses existing tasks by subject, no duplicates"
+        );
+    }
+
+    #[test]
+    fn reapplying_an_updated_plan_resyncs_an_already_registered_agent() {
+        // Exact real-world scenario: a domain gets applied once before the
+        // user ever picks a model (agent registers with no launcher), then
+        // the user assigns a model in the Biplane UI and re-applies. The
+        // already-existing agent must pick up the new model -- previously it
+        // was silently skipped forever and stayed stuck with no launcher no
+        // matter how many times the plan was re-applied.
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = migrated_ctx(&temp);
+
+        let desc_v1 = ProjectDescription {
+            name: "demo".into(),
+            description: String::new(),
+            domains: vec![plan_domain("backend", None)],
+            max_agents: Some(1),
+            default_model: None,
+        };
+        let plan_v1 = plan_from_description(&desc_v1, 1).unwrap();
+        apply_plan_to_session(&ctx, &desc_v1, &plan_v1).unwrap();
+        let before = crate::store::get_domain(&ctx.conn, "backend")
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.launcher_agent, None);
+
+        let desc_v2 = ProjectDescription {
+            name: "demo".into(),
+            description: String::new(),
+            domains: vec![plan_domain(
+                "backend",
+                Some("opencode/nemotron-3-ultra-free"),
+            )],
+            max_agents: Some(1),
+            default_model: None,
+        };
+        let plan_v2 = plan_from_description(&desc_v2, 1).unwrap();
+        let added = apply_plan_to_session(&ctx, &desc_v2, &plan_v2).unwrap();
+        assert_eq!(added, 0, "the agent already existed; nothing new was added");
+
+        let after = crate::store::get_domain(&ctx.conn, "backend")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.launcher_agent.as_deref(),
+            Some("opencode/nemotron-3-ultra-free"),
+            "re-applying must update the existing agent's model, not leave it stuck"
+        );
+    }
+
     #[test]
     fn planning_prompt_requests_a_multi_agent_split() {
         let prompt = compose_biplane_planning_prompt(
@@ -1940,9 +2202,17 @@ mod tests {
         for d in [&proj, &extra, &unrelated] {
             std::fs::create_dir_all(d).unwrap();
         }
-        std::fs::write(proj.join("README.md"), "# Juice Shop\nA shop that sells juice.").unwrap();
+        std::fs::write(
+            proj.join("README.md"),
+            "# Juice Shop\nA shop that sells juice.",
+        )
+        .unwrap();
         std::fs::write(extra.join("spec.md"), "Backend API for payment codes.").unwrap();
-        std::fs::write(unrelated.join("trelane.md"), "Trelane coordination protocol internals.").unwrap();
+        std::fs::write(
+            unrelated.join("trelane.md"),
+            "Trelane coordination protocol internals.",
+        )
+        .unwrap();
 
         // Only proj (root) + extra are sources; unrelated is omitted.
         let prompt = compose_sources_prompt(&proj, &[extra.clone()], 8);
@@ -1954,7 +2224,6 @@ mod tests {
 
         std::fs::remove_dir_all(&base).ok();
     }
-
 
     fn domain(name: &str, deps: &[&str], agents: usize) -> DomainSpec {
         DomainSpec {

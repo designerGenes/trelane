@@ -146,6 +146,12 @@ pub fn verbose_enabled(session: Option<&str>) -> bool {
 pub fn setup_session_ui(session: &str, ui: &UiConfig) -> Result<()> {
     let root_marker = format!("/tmp/trelane-{session}-root");
 
+    // Mouse mode: click a pane to focus it, drag borders to resize, scroll to
+    // scroll pane history. This is tmux's own built-in mouse protocol --
+    // universally supported, no per-terminal detection or configuration
+    // needed, unlike the keyboard pane-nav bindings below.
+    tmux("mouse mode", &["set-option", "-g", "mouse", "on"])?;
+
     // Diagnostics split: full-session `trelane status`.
     let status_cmd = format!(
         "trelane --root \"$(cat {root_marker} 2>/dev/null || echo $HOME)\" status; \
@@ -242,6 +248,32 @@ pub fn setup_session_ui(session: &str, ui: &UiConfig) -> Result<()> {
                 &["bind-key", "-n", key, "select-pane", dir],
             )?;
         }
+
+        // Guaranteed fallback: plain function keys, sent identically by every
+        // terminal with zero configuration. The bindings above are a nicer
+        // match for the detected terminal's own shortcuts when they work,
+        // but some (e.g. Alt/Option+arrow on stock macOS Terminal.app) only
+        // fire if the user has separately enabled a non-default preference
+        // ("Use Option as Meta key"), which trelane has no way to set for
+        // them. These four always work, so pane navigation never silently
+        // has zero working keyboard method.
+        for (key, dir) in [
+            (ui.keys.pane_left.as_str(), "-L"),
+            (ui.keys.pane_right.as_str(), "-R"),
+            (ui.keys.pane_up.as_str(), "-U"),
+            (ui.keys.pane_down.as_str(), "-D"),
+        ] {
+            tmux(
+                "bind-key pane-nav (guaranteed)",
+                &["bind-key", "-n", key, "select-pane", dir],
+            )?;
+        }
+        eprintln!(
+            "  pane-nav: {}/{}/{}/{} always work (any terminal, no setup) \
+             -- also try Ctrl-b then an arrow key (tmux's own default), \
+             or just click a pane (mouse mode is on).",
+            ui.keys.pane_left, ui.keys.pane_right, ui.keys.pane_up, ui.keys.pane_down
+        );
     }
     Ok(())
 }

@@ -6,7 +6,8 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "trelane",
     version,
-    about = "Squire-based multi-agent coordination protocol"
+    about = "Squire-based multi-agent coordination protocol",
+    disable_help_subcommand = true
 )]
 pub struct Cli {
     #[arg(long, global = true, help = "project root (default: walk up from cwd)")]
@@ -169,6 +170,8 @@ pub enum Command {
         task: Option<String>,
         #[arg(long = "grant")]
         grant: Option<String>,
+        #[arg(long, help = "active delegation id for a cross-domain claim")]
+        delegation: Option<String>,
     },
 
     /// Release a file lease
@@ -254,6 +257,11 @@ pub enum Command {
             help = "narrate normally-quiet events (e.g. concurrency-budget deferrals)"
         )]
         verbose: bool,
+        #[arg(
+            long = "max-concurrent",
+            help = "override squire.max_concurrent for this run (simultaneous agent ceiling)"
+        )]
+        max_concurrent: Option<usize>,
     },
 
     /// Token-free scripted agent for demos and testing
@@ -288,7 +296,7 @@ pub enum Command {
         interactive: bool,
         #[arg(
             long = "ui",
-            help = "open the interactive Biplane editor TUI (the default when no headless flags are given)"
+            help = "open the interactive Biplane editor TUI (amber-themed) to review and edit domains"
         )]
         ui: bool,
         #[arg(
@@ -319,6 +327,186 @@ pub enum Command {
     /// Interactive diagnostic view for the main Trelane session (TUI)
     Diagnostic,
 
+    /// Inspect or change Trelane configuration values
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+
+    /// Request, offer, grant, deny, or revoke bounded cross-domain help
+    Help {
+        #[command(subcommand)]
+        action: HelpAction,
+    },
+
+    /// Inspect and manage the durable work ledger (C1)
+    Work {
+        #[command(subcommand)]
+        action: WorkAction,
+    },
+
     /// Kill all trelane tmux sessions and stop all running agents
     Kill,
+}
+
+#[derive(Subcommand)]
+pub enum ConfigAction {
+    /// Print a config value, e.g. `trelane config get squire.max_concurrent`
+    Get { key: String },
+    /// Set a config value and save it to the global config file
+    Set { key: String, value: String },
+    /// Explain a config value: what it means, its effective value, and how to change it
+    Explain { key: String },
+}
+
+#[derive(Subcommand)]
+pub enum HelpAction {
+    /// Ask a specific helper to assist an owned task
+    Request {
+        #[arg(long = "from")]
+        from: String,
+        #[arg(long = "to")]
+        to: String,
+        #[arg(long)]
+        task: String,
+        #[arg(long = "path")]
+        paths: Vec<String>,
+        #[arg(long)]
+        need: String,
+    },
+    /// Offer bounded assistance to a specific task owner
+    Offer {
+        #[arg(long = "from")]
+        from: String,
+        #[arg(long = "to")]
+        to: String,
+        #[arg(long)]
+        task: String,
+        #[arg(long = "path")]
+        paths: Vec<String>,
+        #[arg(long)]
+        plan: String,
+        #[arg(long)]
+        deliverable: String,
+        #[arg(long = "allowed-op")]
+        allowed_ops: Vec<String>,
+    },
+    /// Accept and optionally narrow a pending help offer
+    Accept {
+        id: String,
+        #[arg(long)]
+        by: String,
+        #[arg(long = "path")]
+        paths: Vec<String>,
+        #[arg(long = "allowed-op")]
+        allowed_ops: Vec<String>,
+        #[arg(long)]
+        ttl: u64,
+    },
+    /// Deny a pending help offer
+    Deny {
+        id: String,
+        #[arg(long)]
+        by: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Revoke an offered, active, or submitted delegation
+    Revoke {
+        id: String,
+        #[arg(long)]
+        by: String,
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum WorkAction {
+    /// List tasks in the ledger (optionally filtered by owner and/or state)
+    List {
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(
+            long,
+            help = "filter by state: draft|ready|active|blocked|review|done|cancelled"
+        )]
+        state: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, help = "only open, non-owned tasks accepting assistance")]
+        assistable: bool,
+        #[arg(long, help = "prospective helper; excludes their own tasks")]
+        agent: Option<String>,
+    },
+    /// Show a single task with its assignments, delegations, and reviews
+    Show { id: String },
+    /// Add a task to the ledger
+    Add {
+        #[arg(long)]
+        owner: String,
+        #[arg(long)]
+        subject: String,
+        #[arg(long, default_value = "")]
+        body: String,
+        #[arg(long, default_value = "normal", help = "low|normal|high|critical")]
+        priority: String,
+        #[arg(long = "path", help = "path-scope glob (repeatable)")]
+        paths: Vec<String>,
+        #[arg(long = "accept", help = "acceptance criterion (repeatable)")]
+        acceptance: Vec<String>,
+        #[arg(
+            long = "blocked-by",
+            help = "task id this task depends on (repeatable)"
+        )]
+        blocked_by: Vec<String>,
+        #[arg(
+            long = "parallelism",
+            default_value_t = 1,
+            help = "how many agents may work it at once"
+        )]
+        parallelism: u32,
+        #[arg(
+            long = "assist",
+            default_value = "open",
+            help = "assist policy: open|solo"
+        )]
+        assist: String,
+    },
+    /// Submit a validated Git commit for owner/reviewer review
+    Submit {
+        task: String,
+        #[arg(long)]
+        by: String,
+        #[arg(long)]
+        delegation: String,
+        #[arg(long)]
+        commit: String,
+        #[arg(long)]
+        summary: String,
+        #[arg(long)]
+        tests: String,
+    },
+    /// Review a helper submission
+    #[command(group(
+        clap::ArgGroup::new("decision")
+            .required(true)
+            .multiple(false)
+            .args(["accept", "request_changes", "reject"])
+    ))]
+    Review {
+        task: String,
+        #[arg(long)]
+        by: String,
+        #[arg(long)]
+        delegation: String,
+        #[arg(long)]
+        accept: bool,
+        #[arg(long = "request-changes")]
+        request_changes: bool,
+        #[arg(long)]
+        reject: bool,
+        #[arg(long, default_value = "")]
+        notes: String,
+    },
 }

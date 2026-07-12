@@ -79,8 +79,7 @@ pub enum ScenarioStep {
         waiting_on: String,
         resume_hint: String,
     },
-    #[serde(alias = "Pump", alias = "Prop")]
-    Squire {
+    Pump {
         explanation: String,
         ticks: u32,
     },
@@ -89,8 +88,7 @@ pub enum ScenarioStep {
         agent: String,
         why: String,
     },
-    #[serde(alias = "SquireWatch")]
-    SquireWatch {
+    PumpWatch {
         explanation: String,
         interval_s: u64,
         max_ticks: u32,
@@ -127,7 +125,7 @@ pub struct ScenarioReport {
     pub result: String,
     pub sandbox: String,
     pub messages_sent: usize,
-    pub squire_ticks: u32,
+    pub pumps: u32,
     pub redomains: u32,
     pub deadlocks_detected: usize,
     pub metrics: Vec<String>,
@@ -137,7 +135,7 @@ pub struct ScenarioReport {
 #[derive(Default)]
 struct Counters {
     messages_sent: usize,
-    squire_ticks: u32,
+    pumps: u32,
     redomains: u32,
 }
 
@@ -340,19 +338,19 @@ fn run_once(
                     resume_hint,
                 )?;
             }
-            ScenarioStep::Squire {
+            ScenarioStep::Pump {
                 explanation: _,
                 ticks,
             } => {
-                let launcher = resolve_squire_launcher(scenario, launcher_override);
+                let launcher = resolve_pump_launcher(scenario, launcher_override);
                 let override_arg = (!launcher.is_empty()).then_some(launcher.as_str());
                 for tick in 0..*ticks {
-                    println!("[testing] squire tick {} of {}", tick + 1, ticks);
-                    crate::squire::tick(&ctx, override_arg, true)?;
+                    println!("[testing] pump tick {} of {}", tick + 1, ticks);
+                    crate::squire::tick(&ctx, override_arg, false)?;
                     if matches!(scenario.mode, ScenarioMode::Stub) {
                         wait_for_idle(&ctx, 40, std::time::Duration::from_millis(250))?;
                     }
-                    counters.squire_ticks += 1;
+                    counters.pumps += 1;
                 }
             }
             ScenarioStep::Wake {
@@ -362,20 +360,20 @@ fn run_once(
             } => {
                 commands::cmd_wake(&ctx, agent, Some(why.as_str()), None)?;
             }
-            ScenarioStep::SquireWatch {
+            ScenarioStep::PumpWatch {
                 explanation: _,
                 interval_s,
                 max_ticks,
                 idle_grace_ticks,
             } => {
-                let launcher = resolve_squire_launcher(scenario, launcher_override);
+                let launcher = resolve_pump_launcher(scenario, launcher_override);
                 let override_arg = (!launcher.is_empty()).then_some(launcher.as_str());
                 let mut idle_ticks = 0u32;
                 let mut quiesced = false;
                 for tick in 0..*max_ticks {
-                    println!("[testing] squire watch tick {} of {}", tick + 1, max_ticks);
-                    crate::squire::tick(&ctx, override_arg, true)?;
-                    counters.squire_ticks += 1;
+                    println!("[testing] pump watch tick {} of {}", tick + 1, max_ticks);
+                    crate::squire::tick(&ctx, override_arg, false)?;
+                    counters.pumps += 1;
                     if matches!(scenario.mode, ScenarioMode::Stub) {
                         wait_for_idle(&ctx, 40, std::time::Duration::from_millis(250))?;
                     }
@@ -404,7 +402,7 @@ fn run_once(
                 // when the swarm had actually settled.
                 if !quiesced && !swarm_quiescent(&ctx)? {
                     return Err(TrelaneError::msg(
-                        "squire watch exhausted max_ticks before the swarm became quiescent",
+                        "pump watch exhausted max_ticks before the swarm became quiescent",
                     ));
                 }
             }
@@ -436,7 +434,7 @@ fn run_once(
                 counters.redomains += 1;
             }
             ScenarioStep::AssertNoDeadlock { explanation: _ } => {
-                let (_, cycle) = crate::squire::wait_graph(&ctx.conn)?;
+                let (_, cycle) = crate::pump::wait_graph(&ctx.conn)?;
                 if cycle.is_some() {
                     return Err(TrelaneError::msg(
                         "scenario assertion failed: deadlock still present",
@@ -459,7 +457,7 @@ fn run_once(
     }
 
     let ended_at = chrono::Utc::now();
-    let (_, cycle) = crate::squire::wait_graph(&ctx.conn)?;
+    let (_, cycle) = crate::pump::wait_graph(&ctx.conn)?;
     let deadlocks_detected = usize::from(cycle.is_some());
 
     Ok(ScenarioReport {
@@ -475,7 +473,7 @@ fn run_once(
         },
         sandbox: run_dir.display().to_string(),
         messages_sent: counters.messages_sent,
-        squire_ticks: counters.squire_ticks,
+        pumps: counters.pumps,
         redomains: counters.redomains,
         deadlocks_detected,
         metrics: scenario.metrics.clone(),
@@ -490,9 +488,9 @@ fn step_name(step: &ScenarioStep) -> &'static str {
     match step {
         ScenarioStep::Send { .. } => "send",
         ScenarioStep::Park { .. } => "park",
-        ScenarioStep::Squire { .. } => "squire",
+        ScenarioStep::Pump { .. } => "pump",
         ScenarioStep::Wake { .. } => "wake",
-        ScenarioStep::SquireWatch { .. } => "squire-watch",
+        ScenarioStep::PumpWatch { .. } => "pump-watch",
         ScenarioStep::ClaimExpectDenied { .. } => "claim-expect-denied",
         ScenarioStep::Redomain { .. } => "redomain",
         ScenarioStep::AssertNoDeadlock { .. } => "assert-no-deadlock",
@@ -504,9 +502,9 @@ fn step_explanation(step: &ScenarioStep) -> &str {
     match step {
         ScenarioStep::Send { explanation, .. }
         | ScenarioStep::Park { explanation, .. }
-        | ScenarioStep::Squire { explanation, .. }
+        | ScenarioStep::Pump { explanation, .. }
         | ScenarioStep::Wake { explanation, .. }
-        | ScenarioStep::SquireWatch { explanation, .. }
+        | ScenarioStep::PumpWatch { explanation, .. }
         | ScenarioStep::ClaimExpectDenied { explanation, .. }
         | ScenarioStep::Redomain { explanation, .. }
         | ScenarioStep::AssertNoDeadlock { explanation }
@@ -571,14 +569,14 @@ fn default_stub_launcher() -> String {
         .unwrap_or_else(|_| "trelane --root {root} stub {agent}".to_string())
 }
 
-/// Resolve the launcher template a Squire/SquireWatch step should pass to
+/// Resolve the launcher template a Pump/PumpWatch step should pass to
 /// `squire::tick`. In Stub mode we always fall back to the token-free stub
 /// launcher when nothing was explicitly provided. In Interactive mode we never
 /// force the stub -- an empty string means "no override", so `squire::tick` will
 /// fall through to each agent's own `launcher_agent` -> `launcher.profiles`
 /// resolution in `cmd_wake` (which is what lets different agents run under
 /// different real models). Returns an empty string to mean "no override".
-fn resolve_squire_launcher(scenario: &Scenario, launcher_override: Option<&str>) -> String {
+fn resolve_pump_launcher(scenario: &Scenario, launcher_override: Option<&str>) -> String {
     match scenario.mode {
         ScenarioMode::Stub => launcher_override
             .map(str::to_string)

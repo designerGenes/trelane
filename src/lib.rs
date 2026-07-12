@@ -17,7 +17,6 @@ pub mod squire;
 pub mod store;
 pub mod telemetry;
 pub mod testing;
-pub mod text_input;
 
 use crate::cli::{Cli, Command};
 use crate::domain::find_root;
@@ -69,6 +68,17 @@ pub fn load_config() -> Result<Config> {
     let text = std::fs::read_to_string(&path)
         .map_err(|e| TrelaneError::msg(format!("cannot read config at {}: {e}", path.display())))?;
     Ok(serde_json::from_str(&text)?)
+}
+
+/// Persist a config to the global config file as pretty JSON, creating the
+/// parent directory if necessary.
+pub fn save_config(config: &Config) -> Result<()> {
+    let path = config_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(config)?)?;
+    Ok(())
 }
 
 pub struct Context {
@@ -191,72 +201,14 @@ fn cmd_launch(cli: Cli) -> Result<()> {
             }
             println!();
         } else {
-            // No agents yet and --with-biplane not given. Instead of dead-ending,
-            // look for a saved Biplane report (the curated description written by
-            // `trelane biplane`) and offer a one-key launch from it. In a
-            // non-interactive context, keep the old scriptable behavior.
-            use std::io::IsTerminal;
-            let desc_path = root.join(TRELANE_DIR).join("biplane-description.json");
-            if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-                println!("[launch] No agents registered. Use --with-biplane or add agents manually.");
-                println!(
-                    "[launch] Run: trelane {} --models {} --max-agents {} --with-biplane",
-                    root.display(),
-                    primary_model,
-                    max_agents
-                );
-                return Ok(());
-            }
-
-            if desc_path.exists() {
-                let desc = biplane::load_project_description(&desc_path)?;
-                println!("[launch] Found Biplane report: {}", desc_path.display());
-                println!(
-                    "  Project : {}  |  {} domain(s), budget {} agent(s)",
-                    desc.name,
-                    desc.domains.len(),
-                    desc.max_agents.unwrap_or_else(|| desc.domains.len().max(1))
-                );
-                for d in &desc.domains {
-                    println!(
-                        "    - {:<16} agents:{} model:{} writable:{}",
-                        d.name,
-                        d.agents,
-                        d.model.as_deref().unwrap_or("(default)"),
-                        d.writable.join(",")
-                    );
-                }
-                println!();
-                print!("  [Enter] launch from this report   b: edit in Biplane UI   q: quit > ");
-                use std::io::Write;
-                std::io::stdout().flush()?;
-                let mut line = String::new();
-                std::io::stdin().read_line(&mut line)?;
-                match line.trim() {
-                    "" => {
-                        let ctx = Context::open(Some(&root))?;
-                        let added = biplane::apply_description_to_session(&ctx, &desc)?;
-                        println!(
-                            "[launch] Registered {added} agent(s) from the Biplane report; starting session..."
-                        );
-                        println!();
-                        // fall through into the session startup below
-                    }
-                    "b" | "B" => return biplane_ui::run(&root),
-                    _ => return Ok(()),
-                }
-            } else {
-                println!("[launch] No agents registered and no Biplane report found.");
-                print!("  [Enter] open Biplane UI to create one   q: quit > ");
-                use std::io::Write;
-                std::io::stdout().flush()?;
-                let mut line = String::new();
-                std::io::stdin().read_line(&mut line)?;
-                if line.trim().is_empty() {
-                    return biplane_ui::run(&root);
-                }
-                return Ok(());
-            }
+            println!("[launch] No agents registered. Use --with-biplane or add agents manually.");
+            println!(
+                "[launch] Run: trelane {} --models {} --max-agents {} --with-biplane",
+                root.display(),
+                primary_model,
+                max_agents
+            );
+            return Ok(());
         }
     } else {
         // Resume mode: agents already exist. Clear ALL running locks since
@@ -490,20 +442,7 @@ pub fn handle(cli: Cli) -> Result<()> {
     }
 
     match cli.command {
-        None => {
-            // `trelane` by itself is the session entry point: on a real
-            // terminal it goes straight to the launch flow, which detects a
-            // saved Biplane report (offering a one-key launch from it), offers
-            // the Biplane UI when there is none, or resumes existing agents
-            // into the tmux session. The static welcome screen remains for
-            // non-interactive invocations.
-            use std::io::IsTerminal;
-            if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-                cmd_launch(cli)
-            } else {
-                biplane::cmd_welcome(cli.project)
-            }
-        }
+        None => biplane::cmd_welcome(cli.project),
         Some(Command::Init { project }) => commands::cmd_init(project.or(cli.project)),
         Some(Command::Attach { project, no_inject }) => commands::cmd_attach_project(
             project.or(cli.project),
@@ -567,9 +506,18 @@ pub fn handle(cli: Cli) -> Result<()> {
             ttl,
             task,
             grant,
+            delegation,
         }) => {
             let ctx = Context::open(cli.root.as_deref())?;
-            commands::cmd_claim(&ctx, &agent, &path, ttl, task.as_deref(), grant.as_deref())
+            commands::cmd_claim(
+                &ctx,
+                &agent,
+                &path,
+                ttl,
+                task.as_deref(),
+                grant.as_deref(),
+                delegation.as_deref(),
+            )
         }
         Some(Command::Release { agent, path, force }) => {
             let ctx = Context::open(cli.root.as_deref())?;
@@ -660,16 +608,7 @@ pub fn handle(cli: Cli) -> Result<()> {
             accept_defaults,
             json,
         }) => {
-            // UI-first: `trelane biplane` with no headless-mode flags opens the
-            // interactive editor. Headless modes stay reachable via their flags
-            // (--describe, --interactive, --json, --safe-pocket-dir), and
-            // non-TTY invocations keep the old report output for scripts.
-            let is_tty = {
-                use std::io::IsTerminal;
-                std::io::stdout().is_terminal()
-            };
-            let bare = !interactive && describe.is_none() && !json && safe_pocket_dir.is_none();
-            if ui || (bare && is_tty) {
+            if ui {
                 let root = match cli.root.as_deref() {
                     Some(p) => p.to_path_buf(),
                     None => std::env::current_dir()?,
@@ -717,8 +656,18 @@ pub fn handle(cli: Cli) -> Result<()> {
             interval,
             launcher,
             verbose,
+            max_concurrent,
         }) => {
-            let ctx = Context::open(cli.root.as_deref())?;
+            let mut ctx = Context::open(cli.root.as_deref())?;
+            // A `--max-concurrent N` flag overrides the configured ceiling for
+            // just this squire process, without touching the saved config.
+            if let Some(mc) = max_concurrent {
+                ctx.config.squire.max_concurrent = mc;
+                eprintln!(
+                    "{} squire: max_concurrent overridden to {mc} for this run",
+                    crypto::now_iso()
+                );
+            }
             // The launch script exports TRELANE_SESSION so the squire can own
             // the session UI (status bar, key bindings, verbose marker).
             let session = std::env::var("TRELANE_SESSION")
@@ -838,8 +787,160 @@ pub fn handle(cli: Cli) -> Result<()> {
             let ctx = Context::open(cli.root.as_deref())?;
             diagnostic::run(&ctx)
         }
+        Some(Command::Config { action }) => cmd_config(&action),
+        Some(Command::Help { action }) => {
+            let ctx = Context::open(cli.root.as_deref())?;
+            commands::cmd_help(&ctx, &action)
+        }
+        Some(Command::Work { action }) => {
+            let ctx = Context::open(cli.root.as_deref())?;
+            commands::cmd_work(&ctx, &action)
+        }
         Some(Command::Kill) => cmd_kill(),
     }
+}
+
+// ---------------------------------------------------------------- config cmd
+
+/// Comma-separated list of config keys the `config` command understands, for
+/// use in "unknown key" errors. Keep in sync with the match arms below.
+const KNOWN_CONFIG_KEYS: &str =
+    "squire.max_concurrent, squire.interval_s, squire.reply_timeout_s, claims.default_ttl_s";
+
+fn unknown_config_key(key: &str) -> TrelaneError {
+    TrelaneError::msg(format!(
+        "unknown config key '{key}'. Known keys: {KNOWN_CONFIG_KEYS}"
+    ))
+}
+
+/// Read a config value by dotted key, formatted for display.
+fn config_get(config: &Config, key: &str) -> Result<String> {
+    Ok(match key {
+        "squire.max_concurrent" => config.squire.max_concurrent.to_string(),
+        "squire.interval_s" => config.squire.interval_s.to_string(),
+        "squire.reply_timeout_s" => config
+            .squire
+            .reply_timeout_s
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        "claims.default_ttl_s" => config.claims.default_ttl_s.to_string(),
+        _ => return Err(unknown_config_key(key)),
+    })
+}
+
+/// Parse and apply a config value by dotted key. Validates per-field.
+fn config_set(config: &mut Config, key: &str, value: &str) -> Result<()> {
+    let parse_u64 = |v: &str| -> Result<u64> {
+        v.parse::<u64>()
+            .map_err(|_| TrelaneError::msg(format!("'{v}' is not a valid integer for {key}")))
+    };
+    match key {
+        "squire.max_concurrent" => {
+            let n: usize = value.parse().map_err(|_| {
+                TrelaneError::msg(format!(
+                    "'{value}' is not a valid non-negative integer for {key}"
+                ))
+            })?;
+            if n == 0 {
+                return Err(TrelaneError::msg(
+                    "squire.max_concurrent must be at least 1 (0 would run no agents)".to_string(),
+                ));
+            }
+            config.squire.max_concurrent = n;
+        }
+        "squire.interval_s" => config.squire.interval_s = parse_u64(value)?,
+        "squire.reply_timeout_s" => {
+            config.squire.reply_timeout_s = match value {
+                "none" | "off" | "" => None,
+                v => Some(parse_u64(v)?),
+            };
+        }
+        "claims.default_ttl_s" => config.claims.default_ttl_s = parse_u64(value)?,
+        _ => return Err(unknown_config_key(key)),
+    }
+    Ok(())
+}
+
+fn cmd_config(action: &cli::ConfigAction) -> Result<()> {
+    match action {
+        cli::ConfigAction::Get { key } => {
+            let config = load_config()?;
+            println!("{key} = {}", config_get(&config, key)?);
+            Ok(())
+        }
+        cli::ConfigAction::Set { key, value } => {
+            let mut config = load_config()?;
+            config_set(&mut config, key, value)?;
+            save_config(&config)?;
+            println!("set {key} = {}", config_get(&config, key)?);
+            println!("saved to {}", config_path().display());
+            Ok(())
+        }
+        cli::ConfigAction::Explain { key } => cmd_config_explain(key),
+    }
+}
+
+fn cmd_config_explain(key: &str) -> Result<()> {
+    let config = load_config()?;
+    let effective = config_get(&config, key)?;
+    let meaning = match key {
+        "squire.max_concurrent" => {
+            "The maximum number of agents the squire runs SIMULTANEOUSLY. This is a\n\
+             scheduling ceiling, not the number of registered agents -- a swarm may have\n\
+             many more agents registered than this. When ready work exceeds the ceiling,\n\
+             the extra agents are deferred to a later tick, which can look like \"agents\n\
+             registered but idle\". Compiled default: 2."
+        }
+        "squire.interval_s" => {
+            "How often (in seconds) `trelane squire --watch` runs a scheduling tick."
+        }
+        "squire.reply_timeout_s" => {
+            "Seconds a reply-wait park may sit before the squire declares it abandoned and\n\
+             wakes the waiting agent. 'none' disables timeout-based abandonment."
+        }
+        "claims.default_ttl_s" => {
+            "Default lease duration (in seconds) for a file claim when --ttl is not given."
+        }
+        _ => return Err(unknown_config_key(key)),
+    };
+
+    println!("key       : {key}");
+    println!("effective : {effective}");
+    println!("source    : {}", config_path().display());
+    println!("meaning   :");
+    for line in meaning.lines() {
+        println!("  {line}");
+    }
+    println!("change    :");
+    println!(
+        "  config file : edit \"{key}\" in {}",
+        config_path().display()
+    );
+    println!("  cli         : trelane config set {key} <value>");
+    if key == "squire.max_concurrent" {
+        println!("  single run  : trelane squire --max-concurrent <value>");
+        // Best-effort live utilization, only if we're inside a project. This is
+        // deliberately side-effect-free: it reads registered/running counts but
+        // does NOT run the candidate scan (which records cycle-break attempts).
+        if let Ok(ctx) = Context::open(None)
+            && let Ok(agents) = store::list_agents(&ctx.conn)
+        {
+            let running = agents
+                .iter()
+                .filter(|a| commands::is_running(&ctx.conn, a).unwrap_or(false))
+                .count();
+            let limit = ctx.config.squire.max_concurrent;
+            println!("live      :");
+            println!(
+                "  {} registered / {} running / limit {} ({} slot(s) free)",
+                agents.len(),
+                running,
+                limit,
+                limit.saturating_sub(running),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn print_metrics(m: &telemetry::MetricsSummary) {

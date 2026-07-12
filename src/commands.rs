@@ -107,23 +107,190 @@ pub fn owners_of(conn: &Connection, rel: &str, exclude: Option<&str>) -> Result<
     Ok(owners)
 }
 
-fn grant_covers(
-    conn: &Connection,
-    agent: &str,
-    grant_msg_id: &str,
-    rel: &str,
-    secret: &[u8],
-) -> Result<bool> {
-    if let Some(msg) = store::get_message(conn, grant_msg_id)?
-        && msg.to == agent
-        && msg.msg_type == "claim-grant"
-        && crypto::verify(secret, &msg)
-        && msg.paths.iter().any(|p| p == rel)
-    {
-        let owners = owners_of(conn, rel, None)?;
-        return Ok(owners.contains(&msg.from));
+fn normalize_scope_entry(root: &Path, value: &str) -> Result<String> {
+    if value.trim().is_empty() {
+        return Err(TrelaneError::msg("path scope entries cannot be empty"));
     }
-    Ok(false)
+    if Path::new(value).is_absolute() {
+        return domain::norm_rel(root, value);
+    }
+    let normalized = value.replace(std::path::MAIN_SEPARATOR, "/");
+    let normalized = normalized.strip_prefix("./").unwrap_or(&normalized);
+    if normalized
+        .split('/')
+        .any(|part| part == ".." || part.is_empty())
+    {
+        return Err(TrelaneError::msg(format!(
+            "invalid project-relative path scope '{value}'"
+        )));
+    }
+    Ok(normalized.to_string())
+}
+
+fn normalize_scope(root: &Path, values: &[String]) -> Result<Vec<String>> {
+    values
+        .iter()
+        .map(|value| normalize_scope_entry(root, value))
+        .collect()
+}
+
+fn scope_is_subset(candidates: &[String], parents: &[String]) -> Result<bool> {
+    for candidate in candidates {
+        let mut proved = false;
+        for parent in parents {
+            if domain::scope_entry_is_subset(candidate, parent)? {
+                proved = true;
+                break;
+            }
+        }
+        if !proved {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn validate_delegable_scope(
+    ctx: &Context,
+    task: &Task,
+    owner: &str,
+    values: &[String],
+) -> Result<Vec<String>> {
+    if values.is_empty() {
+        return Err(TrelaneError::msg(
+            "help requires at least one path scope (the task has no usable default)",
+        ));
+    }
+    let scope = normalize_scope(&ctx.root, values)?;
+    if !scope_is_subset(&scope, &task.path_scope)? {
+        return Err(TrelaneError::msg(
+            "proposed path scope is not a provable subset of the task scope",
+        ));
+    }
+    let owner_domain = store::get_domain(&ctx.conn, owner)?
+        .ok_or_else(|| TrelaneError::msg(format!("unknown owner agent '{owner}'")))?;
+    for entry in &scope {
+        if !domain::domain_allows_scope(&owner_domain, entry)? {
+            return Err(TrelaneError::msg(format!(
+                "path scope '{entry}' is outside the owner's writable scope or intersects a forbidden path"
+            )));
+        }
+    }
+    Ok(scope)
+}
+
+fn delegation_expiry(delegation: &Delegation) -> Result<chrono::DateTime<chrono::Utc>> {
+    let value = delegation
+        .expires_at
+        .as_deref()
+        .ok_or_else(|| TrelaneError::msg("delegation has no expiry"))?;
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map_err(|_| TrelaneError::msg("delegation has an invalid expiry"))
+}
+
+fn grant_message_verifies(
+    ctx: &Context,
+    delegation: &Delegation,
+    explicit_grant: Option<&str>,
+) -> Result<bool> {
+    if delegation.grant_message.is_empty()
+        || explicit_grant.is_some_and(|id| id != delegation.grant_message)
+    {
+        return Ok(false);
+    }
+    let Some(msg) = store::get_message(&ctx.conn, &delegation.grant_message)? else {
+        return Ok(false);
+    };
+    let body: serde_json::Value = match serde_json::from_str(&msg.body) {
+        Ok(body) => body,
+        Err(_) => return Ok(false),
+    };
+    Ok(msg.from == delegation.owner_agent
+        && msg.to == delegation.helper_agent
+        && msg.msg_type == "help-accept"
+        && msg.task.as_deref() == Some(delegation.task_id.as_str())
+        && msg.re.as_deref() == Some(delegation.offer_message.as_str())
+        && msg.paths == delegation.scope
+        && body.get("delegation_id").and_then(|v| v.as_str()) == Some(delegation.id.as_str())
+        && body.get("allowed_ops")
+            == Some(&serde_json::to_value(&delegation.allowed_ops).unwrap_or_default())
+        && body.get("expires_at").and_then(|v| v.as_str()) == delegation.expires_at.as_deref()
+        && crypto::verify(&ctx.secret()?, &msg))
+}
+
+fn authorize_delegated_claim(
+    ctx: &Context,
+    helper: &str,
+    delegation_id: &str,
+    explicit_grant: Option<&str>,
+    task_id: Option<&str>,
+    rel: &str,
+) -> Result<(Delegation, chrono::DateTime<chrono::Utc>)> {
+    let delegation = store::get_delegation(&ctx.conn, delegation_id)?
+        .ok_or_else(|| TrelaneError::msg(format!("no delegation '{delegation_id}'")))?;
+    if delegation.status != DelegationStatus::Active {
+        return Err(TrelaneError::msg(format!(
+            "delegation '{delegation_id}' is {}, not active",
+            delegation.status.as_str()
+        )));
+    }
+    if delegation.helper_agent != helper {
+        return Err(TrelaneError::msg(format!(
+            "delegation '{delegation_id}' is for helper '{}', not '{helper}'",
+            delegation.helper_agent
+        )));
+    }
+    if task_id.is_some_and(|task| task != delegation.task_id) {
+        return Err(TrelaneError::msg(
+            "claim task does not match the delegation task",
+        ));
+    }
+    let task = store::get_task(&ctx.conn, &delegation.task_id)?
+        .ok_or_else(|| TrelaneError::msg("delegation task no longer exists"))?;
+    if task.state.is_terminal() {
+        return Err(TrelaneError::msg("delegation task is terminal"));
+    }
+    if !domain::scope_covers_path(&task.path_scope, rel)? {
+        return Err(TrelaneError::msg(format!(
+            "task scope does not cover '{rel}'"
+        )));
+    }
+    let expiry = delegation_expiry(&delegation)?;
+    if expiry <= chrono::Utc::now() {
+        return Err(TrelaneError::msg(format!(
+            "delegation '{delegation_id}' is expired"
+        )));
+    }
+    if domain::is_hard_forbidden(rel) {
+        return Err(TrelaneError::msg(format!(
+            "hard-forbidden path '{rel}' cannot be delegated"
+        )));
+    }
+    if !delegation.allowed_ops.iter().any(|op| op == "write") {
+        return Err(TrelaneError::msg(
+            "delegation does not allow the write operation",
+        ));
+    }
+    if !domain::scope_covers_path(&delegation.scope, rel)? {
+        return Err(TrelaneError::msg(format!(
+            "delegation scope does not cover '{rel}'"
+        )));
+    }
+    let owner_domain = store::get_domain(&ctx.conn, &delegation.owner_agent)?
+        .ok_or_else(|| TrelaneError::msg("delegation owner no longer exists"))?;
+    if !CompiledDomain::from_domain(&owner_domain)?.is_writable(rel) {
+        return Err(TrelaneError::msg(format!(
+            "delegation owner '{}' no longer owns '{rel}'",
+            delegation.owner_agent
+        )));
+    }
+    if !grant_message_verifies(ctx, &delegation, explicit_grant)? {
+        return Err(TrelaneError::msg(
+            "delegation's signed help-accept grant is missing, invalid, or mismatched",
+        ));
+    }
+    Ok((delegation, expiry))
 }
 
 fn git_dirty(root: &Path) -> Option<HashMap<String, String>> {
@@ -411,12 +578,31 @@ fn launcher_command_for_agent(
 
     let domain = store::get_domain(&ctx.conn, agent)?
         .ok_or_else(|| TrelaneError::msg(format!("unknown agent '{agent}'")))?;
-    let template = domain
-        .launcher_agent
-        .as_deref()
-        .and_then(|name| ctx.config.launcher.profiles.get(name))
-        .map(String::as_str)
-        .unwrap_or(&ctx.config.launcher.template);
+
+    let template = match domain.launcher_agent.as_deref() {
+        // A configured launcher PROFILE name (claude-code/opencode/copilot/...).
+        Some(name) if ctx.config.launcher.profiles.contains_key(name) => {
+            ctx.config.launcher.profiles.get(name).unwrap().clone()
+        }
+        // Any other non-empty value is treated as an exact opencode model id
+        // (this is what the Biplane UI's model selector stores -- raw lines
+        // from `opencode models`, e.g. "openrouter/z-ai/glm-5.2"). Without
+        // this branch such a value matched no profile and silently fell back
+        // to the default launcher template, so a model chosen in the UI never
+        // actually took effect. Building an explicit opencode+model command
+        // here mirrors the same pattern Biplane's own planning call uses.
+        Some(model_id) if !model_id.is_empty() => {
+            format!("opencode run --model {model_id} --dir {{root}} \"$(cat {{prompt_file}})\"")
+        }
+        // No launcher was ever explicitly chosen for this agent. Do NOT
+        // silently fall back to the global default template: that default is
+        // a real CLI invocation (out of the box, Anthropic's `claude`) that
+        // can bill the user's account. Launching that without an explicit,
+        // per-agent choice risks unintended real-money spend, so refuse
+        // instead -- this must never happen implicitly.
+        _ => return Err(TrelaneError::launcher_not_configured(agent)),
+    };
+
     Ok(template
         .replace("{prompt_file}", &prompt_file.display().to_string())
         .replace("{agent}", agent)
@@ -744,76 +930,116 @@ pub fn cmd_claim(
     ttl: Option<u64>,
     task: Option<&str>,
     grant: Option<&str>,
+    delegation: Option<&str>,
 ) -> Result<()> {
     if !store::agent_exists(&ctx.conn, agent)? {
         return Err(TrelaneError::msg(format!("unknown agent '{agent}'")));
     }
+    store::expire_stale_delegations(&ctx.conn, &crypto::now_iso())?;
     let rel = domain::norm_rel(&ctx.root, path)?;
-    if rel.starts_with(".trelane/") || rel == ".trelane" {
-        return Err(TrelaneError::msg("never claim .trelane internals"));
+    if domain::is_hard_forbidden(&rel) {
+        return Err(TrelaneError::msg(format!(
+            "never claim hard-forbidden path '{rel}'"
+        )));
     }
 
     let ttl = ttl.unwrap_or(ctx.config.claims.default_ttl_s);
     let now_ts = chrono::Utc::now().timestamp() as f64;
-    let expires_at = now_ts + ttl as f64;
-    let expires_human = chrono::Utc::now()
-        .checked_add_signed(chrono::Duration::seconds(ttl as i64))
-        .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
-        .unwrap_or_default();
-
-    // Check existing lease
-    if let Some(lease) = store::get_claim(&ctx.conn, &rel)? {
-        if lease.expires_at >= now_ts {
-            if lease.holder == agent {
-                store::update_claim_expiry(&ctx.conn, &rel, expires_at, &expires_human)?;
-                println!("renewed lease on {rel} (ttl {ttl}s)");
-                return Ok(());
-            }
-            eprintln!(
-                "DENIED: {rel} is leased by {} until {}.",
-                lease.holder, lease.expires_human
-            );
-            eprintln!(
-                "hint: send a claim-request to {}, park on the reply, and exit cleanly.",
-                lease.holder
-            );
-            std::process::exit(2);
-        } else {
-            // Expired — reap
-            store::delete_claim(&ctx.conn, &rel)?;
-        }
-    }
 
     let dom = store::get_domain(&ctx.conn, agent)?
         .ok_or_else(|| TrelaneError::msg(format!("agent '{agent}' not found")))?;
     let compiled = CompiledDomain::from_domain(&dom)?;
     let mine = compiled.is_writable(&rel);
     let others = owners_of(&ctx.conn, &rel, Some(agent))?;
+    let mut existing = store::get_claim(&ctx.conn, &rel)?;
+    if existing
+        .as_ref()
+        .is_some_and(|lease| lease.expires_at < now_ts)
+    {
+        store::delete_claim(&ctx.conn, &rel)?;
+        existing = None;
+    }
 
-    let secret = ctx.secret()?;
+    let grant_delegation = match grant {
+        Some(grant_id) => store::get_delegation_by_grant_message(&ctx.conn, grant_id)?,
+        None => None,
+    };
+    let existing_delegation = existing
+        .as_ref()
+        .filter(|lease| lease.holder == agent)
+        .and_then(|lease| lease.delegation_id.as_deref());
+    let delegation_id = delegation
+        .or(existing_delegation)
+        .or_else(|| grant_delegation.as_ref().map(|d| d.id.as_str()));
+    if let (Some(requested), Some(existing_id)) = (delegation, existing_delegation)
+        && requested != existing_id
+    {
+        return Err(TrelaneError::msg(
+            "a delegated lease can only be renewed with its original delegation",
+        ));
+    }
 
-    if !mine && !others.is_empty() {
-        let has_grant = grant
-            .map(|g| grant_covers(&ctx.conn, agent, g, &rel, &secret))
-            .transpose()?
-            .unwrap_or(false);
-        if !has_grant {
-            eprintln!(
-                "DENIED: {rel} is in the domain of {} and not yours.",
+    let requires_delegation =
+        (!mine && !others.is_empty()) || delegation_id.is_some() || existing_delegation.is_some();
+    let authorized = if requires_delegation {
+        let id = delegation_id.ok_or_else(|| {
+            TrelaneError::msg(format!(
+                "'{rel}' belongs to {}; an active --delegation is required",
                 others.join(", ")
-            );
-            eprintln!(
-                "hint: send a claim-request to the owner; claim again with --grant <claim-grant-msg-id> once granted."
-            );
-            std::process::exit(3);
+            ))
+        })?;
+        Some(authorize_delegated_claim(
+            ctx, agent, id, grant, task, &rel,
+        )?)
+    } else {
+        None
+    };
+
+    let requested_expiry = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::seconds(ttl as i64))
+        .ok_or_else(|| TrelaneError::msg("claim ttl is too large"))?;
+    let effective_expiry = authorized
+        .as_ref()
+        .map(|(_, expiry)| requested_expiry.min(*expiry))
+        .unwrap_or(requested_expiry);
+    let expires_at = effective_expiry.timestamp() as f64;
+    let expires_human = effective_expiry.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let effective_task = authorized
+        .as_ref()
+        .map(|(d, _)| d.task_id.as_str())
+        .or(task);
+    let effective_grant = authorized
+        .as_ref()
+        .map(|(d, _)| d.grant_message.as_str())
+        .or(grant);
+    let effective_delegation = authorized.as_ref().map(|(d, _)| d.id.as_str());
+
+    if let Some(lease) = existing {
+        if lease.holder == agent {
+            store::update_claim_renewal(
+                &ctx.conn,
+                &rel,
+                effective_task,
+                effective_grant,
+                effective_delegation,
+                expires_at,
+                &expires_human,
+            )?;
+            println!("renewed lease on {rel} (until {expires_human})");
+            return Ok(());
         }
+        return Err(TrelaneError::msg(format!(
+            "DENIED: {rel} is leased by {} until {}",
+            lease.holder, lease.expires_human
+        )));
     }
 
     let new_lease = Lease {
         path: rel.clone(),
         holder: agent.to_string(),
-        task: task.map(|s| s.to_string()),
-        grant: grant.map(|s| s.to_string()),
+        task: effective_task.map(str::to_string),
+        grant: effective_grant.map(str::to_string),
+        delegation_id: effective_delegation.map(str::to_string),
         acquired_at: crypto::now_iso(),
         expires_at,
         expires_human,
@@ -830,12 +1056,9 @@ pub fn cmd_claim(
             println!("claimed {rel} for {agent}, ttl {ttl}s{tag}");
             Ok(())
         }
-        Ok(false) => {
-            eprintln!(
-                "DENIED: lost race for {rel}; re-check with 'trelane claim' later or park on it."
-            );
-            std::process::exit(2);
-        }
+        Ok(false) => Err(TrelaneError::msg(format!(
+            "DENIED: lost race for {rel}; re-check the lease before retrying"
+        ))),
         Err(e) => Err(e),
     }
 }
@@ -1024,6 +1247,23 @@ pub fn cmd_status(ctx: &Context) -> Result<()> {
             println!("  {name:<24} {state:<8} source={source}");
         }
     }
+
+    // Concurrency: registered count and the simultaneous-execution ceiling are
+    // shown as separate numbers so a swarm with more registered agents than
+    // the limit is never mistaken for a stuck/idle swarm -- the extra agents
+    // are simply waiting for a free slot (see `squire.max_concurrent`).
+    let running_count = agents
+        .iter()
+        .filter(|a| is_running(&ctx.conn, a).unwrap_or(false))
+        .count();
+    let limit = ctx.config.squire.max_concurrent;
+    println!(
+        "concurrency  : {} registered / {} running / limit {} ({} slot(s) free)",
+        agents.len(),
+        running_count,
+        limit,
+        limit.saturating_sub(running_count),
+    );
 
     let launch_targets = store::list_launch_targets(&ctx.conn)?;
     if !launch_targets.is_empty() {
@@ -1445,6 +1685,7 @@ pub fn cmd_stub(ctx: &Context, agent: &str) -> Result<()> {
                         Some(60),
                         None,
                         Some(&m.id),
+                        None,
                     )?;
                     println!(
                         "[stub:{agent}] claimed {rel} using grant {}; pretending to edit; releasing",
@@ -1557,6 +1798,1035 @@ pub fn cmd_audit(ctx: &Context, agent: &str) -> Result<()> {
     std::process::exit(1);
 }
 
+// ---------------------------------------------------------- assistance C2
+
+pub fn cmd_help(ctx: &Context, action: &crate::cli::HelpAction) -> Result<()> {
+    use crate::cli::HelpAction;
+    store::expire_stale_delegations(&ctx.conn, &crypto::now_iso())?;
+    match action {
+        HelpAction::Request {
+            from,
+            to,
+            task,
+            paths,
+            need,
+        } => cmd_help_request(ctx, from, to, task, paths, need),
+        HelpAction::Offer {
+            from,
+            to,
+            task,
+            paths,
+            plan,
+            deliverable,
+            allowed_ops,
+        } => cmd_help_offer(ctx, from, to, task, paths, plan, deliverable, allowed_ops),
+        HelpAction::Accept {
+            id,
+            by,
+            paths,
+            allowed_ops,
+            ttl,
+        } => cmd_help_accept(ctx, id, by, paths, allowed_ops, *ttl),
+        HelpAction::Deny { id, by, reason } => cmd_help_deny(ctx, id, by, reason),
+        HelpAction::Revoke { id, by, reason } => cmd_help_revoke(ctx, id, by, reason),
+    }
+}
+
+fn require_open_assistable_task(ctx: &Context, task_id: &str, owner: &str) -> Result<Task> {
+    let task = store::get_task(&ctx.conn, task_id)?
+        .ok_or_else(|| TrelaneError::msg(format!("no task '{task_id}'")))?;
+    if task.owner_agent != owner {
+        return Err(TrelaneError::msg(format!(
+            "task '{task_id}' is owned by '{}', not '{owner}'",
+            task.owner_agent
+        )));
+    }
+    if task.state.is_terminal() {
+        return Err(TrelaneError::msg(format!(
+            "task '{task_id}' is terminal ({})",
+            task.state.as_str()
+        )));
+    }
+    if task.assist_policy != AssistPolicy::Open {
+        return Err(TrelaneError::msg(format!(
+            "task '{task_id}' does not accept assistance"
+        )));
+    }
+    Ok(task)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn signed_protocol_message(
+    ctx: &Context,
+    from: &str,
+    to: &str,
+    msg_type: &str,
+    subject: String,
+    body: String,
+    re: Option<String>,
+    task: Option<String>,
+    paths: Vec<String>,
+) -> Result<Message> {
+    let mut msg = Message::new(
+        crypto::new_id("msg"),
+        from.to_string(),
+        to.to_string(),
+        msg_type.to_string(),
+        "normal".to_string(),
+        subject,
+        body,
+        re,
+        task,
+        paths,
+        crypto::now_iso(),
+    );
+    crypto::sign(&ctx.secret()?, &mut msg);
+    Ok(msg)
+}
+
+fn cmd_help_request(
+    ctx: &Context,
+    owner: &str,
+    helper: &str,
+    task_id: &str,
+    paths: &[String],
+    need: &str,
+) -> Result<()> {
+    if owner == helper {
+        return Err(TrelaneError::msg(
+            "owner and helper must be different agents",
+        ));
+    }
+    if !store::agent_exists(&ctx.conn, helper)? {
+        return Err(TrelaneError::msg(format!(
+            "unknown helper agent '{helper}'"
+        )));
+    }
+    let task = require_open_assistable_task(ctx, task_id, owner)?;
+    let requested = if paths.is_empty() {
+        task.path_scope.clone()
+    } else {
+        paths.to_vec()
+    };
+    let scope = validate_delegable_scope(ctx, &task, owner, &requested)?;
+    let msg = signed_protocol_message(
+        ctx,
+        owner,
+        helper,
+        "help-request",
+        format!("help requested for task {task_id}"),
+        serde_json::json!({"need": need}).to_string(),
+        None,
+        Some(task_id.to_string()),
+        scope,
+    )?;
+    store::insert_message(&ctx.conn, &msg)?;
+    println!("{}", msg.id);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_help_offer(
+    ctx: &Context,
+    helper: &str,
+    owner: &str,
+    task_id: &str,
+    paths: &[String],
+    plan: &str,
+    deliverable: &str,
+    allowed_ops: &[String],
+) -> Result<()> {
+    if helper == owner {
+        return Err(TrelaneError::msg(
+            "owner and helper must be different agents",
+        ));
+    }
+    if !store::agent_exists(&ctx.conn, helper)? {
+        return Err(TrelaneError::msg(format!(
+            "unknown helper agent '{helper}'"
+        )));
+    }
+    let task = require_open_assistable_task(ctx, task_id, owner)?;
+    let proposed = if paths.is_empty() {
+        task.path_scope.clone()
+    } else {
+        paths.to_vec()
+    };
+    let scope = validate_delegable_scope(ctx, &task, owner, &proposed)?;
+    let ops = if allowed_ops.is_empty() {
+        vec!["write".to_string()]
+    } else {
+        allowed_ops.to_vec()
+    };
+    if ops.iter().any(|op| op.trim().is_empty()) {
+        return Err(TrelaneError::msg("allowed operations cannot be empty"));
+    }
+    let id = crypto::new_id("del");
+    let body = serde_json::json!({
+        "delegation_id": id,
+        "plan": plan,
+        "deliverable": deliverable,
+        "allowed_ops": ops,
+    })
+    .to_string();
+    let msg = signed_protocol_message(
+        ctx,
+        helper,
+        owner,
+        "help-offer",
+        format!("help offered for task {task_id}"),
+        body,
+        None,
+        Some(task_id.to_string()),
+        scope.clone(),
+    )?;
+    let base_revision = git_head(&ctx.root).ok();
+    let delegation = Delegation {
+        id: id.clone(),
+        task_id: task_id.to_string(),
+        owner_agent: owner.to_string(),
+        helper_agent: helper.to_string(),
+        scope,
+        allowed_ops: ops,
+        constraints_json: serde_json::json!({
+            "plan": plan,
+            "deliverable": deliverable,
+        })
+        .to_string(),
+        base_revision,
+        offer_message: msg.id.clone(),
+        grant_message: String::new(),
+        issued_at: crypto::now_iso(),
+        expires_at: None,
+        status: DelegationStatus::Offered,
+    };
+    store::insert_offer(&ctx.conn, &delegation, &msg)?;
+    // C3: record the backlog fingerprint at offer time so the scheduler does
+    // not keep waking this helper for the same unchanged backlog.
+    let assistable = store::list_assistable_tasks(&ctx.conn, helper, &crypto::now_iso())?;
+    let fingerprint = store::assist_backlog_fingerprint(&assistable);
+    let _ = store::record_offer_fingerprint(&ctx.conn, helper, &fingerprint, &id, &crypto::now_iso());
+    println!("{id}");
+    Ok(())
+}
+
+fn cmd_help_accept(
+    ctx: &Context,
+    id: &str,
+    owner: &str,
+    paths: &[String],
+    allowed_ops: &[String],
+    ttl: u64,
+) -> Result<()> {
+    if ttl == 0 {
+        return Err(TrelaneError::msg(
+            "delegation ttl must be greater than zero",
+        ));
+    }
+    let offered = store::get_delegation(&ctx.conn, id)?
+        .ok_or_else(|| TrelaneError::msg(format!("no help offer '{id}'")))?;
+    if offered.status != DelegationStatus::Offered {
+        return Err(TrelaneError::msg(format!(
+            "help offer '{id}' is {}, not offered",
+            offered.status.as_str()
+        )));
+    }
+    if offered.owner_agent != owner {
+        return Err(TrelaneError::msg(format!(
+            "only owner '{}' may accept this offer",
+            offered.owner_agent
+        )));
+    }
+    let task = require_open_assistable_task(ctx, &offered.task_id, owner)?;
+    let narrowed = if paths.is_empty() {
+        offered.scope.clone()
+    } else {
+        paths.to_vec()
+    };
+    let scope = validate_delegable_scope(ctx, &task, owner, &narrowed)?;
+    if !scope_is_subset(&scope, &offered.scope)? {
+        return Err(TrelaneError::msg(
+            "accepted path scope is not a provable subset of the offer",
+        ));
+    }
+    let ops = if allowed_ops.is_empty() {
+        offered.allowed_ops.clone()
+    } else {
+        allowed_ops.to_vec()
+    };
+    if ops.is_empty()
+        || ops
+            .iter()
+            .any(|op| !offered.allowed_ops.iter().any(|offered| offered == op))
+    {
+        return Err(TrelaneError::msg(
+            "accepted operations must be a non-empty subset of offered operations",
+        ));
+    }
+    let now = crypto::now_iso();
+    let expires_at = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::seconds(ttl as i64))
+        .ok_or_else(|| TrelaneError::msg("delegation ttl is too large"))?
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    let grant = signed_protocol_message(
+        ctx,
+        owner,
+        &offered.helper_agent,
+        "help-accept",
+        format!("delegation {id} accepted"),
+        serde_json::json!({
+            "delegation_id": id,
+            "allowed_ops": ops,
+            "expires_at": expires_at,
+        })
+        .to_string(),
+        Some(offered.offer_message.clone()),
+        Some(offered.task_id.clone()),
+        scope.clone(),
+    )?;
+    store::activate_delegation_and_assign(&ctx.conn, id, &scope, &ops, &expires_at, &grant, &now)?;
+    // C3: acceptance clears any rejection backoff between this owner/helper pair.
+    let _ = store::clear_rejection_backoff(&ctx.conn, &offered.helper_agent, owner);
+    println!("accepted {id} until {expires_at} (grant {})", grant.id);
+    Ok(())
+}
+
+fn cmd_help_deny(ctx: &Context, id: &str, owner: &str, reason: &str) -> Result<()> {
+    if !store::agent_exists(&ctx.conn, owner)? {
+        return Err(TrelaneError::msg(format!("unknown owner agent '{owner}'")));
+    }
+    let offered = store::get_delegation(&ctx.conn, id)?
+        .ok_or_else(|| TrelaneError::msg(format!("no help offer '{id}'")))?;
+    if offered.owner_agent != owner {
+        return Err(TrelaneError::msg(format!(
+            "only owner '{}' may deny this offer",
+            offered.owner_agent
+        )));
+    }
+    let msg = signed_protocol_message(
+        ctx,
+        owner,
+        &offered.helper_agent,
+        "help-deny",
+        format!("help offer {id} denied"),
+        serde_json::json!({"delegation_id": id, "reason": reason}).to_string(),
+        Some(offered.offer_message),
+        Some(offered.task_id),
+        vec![],
+    )?;
+    if !store::reject_offer_with_message(&ctx.conn, id, &msg, &crypto::now_iso())? {
+        return Err(TrelaneError::msg(format!(
+            "help offer '{id}' is no longer pending"
+        )));
+    }
+    // C3: exponential rejection backoff so a denied offer does not immediately
+    // re-fire on the next tick.
+    let _ = store::record_rejection_backoff(
+        &ctx.conn,
+        &offered.helper_agent,
+        owner,
+        &crypto::now_iso(),
+    );
+    println!("denied {id}");
+    Ok(())
+}
+
+fn cmd_help_revoke(ctx: &Context, id: &str, owner: &str, reason: &str) -> Result<()> {
+    if !store::agent_exists(&ctx.conn, owner)? {
+        return Err(TrelaneError::msg(format!("unknown owner agent '{owner}'")));
+    }
+    let delegation = store::get_delegation(&ctx.conn, id)?
+        .ok_or_else(|| TrelaneError::msg(format!("no delegation '{id}'")))?;
+    if delegation.owner_agent != owner {
+        return Err(TrelaneError::msg(format!(
+            "only owner '{}' may revoke this delegation",
+            delegation.owner_agent
+        )));
+    }
+    let msg = signed_protocol_message(
+        ctx,
+        owner,
+        &delegation.helper_agent,
+        "help-revoke",
+        format!("delegation {id} revoked"),
+        serde_json::json!({"delegation_id": id, "reason": reason}).to_string(),
+        Some(delegation.grant_message),
+        Some(delegation.task_id),
+        vec![],
+    )?;
+    if !store::revoke_delegation_with_message(&ctx.conn, id, &msg, &crypto::now_iso())? {
+        return Err(TrelaneError::msg(format!(
+            "delegation '{id}' is already terminal"
+        )));
+    }
+    println!("revoked {id}");
+    Ok(())
+}
+
+// ------------------------------------------------------------- work ledger
+
+/// `trelane work ...` entry point (C1). Dispatches the ledger subcommands.
+pub fn cmd_work(ctx: &Context, action: &crate::cli::WorkAction) -> Result<()> {
+    use crate::cli::WorkAction;
+    match action {
+        WorkAction::List {
+            owner,
+            state,
+            json,
+            assistable,
+            agent,
+        } => cmd_work_list(
+            ctx,
+            owner.as_deref(),
+            state.as_deref(),
+            *json,
+            *assistable,
+            agent.as_deref(),
+        ),
+        WorkAction::Show { id } => cmd_work_show(ctx, id),
+        WorkAction::Add {
+            owner,
+            subject,
+            body,
+            priority,
+            paths,
+            acceptance,
+            blocked_by,
+            parallelism,
+            assist,
+        } => cmd_work_add(
+            ctx,
+            owner,
+            subject,
+            body,
+            priority,
+            paths,
+            acceptance,
+            blocked_by,
+            *parallelism,
+            assist,
+        ),
+        WorkAction::Submit {
+            task,
+            by,
+            delegation,
+            commit,
+            summary,
+            tests,
+        } => cmd_work_submit(ctx, task, by, delegation, commit, summary, tests),
+        WorkAction::Review {
+            task,
+            by,
+            delegation,
+            accept,
+            request_changes,
+            reject,
+            notes,
+        } => cmd_work_review(
+            ctx,
+            task,
+            by,
+            delegation,
+            *accept,
+            *request_changes,
+            *reject,
+            notes,
+        ),
+    }
+}
+
+fn cmd_work_list(
+    ctx: &Context,
+    owner: Option<&str>,
+    state: Option<&str>,
+    json: bool,
+    assistable: bool,
+    agent: Option<&str>,
+) -> Result<()> {
+    let mut tasks = match owner {
+        Some(o) => store::list_tasks_for_owner(&ctx.conn, o)?,
+        None => store::list_tasks(&ctx.conn)?,
+    };
+    if let Some(s) = state {
+        let want = TaskState::parse(s).ok_or_else(|| {
+            TrelaneError::msg(format!(
+                "unknown task state '{s}'. Known: {}",
+                TASK_STATES.join(", ")
+            ))
+        })?;
+        tasks.retain(|t| t.state == want);
+    }
+    if assistable {
+        if let Some(helper) = agent
+            && !store::agent_exists(&ctx.conn, helper)?
+        {
+            return Err(TrelaneError::msg(format!(
+                "unknown prospective helper agent '{helper}'"
+            )));
+        }
+        let helper_delegations = match agent {
+            Some(helper) => store::list_delegations_for_helper(&ctx.conn, helper, None)?,
+            None => vec![],
+        };
+        let mut filtered = Vec::new();
+        for task in tasks {
+            let active_helpers = store::list_assignments_for_task(&ctx.conn, &task.id)?
+                .into_iter()
+                .filter(|assignment| {
+                    assignment.role == TaskRole::Helper
+                        && matches!(assignment.state.as_str(), "active" | "submitted")
+                })
+                .count();
+            let helper_already_involved = helper_delegations.iter().any(|delegation| {
+                delegation.task_id == task.id
+                    && matches!(
+                        delegation.status,
+                        DelegationStatus::Offered
+                            | DelegationStatus::Active
+                            | DelegationStatus::Submitted
+                    )
+            });
+            if !task.state.is_terminal()
+                && task.assist_policy == AssistPolicy::Open
+                && agent.is_none_or(|helper| task.owner_agent != helper)
+                && active_helpers < task.desired_parallelism as usize
+                && !helper_already_involved
+            {
+                filtered.push(task);
+            }
+        }
+        tasks = filtered;
+    } else if agent.is_some() {
+        return Err(TrelaneError::msg("--agent requires --assistable"));
+    }
+    if json {
+        let arr: Vec<serde_json::Value> = tasks
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "id": t.id,
+                    "owner": t.owner_agent,
+                    "state": t.state.as_str(),
+                    "priority": t.priority,
+                    "subject": t.subject,
+                    "blocked_by": t.blocked_by,
+                    "path_scope": t.path_scope,
+                    "assist_policy": t.assist_policy.as_str(),
+                    "desired_parallelism": t.desired_parallelism,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+        return Ok(());
+    }
+    if tasks.is_empty() {
+        println!("no tasks");
+        return Ok(());
+    }
+    println!(
+        "{:<20} {:<12} {:<9} {:<8} {}",
+        "id", "owner", "state", "priority", "subject"
+    );
+    for t in &tasks {
+        println!(
+            "{:<20} {:<12} {:<9} {:<8} {}",
+            t.id,
+            t.owner_agent,
+            t.state.as_str(),
+            t.priority,
+            t.subject
+        );
+    }
+    Ok(())
+}
+
+fn cmd_work_show(ctx: &Context, id: &str) -> Result<()> {
+    let task = store::get_task(&ctx.conn, id)?
+        .ok_or_else(|| TrelaneError::msg(format!("no task '{id}'")))?;
+    println!("id             : {}", task.id);
+    println!("owner          : {}", task.owner_agent);
+    println!("domain         : {}", task.domain);
+    if let Some(p) = &task.parent_task {
+        println!("parent         : {p}");
+    }
+    println!("state          : {}", task.state.as_str());
+    println!("priority       : {}", task.priority);
+    println!("assist policy  : {}", task.assist_policy.as_str());
+    println!("parallelism    : {}", task.desired_parallelism);
+    println!("subject        : {}", task.subject);
+    if !task.body.is_empty() {
+        println!("body           : {}", task.body);
+    }
+    println!("path scope     : {}", list_or_none(&task.path_scope));
+    println!("acceptance     : {}", list_or_none(&task.acceptance));
+    println!("blocked by     : {}", list_or_none(&task.blocked_by));
+    println!("created        : {}", task.created_at);
+    println!("updated        : {}", task.updated_at);
+
+    let assignments = store::list_assignments_for_task(&ctx.conn, id)?;
+    if !assignments.is_empty() {
+        println!("assignments    :");
+        for a in &assignments {
+            println!("  {} [{}] state={}", a.agent, a.role.as_str(), a.state);
+        }
+    }
+    let delegations = store::list_delegations_for_task(&ctx.conn, id)?;
+    if !delegations.is_empty() {
+        println!("delegations    :");
+        for d in &delegations {
+            println!(
+                "  {} -> {} [{}] scope={}",
+                d.owner_agent,
+                d.helper_agent,
+                d.status.as_str(),
+                list_or_none(&d.scope)
+            );
+        }
+    }
+    let submissions = store::list_submissions_for_task(&ctx.conn, id)?;
+    if !submissions.is_empty() {
+        println!("submissions    :");
+        for submission in &submissions {
+            println!(
+                "  {} by {} [{}] commit={} paths={}",
+                submission.id,
+                submission.helper_agent,
+                submission.status,
+                submission.commit_ref,
+                list_or_none(&submission.changed_paths)
+            );
+        }
+    }
+    let reviews = store::list_reviews_for_task(&ctx.conn, id)?;
+    if !reviews.is_empty() {
+        println!("reviews        :");
+        for r in &reviews {
+            println!(
+                "  {} -> {} {}",
+                r.reviewer_agent,
+                r.decision.as_str(),
+                r.notes
+            );
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_work_add(
+    ctx: &Context,
+    owner: &str,
+    subject: &str,
+    body: &str,
+    priority: &str,
+    paths: &[String],
+    acceptance: &[String],
+    blocked_by: &[String],
+    parallelism: u32,
+    assist: &str,
+) -> Result<()> {
+    if !store::agent_exists(&ctx.conn, owner)? {
+        return Err(TrelaneError::msg(format!("unknown owner agent '{owner}'")));
+    }
+    if !URGENCIES.contains(&priority) {
+        return Err(TrelaneError::msg(format!(
+            "unknown priority '{priority}'. Known: {}",
+            URGENCIES.join(", ")
+        )));
+    }
+    let assist_policy = AssistPolicy::parse(assist).ok_or_else(|| {
+        TrelaneError::msg(format!(
+            "unknown assist policy '{assist}'. Known: open, solo"
+        ))
+    })?;
+    // Dependencies must reference tasks that actually exist, so readiness can
+    // be evaluated meaningfully.
+    for dep in blocked_by {
+        if store::get_task(&ctx.conn, dep)?.is_none() {
+            return Err(TrelaneError::msg(format!(
+                "blocked-by task '{dep}' does not exist"
+            )));
+        }
+    }
+    let now = crate::crypto::now_iso();
+    let task = Task {
+        id: crate::crypto::new_id("task"),
+        owner_agent: owner.to_string(),
+        domain: owner.to_string(),
+        parent_task: None,
+        subject: subject.to_string(),
+        body: body.to_string(),
+        state: TaskState::Ready,
+        priority: priority.to_string(),
+        assist_policy,
+        desired_parallelism: parallelism.max(1),
+        path_scope: paths.to_vec(),
+        acceptance: acceptance.to_vec(),
+        blocked_by: blocked_by.to_vec(),
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    store::insert_task(&ctx.conn, &task)?;
+    println!(
+        "created task {} (owner {}, state ready)",
+        task.id, task.owner_agent
+    );
+    Ok(())
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .map_err(|e| TrelaneError::msg(format!("Git is required for work submission: {e}")))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(TrelaneError::msg(format!(
+            "Git validation failed for `git {}`: {}",
+            args.join(" "),
+            if detail.is_empty() {
+                "command failed".to_string()
+            } else {
+                detail
+            }
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn ensure_git_repository(root: &Path) -> Result<()> {
+    let value = git_output(root, &["rev-parse", "--is-inside-work-tree"])?;
+    if value != "true" {
+        return Err(TrelaneError::msg(
+            "work submit requires a Git work tree; validation cannot be skipped",
+        ));
+    }
+    Ok(())
+}
+
+fn git_head(root: &Path) -> Result<String> {
+    ensure_git_repository(root)?;
+    git_output(root, &["rev-parse", "--verify", "HEAD^{commit}"])
+}
+
+fn resolve_git_commit(root: &Path, reference: &str) -> Result<String> {
+    git_output(
+        root,
+        &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
+    )
+}
+
+fn git_is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .status()
+        .map_err(|e| TrelaneError::msg(format!("Git is required for work submission: {e}")))?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(TrelaneError::msg(
+            "Git could not compare the submission base and commit",
+        )),
+    }
+}
+
+fn git_changed_paths(root: &Path, base: &str, commit: &str) -> Result<Vec<String>> {
+    let range = format!("{base}..{commit}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            "--diff-filter=ACDMRTUXB",
+            &range,
+            "--",
+        ])
+        .output()
+        .map_err(|e| TrelaneError::msg(format!("Git is required for work submission: {e}")))?;
+    if !output.status.success() {
+        return Err(TrelaneError::msg(format!(
+            "Git could not enumerate submission paths: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            std::str::from_utf8(path)
+                .map(|path| path.replace(std::path::MAIN_SEPARATOR, "/"))
+                .map_err(|_| TrelaneError::msg("Git reported a non-UTF-8 changed path"))
+        })
+        .collect()
+}
+
+fn invalidate_stale_delegation(ctx: &Context, delegation: &Delegation, reason: &str) -> Result<()> {
+    let msg = signed_protocol_message(
+        ctx,
+        "system",
+        &delegation.helper_agent,
+        "help-revoke",
+        format!("delegation {} invalidated", delegation.id),
+        serde_json::json!({
+            "delegation_id": delegation.id,
+            "reason": reason,
+        })
+        .to_string(),
+        Some(delegation.grant_message.clone()),
+        Some(delegation.task_id.clone()),
+        vec![],
+    )?;
+    store::revoke_delegation_with_message(&ctx.conn, &delegation.id, &msg, &crypto::now_iso())?;
+    Ok(())
+}
+
+fn validate_submission_paths(
+    task: &Task,
+    delegation: &Delegation,
+    owner_domain: &Domain,
+    paths: &[String],
+) -> Result<()> {
+    let compiled_owner = CompiledDomain::from_domain(owner_domain)?;
+    for path in paths {
+        if domain::is_hard_forbidden(path) {
+            return Err(TrelaneError::msg(format!(
+                "submission changes hard-forbidden path '{path}'"
+            )));
+        }
+        if !domain::scope_covers_path(&task.path_scope, path)? {
+            return Err(TrelaneError::msg(format!(
+                "submission path '{path}' is outside task scope"
+            )));
+        }
+        if !domain::scope_covers_path(&delegation.scope, path)? {
+            return Err(TrelaneError::msg(format!(
+                "submission path '{path}' is outside delegation scope"
+            )));
+        }
+        if !compiled_owner.is_writable(path) {
+            return Err(TrelaneError::msg(format!(
+                "submission path '{path}' is no longer writable by owner '{}'",
+                delegation.owner_agent
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_work_submit(
+    ctx: &Context,
+    task_id: &str,
+    helper: &str,
+    delegation_id: &str,
+    commit_ref: &str,
+    summary: &str,
+    tests: &str,
+) -> Result<()> {
+    store::expire_stale_delegations(&ctx.conn, &crypto::now_iso())?;
+    if !store::agent_exists(&ctx.conn, helper)? {
+        return Err(TrelaneError::msg(format!(
+            "unknown helper agent '{helper}'"
+        )));
+    }
+    let task = store::get_task(&ctx.conn, task_id)?
+        .ok_or_else(|| TrelaneError::msg(format!("no task '{task_id}'")))?;
+    let delegation = store::get_delegation(&ctx.conn, delegation_id)?
+        .ok_or_else(|| TrelaneError::msg(format!("no delegation '{delegation_id}'")))?;
+    if delegation.task_id != task.id
+        || delegation.helper_agent != helper
+        || delegation.status != DelegationStatus::Active
+    {
+        return Err(TrelaneError::msg(
+            "submission requires the matching helper's active delegation for this task",
+        ));
+    }
+    if delegation_expiry(&delegation)? <= chrono::Utc::now() {
+        return Err(TrelaneError::msg("submission delegation has expired"));
+    }
+    if !grant_message_verifies(ctx, &delegation, None)? {
+        return Err(TrelaneError::msg(
+            "submission delegation has no valid signed help-accept grant",
+        ));
+    }
+
+    ensure_git_repository(&ctx.root)?;
+    let commit = resolve_git_commit(&ctx.root, commit_ref)?;
+    let base_ref = delegation
+        .base_revision
+        .as_deref()
+        .ok_or_else(|| TrelaneError::msg("delegation has no validated Git base revision"))?;
+    let base = match resolve_git_commit(&ctx.root, base_ref) {
+        Ok(base) => base,
+        Err(error) => {
+            invalidate_stale_delegation(ctx, &delegation, "base revision no longer exists")?;
+            return Err(error);
+        }
+    };
+    if !git_is_ancestor(&ctx.root, &base, &commit)? {
+        invalidate_stale_delegation(
+            ctx,
+            &delegation,
+            "submission is not descended from its grant base",
+        )?;
+        return Err(TrelaneError::msg(
+            "submission commit is not descended from the delegation base",
+        ));
+    }
+    let current_head = git_head(&ctx.root)?;
+    if !git_is_ancestor(&ctx.root, &current_head, &commit)? {
+        invalidate_stale_delegation(ctx, &delegation, "base is stale relative to current HEAD")?;
+        return Err(TrelaneError::msg(
+            "delegation base is stale relative to current HEAD; rebase and resubmit",
+        ));
+    }
+    let changed_paths = git_changed_paths(&ctx.root, &base, &commit)?;
+    let owner_domain = store::get_domain(&ctx.conn, &delegation.owner_agent)?
+        .ok_or_else(|| TrelaneError::msg("delegation owner no longer exists"))?;
+    validate_submission_paths(&task, &delegation, &owner_domain, &changed_paths)?;
+
+    let submission_id = crypto::new_id("sub");
+    let message = signed_protocol_message(
+        ctx,
+        helper,
+        &delegation.owner_agent,
+        "submission",
+        format!("submission for task {task_id}"),
+        serde_json::json!({
+            "submission_id": submission_id,
+            "delegation_id": delegation_id,
+            "commit": commit,
+            "base_revision": base,
+            "summary": summary,
+            "tests": tests,
+        })
+        .to_string(),
+        Some(delegation.grant_message.clone()),
+        Some(task_id.to_string()),
+        changed_paths.clone(),
+    )?;
+    let submission = TaskSubmission {
+        id: submission_id.clone(),
+        task_id: task_id.to_string(),
+        delegation_id: delegation_id.to_string(),
+        helper_agent: helper.to_string(),
+        commit_ref: commit,
+        base_revision: base,
+        summary: summary.to_string(),
+        tests: tests.to_string(),
+        changed_paths,
+        message_id: message.id.clone(),
+        status: "pending".to_string(),
+        created_at: crypto::now_iso(),
+        reviewed_at: None,
+    };
+    store::record_submission(&ctx.conn, &submission, &message)?;
+    println!("{submission_id}");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_work_review(
+    ctx: &Context,
+    task_id: &str,
+    reviewer: &str,
+    delegation_id: &str,
+    accept: bool,
+    request_changes: bool,
+    reject: bool,
+    notes: &str,
+) -> Result<()> {
+    let choices = [accept, request_changes, reject]
+        .into_iter()
+        .filter(|selected| *selected)
+        .count();
+    if choices != 1 {
+        return Err(TrelaneError::msg(
+            "specify exactly one of --accept, --request-changes, or --reject",
+        ));
+    }
+    let decision = if accept {
+        ReviewDecision::Accept
+    } else if request_changes {
+        ReviewDecision::RequestChanges
+    } else {
+        ReviewDecision::Reject
+    };
+    if !store::agent_exists(&ctx.conn, reviewer)? {
+        return Err(TrelaneError::msg(format!(
+            "unknown reviewer agent '{reviewer}'"
+        )));
+    }
+    let task = store::get_task(&ctx.conn, task_id)?
+        .ok_or_else(|| TrelaneError::msg(format!("no task '{task_id}'")))?;
+    let reviewer_is_assigned = store::list_assignments_for_task(&ctx.conn, task_id)?
+        .iter()
+        .any(|assignment| assignment.agent == reviewer && assignment.role == TaskRole::Reviewer);
+    if task.owner_agent != reviewer && !reviewer_is_assigned {
+        return Err(TrelaneError::msg(format!(
+            "'{reviewer}' is neither task owner nor designated reviewer"
+        )));
+    }
+    let delegation = store::get_delegation(&ctx.conn, delegation_id)?
+        .ok_or_else(|| TrelaneError::msg(format!("no delegation '{delegation_id}'")))?;
+    if delegation.task_id != task.id || delegation.status != DelegationStatus::Submitted {
+        return Err(TrelaneError::msg(
+            "delegation is not awaiting review for this task",
+        ));
+    }
+    if decision == ReviewDecision::RequestChanges
+        && delegation_expiry(&delegation)? <= chrono::Utc::now()
+    {
+        return Err(TrelaneError::msg(
+            "cannot request changes: delegation has expired; accept or reject the submission",
+        ));
+    }
+    let submission = store::latest_submission_for_delegation(&ctx.conn, task_id, delegation_id)?
+        .filter(|submission| submission.status == "pending")
+        .ok_or_else(|| TrelaneError::msg("no pending submission for this delegation"))?;
+    let now = crypto::now_iso();
+    let review = TaskReview {
+        id: crypto::new_id("rev"),
+        task_id: task_id.to_string(),
+        delegation_id: Some(delegation_id.to_string()),
+        reviewer_agent: reviewer.to_string(),
+        submission_ref: submission.id.clone(),
+        decision,
+        notes: notes.to_string(),
+        created_at: now,
+    };
+    let result_message = signed_protocol_message(
+        ctx,
+        reviewer,
+        &delegation.helper_agent,
+        "review-result",
+        format!("review result for task {task_id}: {}", decision.as_str()),
+        serde_json::json!({
+            "review_id": review.id,
+            "submission_id": submission.id,
+            "delegation_id": delegation_id,
+            "decision": decision.as_str(),
+            "notes": notes,
+        })
+        .to_string(),
+        Some(submission.message_id),
+        Some(task_id.to_string()),
+        submission.changed_paths,
+    )?;
+    store::record_review_result(&ctx.conn, &review, &result_message)?;
+    println!("{}", review.id);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1589,6 +2859,179 @@ mod tests {
         assert!(relaunch_command_for_agent(&ctx, "alpha").contains("inbox alpha --json"));
     }
 
+    fn migrated_ctx(temp: &tempfile::TempDir) -> Context {
+        let root = temp.path().to_path_buf();
+        let db_path = root.join(".trelane").join("trelane.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = crate::db::open(&db_path).unwrap();
+        Context {
+            root,
+            conn,
+            config: Config::default(),
+        }
+    }
+
+    fn assistance_ctx(temp: &tempfile::TempDir) -> Context {
+        let ctx = migrated_ctx(temp);
+        cmd_add_agent(
+            &ctx,
+            "owner",
+            &["src/**".to_string()],
+            &["src/secrets/**".to_string()],
+            None,
+            None,
+        )
+        .unwrap();
+        cmd_add_agent(&ctx, "helper", &["helper/**".to_string()], &[], None, None).unwrap();
+        let now = crypto::now_iso();
+        store::insert_task(
+            &ctx.conn,
+            &Task {
+                id: "task_1".to_string(),
+                owner_agent: "owner".to_string(),
+                domain: "owner".to_string(),
+                parent_task: None,
+                subject: "add tests".to_string(),
+                body: String::new(),
+                state: TaskState::Ready,
+                priority: "normal".to_string(),
+                assist_policy: AssistPolicy::Open,
+                desired_parallelism: 1,
+                path_scope: vec!["src/**".to_string()],
+                acceptance: vec![],
+                blocked_by: vec![],
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .unwrap();
+        ctx
+    }
+
+    fn create_tests_only_offer(ctx: &Context, id: &str) {
+        let offer = signed_protocol_message(
+            ctx,
+            "helper",
+            "owner",
+            "help-offer",
+            "tests offer".to_string(),
+            serde_json::json!({
+                "delegation_id": id,
+                "plan": "add tests",
+                "deliverable": "passing tests",
+                "allowed_ops": ["write"],
+            })
+            .to_string(),
+            None,
+            Some("task_1".to_string()),
+            vec!["src/**".to_string()],
+        )
+        .unwrap();
+        store::insert_offer(
+            &ctx.conn,
+            &Delegation {
+                id: id.to_string(),
+                task_id: "task_1".to_string(),
+                owner_agent: "owner".to_string(),
+                helper_agent: "helper".to_string(),
+                scope: vec!["src/**".to_string()],
+                allowed_ops: vec!["write".to_string()],
+                constraints_json: "{}".to_string(),
+                base_revision: None,
+                offer_message: offer.id.clone(),
+                grant_message: String::new(),
+                issued_at: crypto::now_iso(),
+                expires_at: None,
+                status: DelegationStatus::Offered,
+            },
+            &offer,
+        )
+        .unwrap();
+    }
+
+    fn git_ok(root: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git command failed: {args:?}");
+    }
+
+    #[test]
+    fn launcher_resolves_known_profile_by_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = migrated_ctx(&temp);
+        cmd_add_agent(
+            &ctx,
+            "alpha",
+            &["src/**".to_string()],
+            &[],
+            None,
+            Some("opencode"),
+        )
+        .unwrap();
+        let cmd = launcher_command_for_agent(&ctx, "alpha", Path::new("/tmp/p.md"), None).unwrap();
+        // The "opencode" profile's default template, not a model-specific one.
+        assert!(cmd.starts_with("opencode run \""));
+        assert!(!cmd.contains("--model"));
+    }
+
+    #[test]
+    fn launcher_treats_unknown_launcher_agent_as_a_model_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = migrated_ctx(&temp);
+        // "openrouter/z-ai/glm-5.2" matches no profile key -- this is exactly
+        // what the Biplane UI's model selector stores. Before this fix it
+        // silently fell back to the default (claude) launcher.
+        cmd_add_agent(
+            &ctx,
+            "alpha",
+            &["src/**".to_string()],
+            &[],
+            None,
+            Some("openrouter/z-ai/glm-5.2"),
+        )
+        .unwrap();
+        let cmd = launcher_command_for_agent(&ctx, "alpha", Path::new("/tmp/p.md"), None).unwrap();
+        assert!(cmd.contains("opencode run --model openrouter/z-ai/glm-5.2"));
+        assert!(cmd.contains("/tmp/p.md"));
+    }
+
+    #[test]
+    fn launcher_refuses_when_no_launcher_agent_is_configured() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = migrated_ctx(&temp);
+        cmd_add_agent(&ctx, "alpha", &["src/**".to_string()], &[], None, None).unwrap();
+        let err = launcher_command_for_agent(&ctx, "alpha", Path::new("/tmp/p.md"), None)
+            .expect_err(
+                "must refuse rather than silently use the default (possibly paid) launcher",
+            );
+        assert!(err.is_launcher_not_configured());
+        // The refusal must never itself be (or produce) a runnable paid-CLI
+        // command -- it's an error, not a fallback command string.
+        assert!(err.to_string().contains("launcher-not-configured"));
+    }
+
+    #[test]
+    fn launcher_override_still_bypasses_the_safety_guard() {
+        // An explicit --launcher flag (or --testing-launcher) is a direct,
+        // conscious choice made in the moment, distinct from a silent global
+        // default -- it must still work even with no launcher_agent stored.
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = migrated_ctx(&temp);
+        cmd_add_agent(&ctx, "alpha", &["src/**".to_string()], &[], None, None).unwrap();
+        let cmd = launcher_command_for_agent(
+            &ctx,
+            "alpha",
+            Path::new("/tmp/p.md"),
+            Some("trelane --root {root} stub {agent}"),
+        )
+        .unwrap();
+        assert!(cmd.contains("stub alpha"));
+    }
+
     #[test]
     fn command_for_launch_target_wraps_through_tmux_overlay() {
         let target = LaunchTarget {
@@ -1610,6 +3053,323 @@ mod tests {
         assert_eq!(
             shell_double_quote("/tmp/a \"quoted\" path"),
             "\"/tmp/a \\\"quoted\\\" path\""
+        );
+    }
+
+    #[test]
+    fn owner_can_narrow_offer_to_tests_only_and_helper_can_claim_only_that_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = assistance_ctx(&temp);
+        create_tests_only_offer(&ctx, "del_1");
+
+        let offered_error = authorize_delegated_claim(
+            &ctx,
+            "helper",
+            "del_1",
+            None,
+            Some("task_1"),
+            "src/tests/a.rs",
+        )
+        .unwrap_err();
+        assert!(offered_error.to_string().contains("not active"));
+
+        cmd_help_accept(
+            &ctx,
+            "del_1",
+            "owner",
+            &["src/tests/**".to_string()],
+            &["write".to_string()],
+            3600,
+        )
+        .unwrap();
+        let delegation = store::get_delegation(&ctx.conn, "del_1").unwrap().unwrap();
+        assert_eq!(delegation.scope, vec!["src/tests/**".to_string()]);
+
+        let path = ctx.root.join("src/tests/a.rs");
+        cmd_claim(
+            &ctx,
+            "helper",
+            &path.to_string_lossy(),
+            Some(7200),
+            Some("task_1"),
+            None,
+            Some("del_1"),
+        )
+        .unwrap();
+        let claim = store::get_claim(&ctx.conn, "src/tests/a.rs")
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.delegation_id.as_deref(), Some("del_1"));
+        assert!(claim.expires_human <= delegation.expires_at.unwrap());
+
+        let outside = ctx.root.join("src/lib.rs");
+        let error = cmd_claim(
+            &ctx,
+            "helper",
+            &outside.to_string_lossy(),
+            None,
+            Some("task_1"),
+            None,
+            Some("del_1"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not cover"));
+
+        cmd_help_revoke(&ctx, "del_1", "owner", "scope withdrawn").unwrap();
+        assert!(
+            store::get_claim(&ctx.conn, "src/tests/a.rs")
+                .unwrap()
+                .is_none()
+        );
+        let revoked = authorize_delegated_claim(
+            &ctx,
+            "helper",
+            "del_1",
+            None,
+            Some("task_1"),
+            "src/tests/a.rs",
+        )
+        .unwrap_err();
+        assert!(revoked.to_string().contains("revoked"));
+    }
+
+    #[test]
+    fn expired_delegation_is_refused_at_command_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = assistance_ctx(&temp);
+        create_tests_only_offer(&ctx, "del_expired");
+        cmd_help_accept(
+            &ctx,
+            "del_expired",
+            "owner",
+            &["src/tests/**".to_string()],
+            &[],
+            3600,
+        )
+        .unwrap();
+        ctx.conn
+            .execute(
+                "UPDATE delegations SET expires_at = '2020-01-01T00:00:00Z' WHERE id = 'del_expired'",
+                [],
+            )
+            .unwrap();
+        let path = ctx.root.join("src/tests/a.rs");
+        let error = cmd_claim(
+            &ctx,
+            "helper",
+            &path.to_string_lossy(),
+            None,
+            Some("task_1"),
+            None,
+            Some("del_expired"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("expired"));
+    }
+
+    #[test]
+    fn out_of_scope_and_forbidden_submission_paths_fail_closed() {
+        let mut task = Task {
+            id: "task_1".to_string(),
+            owner_agent: "owner".to_string(),
+            domain: "owner".to_string(),
+            parent_task: None,
+            subject: String::new(),
+            body: String::new(),
+            state: TaskState::Active,
+            priority: "normal".to_string(),
+            assist_policy: AssistPolicy::Open,
+            desired_parallelism: 1,
+            path_scope: vec!["src/**".to_string()],
+            acceptance: vec![],
+            blocked_by: vec![],
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let delegation = Delegation {
+            id: "del_1".to_string(),
+            task_id: task.id.clone(),
+            owner_agent: "owner".to_string(),
+            helper_agent: "helper".to_string(),
+            scope: vec!["src/tests/**".to_string()],
+            allowed_ops: vec!["write".to_string()],
+            constraints_json: "{}".to_string(),
+            base_revision: Some("base".to_string()),
+            offer_message: "offer".to_string(),
+            grant_message: "grant".to_string(),
+            issued_at: String::new(),
+            expires_at: None,
+            status: DelegationStatus::Active,
+        };
+        let owner = Domain {
+            agent: "owner".to_string(),
+            description: String::new(),
+            writable: vec!["**".to_string()],
+            launcher_agent: None,
+            forbidden_write: vec![".trelane/**".to_string(), ".git/**".to_string()],
+        };
+        assert!(
+            validate_submission_paths(&task, &delegation, &owner, &["src/tests/a.rs".to_string()])
+                .is_ok()
+        );
+        assert!(
+            validate_submission_paths(&task, &delegation, &owner, &["src/lib.rs".to_string()])
+                .unwrap_err()
+                .to_string()
+                .contains("outside delegation scope")
+        );
+        task.path_scope = vec!["**".to_string()];
+        let mut broad = delegation;
+        broad.scope = vec!["**".to_string()];
+        assert!(
+            validate_submission_paths(&task, &broad, &owner, &[".git/config".to_string()])
+                .unwrap_err()
+                .to_string()
+                .contains("hard-forbidden")
+        );
+    }
+
+    #[test]
+    fn git_submission_and_owner_review_run_end_to_end() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        git_ok(root, &["init", "-q"]);
+        git_ok(root, &["config", "user.email", "tests@example.invalid"]);
+        git_ok(root, &["config", "user.name", "Trelane Tests"]);
+        std::fs::create_dir_all(root.join("src/tests")).unwrap();
+        std::fs::write(root.join("src/tests/a.rs"), "const A: u8 = 1;\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn baseline() {}\n").unwrap();
+        git_ok(root, &["add", "src"]);
+        git_ok(root, &["commit", "-q", "-m", "base"]);
+
+        let ctx = assistance_ctx(&temp);
+        cmd_help_offer(
+            &ctx,
+            "helper",
+            "owner",
+            "task_1",
+            &["src/tests/**".to_string()],
+            "add coverage",
+            "tests",
+            &["write".to_string()],
+        )
+        .unwrap();
+        let offer = store::list_open_offers_for_owner(&ctx.conn, "owner")
+            .unwrap()
+            .pop()
+            .unwrap();
+        cmd_help_accept(&ctx, &offer.id, "owner", &[], &[], 3600).unwrap();
+
+        std::fs::write(root.join("src/lib.rs"), "pub fn outside_scope() {}\n").unwrap();
+        git_ok(root, &["add", "src/lib.rs"]);
+        git_ok(root, &["commit", "-q", "-m", "outside"]);
+        let outside_commit = git_head(root).unwrap();
+        let error = cmd_work_submit(
+            &ctx,
+            "task_1",
+            "helper",
+            &offer.id,
+            &outside_commit,
+            "bad diff",
+            "not run",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("outside delegation scope"));
+
+        // Restore the out-of-scope file to its base contents and create a
+        // final tree whose base..commit diff contains only the delegated test.
+        std::fs::write(root.join("src/lib.rs"), "pub fn baseline() {}\n").unwrap();
+        std::fs::write(root.join("src/tests/a.rs"), "const A: u8 = 2;\n").unwrap();
+        git_ok(root, &["add", "src"]);
+        git_ok(root, &["commit", "-q", "-m", "scoped tests"]);
+        let scoped_commit = git_head(root).unwrap();
+        cmd_work_submit(
+            &ctx,
+            "task_1",
+            "helper",
+            &offer.id,
+            &scoped_commit,
+            "added coverage",
+            "cargo test",
+        )
+        .unwrap();
+        cmd_work_review(
+            &ctx, "task_1", "owner", &offer.id, true, false, false, "approved",
+        )
+        .unwrap();
+        assert_eq!(
+            store::get_task(&ctx.conn, "task_1").unwrap().unwrap().state,
+            TaskState::Done
+        );
+        assert_eq!(
+            store::get_delegation(&ctx.conn, &offer.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            DelegationStatus::Accepted
+        );
+    }
+
+    #[test]
+    fn stale_base_submission_invalidates_delegation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        git_ok(root, &["init", "-q"]);
+        git_ok(root, &["config", "user.email", "tests@example.invalid"]);
+        git_ok(root, &["config", "user.name", "Trelane Tests"]);
+        std::fs::create_dir_all(root.join("src/tests")).unwrap();
+        std::fs::write(root.join("src/tests/a.rs"), "const A: u8 = 1;\n").unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn baseline() {}\n").unwrap();
+        git_ok(root, &["add", "src"]);
+        git_ok(root, &["commit", "-q", "-m", "base"]);
+        let owner_branch = git_output(root, &["symbolic-ref", "--short", "HEAD"]).unwrap();
+
+        let ctx = assistance_ctx(&temp);
+        cmd_help_offer(
+            &ctx,
+            "helper",
+            "owner",
+            "task_1",
+            &["src/tests/**".to_string()],
+            "add coverage",
+            "tests",
+            &["write".to_string()],
+        )
+        .unwrap();
+        let offer = store::list_open_offers_for_owner(&ctx.conn, "owner")
+            .unwrap()
+            .pop()
+            .unwrap();
+        cmd_help_accept(&ctx, &offer.id, "owner", &[], &[], 3600).unwrap();
+
+        git_ok(root, &["checkout", "-q", "-b", "helper-work"]);
+        std::fs::write(root.join("src/tests/a.rs"), "const A: u8 = 2;\n").unwrap();
+        git_ok(root, &["add", "src/tests/a.rs"]);
+        git_ok(root, &["commit", "-q", "-m", "helper tests"]);
+        let helper_commit = git_head(root).unwrap();
+
+        git_ok(root, &["checkout", "-q", &owner_branch]);
+        std::fs::write(root.join("src/lib.rs"), "pub fn owner_advanced() {}\n").unwrap();
+        git_ok(root, &["add", "src/lib.rs"]);
+        git_ok(root, &["commit", "-q", "-m", "owner advanced"]);
+
+        let error = cmd_work_submit(
+            &ctx,
+            "task_1",
+            "helper",
+            &offer.id,
+            &helper_commit,
+            "tests",
+            "cargo test",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("stale"));
+        assert_eq!(
+            store::get_delegation(&ctx.conn, &offer.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            DelegationStatus::Revoked
         );
     }
 }
