@@ -1746,51 +1746,14 @@ pub fn scaffold_description_from_structure(root: &Path) -> ProjectDescription {
 
 fn normalize_urgency(priority: &str) -> String {
     match priority {
-
-    // C1: record each planned item as a first-class task in the ledger, so the
-    // durable work record no longer lives only in the initial message. The
-    // message is still sent as the agent's notification, but now carries the
-    // task id. Re-applying a plan must not duplicate tasks: if the owner
-    // already has a task with the same subject, reuse it instead of creating a
-    // new one (mirrors the agent re-sync above).
-    let now = crate::crypto::now_iso();
+        "low" | "normal" | "high" | "critical" => priority.to_string(),
         _ => "normal".to_string(),
     }
 }
 
 /// Register the plan's agents in a live session and queue their planned work as
-            .unwrap_or_else(|| "normal".to_string());
-
-        let existing = crate::store::list_tasks_for_owner(&ctx.conn, &t.agent)?;
-        let task_id = if let Some(found) = existing.iter().find(|et| et.subject == t.subject) {
-            found.id.clone()
-        } else {
-            let path_scope = spec
-                .get(t.agent.as_str())
-                .map(|d| d.writable.clone())
-                .unwrap_or_default();
-            let task = crate::models::Task {
-                id: crate::crypto::new_id("task"),
-                owner_agent: t.agent.clone(),
-                domain: t.agent.clone(),
-                parent_task: None,
-                subject: t.subject.clone(),
-                body: t.body.clone(),
-                state: crate::models::TaskState::Ready,
-                priority: urgency.clone(),
-                assist_policy: crate::models::AssistPolicy::Open,
-                desired_parallelism: 1,
-                path_scope,
-                acceptance: vec![],
-                blocked_by: vec![],
-                created_at: now.clone(),
-                updated_at: now.clone(),
-            };
-            crate::store::insert_task(&ctx.conn, &task)?;
-            task.id
-        };
-
-/// the number of agents newly registered.
+/// first-class ledger tasks and messages. Returns the number of agents newly
+/// registered.
 fn apply_plan_to_session(
     ctx: &crate::Context,
     desc: &ProjectDescription,
@@ -1799,7 +1762,6 @@ fn apply_plan_to_session(
     let existing = crate::store::list_agents(&ctx.conn)?;
     let spec: std::collections::HashMap<&str, &DomainSpec> =
         desc.domains.iter().map(|d| (d.name.as_str(), d)).collect();
-            &Some(task_id),
     let mut added = 0;
     let mut resynced = 0;
     for a in &plan.agents {
@@ -2042,104 +2004,6 @@ pub fn cmd_biplane_interactive(
             } else {
                 "scaffolded from source layout"
             }
-        assert_eq!(solo.launcher_agent.as_deref(), Some("fallback-model"));
-    }
-
-    #[test]
-    fn apply_plan_records_planned_work_as_ledger_tasks() {
-        let temp = tempfile::tempdir().unwrap();
-        let ctx = migrated_ctx(&temp);
-        let mut backend = plan_domain("backend", Some("opencode/x"));
-        backend.planned_work = vec![
-            PlannedWork {
-                subject: "wire up the API".to_string(),
-                body: "add the /v1 routes".to_string(),
-                priority: "high".to_string(),
-            },
-            PlannedWork {
-                subject: "add integration tests".to_string(),
-                body: String::new(),
-                priority: "normal".to_string(),
-            },
-        ];
-        let desc = ProjectDescription {
-            name: "demo".into(),
-            description: String::new(),
-            domains: vec![backend],
-            max_agents: Some(1),
-            default_model: None,
-        };
-        let plan = plan_from_description(&desc, 1).unwrap();
-        apply_plan_to_session(&ctx, &desc, &plan).unwrap();
-
-        let tasks = crate::store::list_tasks_for_owner(&ctx.conn, "backend").unwrap();
-        assert_eq!(tasks.len(), 2, "each planned item becomes a ledger task");
-        let api = tasks
-            .iter()
-            .find(|t| t.subject == "wire up the API")
-            .expect("api task present");
-        assert_eq!(api.state, crate::models::TaskState::Ready);
-        assert_eq!(api.priority, "high");
-        assert_eq!(api.owner_agent, "backend");
-        assert_eq!(api.path_scope, vec!["src/backend/**".to_string()]);
-
-        // Re-applying the same plan must not duplicate tasks.
-        apply_plan_to_session(&ctx, &desc, &plan).unwrap();
-        let tasks2 = crate::store::list_tasks_for_owner(&ctx.conn, "backend").unwrap();
-        assert_eq!(
-            tasks2.len(),
-            2,
-            "re-apply reuses existing tasks by subject, no duplicates"
-        );
-        println!("  Proposed domains: {}", base.domains.len());
-        println!();
-    }
-
-    #[test]
-    fn apply_plan_records_planned_work_as_ledger_tasks() {
-        let temp = tempfile::tempdir().unwrap();
-        let ctx = migrated_ctx(&temp);
-        let mut backend = plan_domain("backend", Some("opencode/x"));
-        backend.planned_work = vec![
-            PlannedWork {
-                subject: "wire up the API".to_string(),
-                body: "add the /v1 routes".to_string(),
-                priority: "high".to_string(),
-                ..Default::default()
-            },
-            PlannedWork {
-                subject: "add integration tests".to_string(),
-                ..Default::default()
-            },
-        ];
-        let desc = ProjectDescription {
-            name: "demo".into(),
-            description: String::new(),
-            domains: vec![backend],
-            max_agents: Some(1),
-            default_model: None,
-        };
-        let plan = plan_from_description(&desc, 1).unwrap();
-        apply_plan_to_session(&ctx, &desc, &plan).unwrap();
-
-        let tasks = crate::store::list_tasks_for_owner(&ctx.conn, "backend").unwrap();
-        assert_eq!(tasks.len(), 2, "each planned item becomes a ledger task");
-        let api = tasks
-            .iter()
-            .find(|t| t.subject == "wire up the API")
-            .expect("api task present");
-        assert_eq!(api.state, crate::models::TaskState::Ready);
-        assert_eq!(api.priority, "high");
-        assert_eq!(api.owner_agent, "backend");
-        assert_eq!(api.path_scope, vec!["src/backend/**".to_string()]);
-
-        // Re-applying the same plan must not duplicate tasks.
-        apply_plan_to_session(&ctx, &desc, &plan).unwrap();
-        let tasks2 = crate::store::list_tasks_for_owner(&ctx.conn, "backend").unwrap();
-        assert_eq!(
-            tasks2.len(),
-            2,
-            "re-apply reuses existing tasks by subject, no duplicates"
         );
         println!("  Proposed domains: {}", base.domains.len());
         println!();

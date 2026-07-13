@@ -164,18 +164,7 @@ CREATE INDEX IF NOT EXISTS idx_reviews_task ON task_reviews(task_id);
 "#;
 
 /// C2 assistance protocol. The links are additive so existing C1 ledgers are
-    let conn = Connection::open(db_path)?;
-    conn.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
-    )?;
-    migrate(&conn)?;
-    Ok(conn)
-}
-
-/// Open an in-memory database with the full migrated schema. Intended for
-/// tests and ephemeral tooling; avoids tempfile lifetime concerns.
-pub fn open_in_memory() -> Result<Connection> {
-    let conn = Connection::open_in_memory()?;
+/// safe to upgrade in place.
 const SCHEMA_C2: &str = r#"
 ALTER TABLE claims ADD COLUMN delegation_id TEXT;
 ALTER TABLE delegations ADD COLUMN offer_message TEXT NOT NULL DEFAULT '';
@@ -192,12 +181,6 @@ CREATE TABLE IF NOT EXISTS task_submissions (
     summary           TEXT NOT NULL DEFAULT '',
     tests             TEXT NOT NULL DEFAULT '',
     changed_paths_json TEXT NOT NULL DEFAULT '[]',
-        // Fall through (instead of returning) so table-creating migrations
-        // that are NOT part of SCHEMA_V1 -- cycle_break_attempts (v5) and the
-        // C1 work ledger (v6) -- also run on a brand-new database. The v2..v4
-        // steps are ALTER TABLEs already covered by SCHEMA_V1, and are skipped
-        // because `version` is now 4.
-        version = 4;
     status            TEXT NOT NULL DEFAULT 'pending',
     created_at        TEXT NOT NULL,
     reviewed_at       TEXT
@@ -241,13 +224,7 @@ const SCHEMA_C5: &str = r#"
 CREATE TABLE IF NOT EXISTS delegation_workspaces (
     delegation_id TEXT PRIMARY KEY,
     mode          TEXT NOT NULL DEFAULT 'shared',
-        conn.execute_batch("PRAGMA user_version = 5;")?;
-        version = 5;
-    }
-    if version < 6 {
-        // C1: durable work ledger (tasks, assignments, delegations, reviews).
-        conn.execute_batch(SCHEMA_C1)?;
-        conn.execute_batch("PRAGMA user_version = 6;")?;
+    path          TEXT NOT NULL DEFAULT '',
     branch        TEXT NOT NULL DEFAULT '',
     created_at    TEXT NOT NULL
 );

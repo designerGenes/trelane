@@ -329,13 +329,7 @@ pub enum Command {
 
     /// Inspect or change Trelane configuration values
     Config {
-
-    /// Inspect and manage the durable work ledger (C1)
-    Work {
         #[command(subcommand)]
-        action: WorkAction,
-    },
-
         action: ConfigAction,
     },
 
@@ -348,43 +342,7 @@ pub enum Command {
     /// Inspect and manage the durable work ledger (C1)
     Work {
         #[command(subcommand)]
-}
-
-#[derive(Subcommand)]
-pub enum WorkAction {
-    /// List tasks in the ledger (optionally filtered by owner and/or state)
-    List {
-        #[arg(long)]
-        owner: Option<String>,
-        #[arg(long, help = "filter by state: draft|ready|active|blocked|review|done|cancelled")]
-        state: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show a single task with its assignments, delegations, and reviews
-    Show { id: String },
-    /// Add a task to the ledger
-    Add {
-        #[arg(long)]
-        owner: String,
-        #[arg(long)]
-        subject: String,
-        #[arg(long, default_value = "")]
-        body: String,
-        #[arg(long, default_value = "normal", help = "low|normal|high|critical")]
-        priority: String,
-        #[arg(long = "path", help = "path-scope glob (repeatable)")]
-        paths: Vec<String>,
-        #[arg(long = "accept", help = "acceptance criterion (repeatable)")]
-        acceptance: Vec<String>,
-        #[arg(long = "blocked-by", help = "task id this task depends on (repeatable)")]
-        blocked_by: Vec<String>,
-        #[arg(long = "parallelism", default_value_t = 1, help = "how many agents may work it at once")]
-        parallelism: u32,
-        #[arg(long = "assist", default_value = "open", help = "assist policy: open|solo")]
-        assist: String,
-    },
-}
+        action: WorkAction,
     },
 
     /// Kill all trelane tmux sessions and stop all running agents

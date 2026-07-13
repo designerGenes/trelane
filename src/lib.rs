@@ -778,11 +778,15 @@ pub fn handle(cli: Cli) -> Result<()> {
                 .iter()
                 .filter(|s| s.name == format!("agent.run:{agent}"))
                 .max_by_key(|s| s.start_time_unix_nano);
-        Some(Command::Config { action }) => cmd_config(&action),
-        Some(Command::Work { action }) => {
-            let ctx = Context::open(cli.root.as_deref())?;
-            commands::cmd_work(&ctx, &action)
-        }
+            // NOTE: run_span_id resolution reconstructed during corruption
+            // repair; verify None-handling matches intended UX.
+            let run_span_id = match last_run {
+                Some(span) => span.span_id.clone(),
+                None => {
+                    println!("no agent.run span found for {agent}; cannot record rating");
+                    return Ok(());
+                }
+            };
             tracer.record_rating(&rater, &agent, &run_span_id, rating, &rationale)?;
             println!("rating recorded: {rater} rated {agent} = {rating}/10");
             Ok(())

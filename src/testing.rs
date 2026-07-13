@@ -79,6 +79,10 @@ pub enum ScenarioStep {
         waiting_on: String,
         resume_hint: String,
     },
+    // "prop" is the current name for the scheduler formerly called "the pump"
+    // (now `crate::squire`). Accept it as an alias so scenario fixtures written
+    // in the newer vocabulary still deserialize to this step.
+    #[serde(alias = "Prop")]
     Pump {
         explanation: String,
         ticks: u32,
@@ -88,6 +92,7 @@ pub enum ScenarioStep {
         agent: String,
         why: String,
     },
+    #[serde(alias = "PropWatch")]
     PumpWatch {
         explanation: String,
         interval_s: u64,

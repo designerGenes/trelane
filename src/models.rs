@@ -358,269 +358,7 @@ pub struct Message {
 impl Message {
     pub fn new(
         id: String,
-
-// ------------------------------------------------------------------- tasks
-//
-// C1: the durable work ledger. Messages remain the notification / protocol
-// channel; these types are the first-class record of what work exists, who
-// owns it, its readiness and dependencies, and (via delegations and reviews)
-// how cross-domain assistance is authorized and accepted. Everything here is
-// additive -- existing park / claim / message flows are unchanged.
-
-pub const TASK_STATES: &[&str] = &[
-    "draft", "ready", "active", "blocked", "review", "done", "cancelled",
-];
-
-/// Lifecycle state of a task in the ledger.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskState {
-    Draft,
-    Ready,
-    Active,
-    Blocked,
-    Review,
-    Done,
-    Cancelled,
-}
-
-impl TaskState {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            TaskState::Draft => "draft",
-            TaskState::Ready => "ready",
-            TaskState::Active => "active",
-            TaskState::Blocked => "blocked",
-            TaskState::Review => "review",
-            TaskState::Done => "done",
-            TaskState::Cancelled => "cancelled",
-        }
-    }
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "draft" => TaskState::Draft,
-            "ready" => TaskState::Ready,
-            "active" => TaskState::Active,
-            "blocked" => TaskState::Blocked,
-            "review" => TaskState::Review,
-            "done" => TaskState::Done,
-            "cancelled" => TaskState::Cancelled,
-            _ => return None,
-        })
-    }
-    /// True for closed states (no longer schedulable or assistable).
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, TaskState::Done | TaskState::Cancelled)
-    }
-    /// True for the success terminal state (satisfies a dependency).
-    pub fn is_done(&self) -> bool {
-        matches!(self, TaskState::Done)
-    }
-}
-
-/// Whether a task may be assisted by non-owner agents. C2 enforces this; C1
-/// only records it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AssistPolicy {
-    /// Any eligible idle agent may offer to help (subject to owner approval).
-    Open,
-    /// Owner-only: not open to cross-domain assistance.
-    Solo,
-}
-
-impl AssistPolicy {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            AssistPolicy::Open => "open",
-            AssistPolicy::Solo => "solo",
-        }
-    }
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "open" => AssistPolicy::Open,
-            "solo" => AssistPolicy::Solo,
-            _ => return None,
-        })
-    }
-}
-
-/// A first-class unit of work in the ledger.
-#[derive(Debug, Clone)]
-pub struct Task {
-    pub id: String,
-    pub owner_agent: String,
-    /// Owning domain name (usually the same as `owner_agent`).
-    pub domain: String,
-    pub parent_task: Option<String>,
-    pub subject: String,
-    pub body: String,
-    pub state: TaskState,
-    /// Urgency using the same vocabulary as messages (see [`URGENCIES`]).
-    pub priority: String,
-    pub assist_policy: AssistPolicy,
-    /// How many agents may work this task at once (>= 1). Single-helper
-    /// subtasks use 1.
-    pub desired_parallelism: u32,
-    /// Path globs this task is scoped to (a subset of the owner's domain).
-    pub path_scope: Vec<String>,
-    /// Acceptance criteria, human/agent-readable.
-    pub acceptance: Vec<String>,
-    /// Task ids that must be `done` before this task becomes ready.
-    pub blocked_by: Vec<String>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-impl Task {
-    /// True when every dependency in `blocked_by` is present in the given set
-    /// of completed (done) task ids. A task with no dependencies is always
-    /// satisfied.
-    pub fn deps_satisfied(&self, done_ids: &std::collections::HashSet<String>) -> bool {
-        self.blocked_by.iter().all(|d| done_ids.contains(d))
-    }
-}
-
-/// Role an agent plays on a task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskRole {
-    Owner,
-    Helper,
-    Reviewer,
-    Integrator,
-}
-
-impl TaskRole {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            TaskRole::Owner => "owner",
-            TaskRole::Helper => "helper",
-            TaskRole::Reviewer => "reviewer",
-            TaskRole::Integrator => "integrator",
-        }
-    }
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "owner" => TaskRole::Owner,
-            "helper" => TaskRole::Helper,
-            "reviewer" => TaskRole::Reviewer,
-            "integrator" => TaskRole::Integrator,
-            _ => return None,
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TaskAssignment {
-    pub task_id: String,
-    pub agent: String,
-    pub role: TaskRole,
-    /// Free-form lifecycle marker for the assignment (e.g. "active",
-    /// "completed"). Kept as a string so the assistance protocol (C2) can
-    /// extend the vocabulary without a migration.
-    pub state: String,
-    pub offer_id: Option<String>,
-    pub delegation_id: Option<String>,
-    pub started_at: Option<String>,
-    pub completed_at: Option<String>,
-}
-
-/// Status of a delegation capability. C2 drives the transitions; C1 records.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DelegationStatus {
-    Offered,
-    Active,
-    Revoked,
-    Expired,
-    Submitted,
-    Accepted,
-    Rejected,
-}
-
-impl DelegationStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            DelegationStatus::Offered => "offered",
-            DelegationStatus::Active => "active",
-            DelegationStatus::Revoked => "revoked",
-            DelegationStatus::Expired => "expired",
-            DelegationStatus::Submitted => "submitted",
-            DelegationStatus::Accepted => "accepted",
-            DelegationStatus::Rejected => "rejected",
-        }
-    }
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "offered" => DelegationStatus::Offered,
-            "active" => DelegationStatus::Active,
-            "revoked" => DelegationStatus::Revoked,
-            "expired" => DelegationStatus::Expired,
-            "submitted" => DelegationStatus::Submitted,
-            "accepted" => DelegationStatus::Accepted,
-            "rejected" => DelegationStatus::Rejected,
-            _ => return None,
-        })
-    }
-    /// True while the delegation can still authorize writes.
-    pub fn is_live(&self) -> bool {
-        matches!(self, DelegationStatus::Active)
-    }
-}
-
-/// A signed, expiring, revocable, task-scoped grant of write authority from a
-/// domain owner to a helper. C1 stores it; C2 issues and enforces it.
-#[derive(Debug, Clone)]
-pub struct Delegation {
-    pub id: String,
-    pub task_id: String,
-    pub owner_agent: String,
-    pub helper_agent: String,
-    pub scope: Vec<String>,
-    pub allowed_ops: Vec<String>,
-    /// Opaque constraint object, stored as a raw JSON string.
-    pub constraints_json: String,
-    pub base_revision: Option<String>,
-    pub grant_message: String,
-    pub issued_at: String,
-    pub expires_at: Option<String>,
-    pub status: DelegationStatus,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReviewDecision {
-    Accept,
-    RequestChanges,
-    Reject,
-}
-
-impl ReviewDecision {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ReviewDecision::Accept => "accept",
-            ReviewDecision::RequestChanges => "request-changes",
-            ReviewDecision::Reject => "reject",
-        }
-    }
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "accept" => ReviewDecision::Accept,
-            "request-changes" => ReviewDecision::RequestChanges,
-            "reject" => ReviewDecision::Reject,
-            _ => return None,
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TaskReview {
-    pub id: String,
-    pub task_id: String,
-    pub delegation_id: Option<String>,
-    pub reviewer_agent: String,
-    pub submission_ref: String,
-    pub decision: ReviewDecision,
-    pub notes: String,
-    pub created_at: String,
-}
-
+        from: String,
         to: String,
         msg_type: String,
         urgency: String,
@@ -650,53 +388,6 @@ pub struct TaskReview {
     }
 }
 
-fn default_urgency() -> String {
-    "normal".to_string()
-}
-
-#[derive(Debug, Clone)]
-pub struct ParkedTask {
-    pub task: String,
-    pub agent: String,
-    pub wait_type: String,
-    pub wait_re: Option<String>,
-    pub wait_path: Option<String>,
-    pub waiting_on: String,
-    pub resume_hint: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct Lease {
-    pub path: String,
-    pub holder: String,
-    pub task: Option<String>,
-    pub grant: Option<String>,
-    /// Delegation capability backing a cross-domain lease. `None` preserves
-    /// ordinary in-domain leases and legacy rows.
-    pub delegation_id: Option<String>,
-    pub acquired_at: String,
-    pub expires_at: f64,
-    pub expires_human: String,
-    pub contested: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct RunningLock {
-    pub agent: String,
-    pub pid: i32,
-    pub started_at: String,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Violation {
-    pub id: String,
-    pub agent: String,
-    pub paths: Vec<String>,
-    pub at: String,
-}
-
 // ------------------------------------------------------------------- tasks
 //
 // C1: the durable work ledger. Messages remain the notification / protocol
@@ -706,13 +397,7 @@ pub struct Violation {
 // additive -- existing park / claim / message flows are unchanged.
 
 pub const TASK_STATES: &[&str] = &[
-    "draft",
-    "ready",
-    "active",
-    "blocked",
-    "review",
-    "done",
-    "cancelled",
+    "draft", "ready", "active", "blocked", "review", "done", "cancelled",
 ];
 
 /// Lifecycle state of a task in the ledger.
@@ -924,9 +609,7 @@ pub struct Delegation {
     /// Opaque constraint object, stored as a raw JSON string.
     pub constraints_json: String,
     pub base_revision: Option<String>,
-    /// Signed `help-offer` message that created this proposed capability.
     pub offer_message: String,
-    /// Signed `help-accept` message carrying the active capability.
     pub grant_message: String,
     pub issued_at: String,
     pub expires_at: Option<String>,
@@ -968,6 +651,53 @@ pub struct TaskReview {
     pub decision: ReviewDecision,
     pub notes: String,
     pub created_at: String,
+}
+
+fn default_urgency() -> String {
+    "normal".to_string()
+}
+
+#[derive(Debug, Clone)]
+pub struct ParkedTask {
+    pub task: String,
+    pub agent: String,
+    pub wait_type: String,
+    pub wait_re: Option<String>,
+    pub wait_path: Option<String>,
+    pub waiting_on: String,
+    pub resume_hint: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Lease {
+    pub path: String,
+    pub holder: String,
+    pub task: Option<String>,
+    pub grant: Option<String>,
+    /// Delegation capability backing a cross-domain lease. `None` preserves
+    /// ordinary in-domain leases and legacy rows.
+    pub delegation_id: Option<String>,
+    pub acquired_at: String,
+    pub expires_at: f64,
+    pub expires_human: String,
+    pub contested: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunningLock {
+    pub agent: String,
+    pub pid: i32,
+    pub started_at: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Violation {
+    pub id: String,
+    pub agent: String,
+    pub paths: Vec<String>,
+    pub at: String,
 }
 
 /// A helper's validated Git submission. Pending submissions are deliberately
