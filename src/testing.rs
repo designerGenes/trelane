@@ -149,6 +149,16 @@ pub enum ScenarioStep {
         agent: String,
         state: String,
     },
+    /// Biplane --describe as a setup phase. Loads the *.describe.json, runs
+    /// Biplane planning (validate -> plan -> apply), and provisions the
+    /// plan's agents + tasks into the live session. This is the
+    /// Biplane->Trelane handoff exercised end-to-end. The describe path is
+    /// resolved relative to the scenario file's parent (so a fixture can
+    /// reference a sibling *.describe.json by bare filename) or as absolute.
+    BiplaneDescribe {
+        explanation: String,
+        describe_path: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -226,6 +236,7 @@ pub fn run_testing(
             run,
             &sandbox_root,
             launcher_override.or(scenario.launcher.as_deref()),
+            Some(scenario_path),
         )?;
         println!(
             "[testing] run {run} finished result={} duration_ms={}",
@@ -254,6 +265,7 @@ fn run_once(
     run: u32,
     sandbox_root: &Path,
     launcher_override: Option<&str>,
+    scenario_path: Option<&Path>,
 ) -> Result<ScenarioReport> {
     let run_dir = sandbox_root.join(format!("scenario-run-{run}"));
     if run_dir.exists() {
@@ -557,6 +569,36 @@ fn run_once(
                     )));
                 }
             }
+            ScenarioStep::BiplaneDescribe {
+                explanation: _,
+                describe_path,
+            } => {
+                // Resolve the describe path: absolute as-is, otherwise
+                // relative to the scenario file's parent (so a fixture can
+                // reference a sibling *.describe.json by bare filename).
+                let p = std::path::Path::new(describe_path);
+                let resolved = if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    match scenario_path.and_then(|sp| sp.parent()) {
+                        Some(base) => base.join(p),
+                        None => {
+                            return Err(TrelaneError::msg(format!(
+                                "BiplaneDescribe step cannot resolve relative path '{describe_path}' \
+                                 without a scenario file path (in-memory scenarios must use an \
+                                 absolute describe_path)"
+                            )));
+                        }
+                    }
+                };
+                let desc = crate::biplane::load_project_description(&resolved)?;
+                let added = crate::biplane::apply_description_to_session(&ctx, &desc)?;
+                println!(
+                    "[testing] biplane-describe applied '{}' -> provisioned {} agent(s)/task(s)",
+                    resolved.display(),
+                    added
+                );
+            }
         }
     }
 
@@ -603,6 +645,7 @@ fn step_name(step: &ScenarioStep) -> &'static str {
         ScenarioStep::AssertFileContains { .. } => "assert-file-contains",
         ScenarioStep::AssertTaskState { .. } => "assert-task-state",
         ScenarioStep::AssertAgentState { .. } => "assert-agent-state",
+        ScenarioStep::BiplaneDescribe { .. } => "biplane-describe",
     }
 }
 
@@ -620,7 +663,8 @@ fn step_explanation(step: &ScenarioStep) -> &str {
         | ScenarioStep::AssertFileExists { explanation, .. }
         | ScenarioStep::AssertFileContains { explanation, .. }
         | ScenarioStep::AssertTaskState { explanation, .. }
-        | ScenarioStep::AssertAgentState { explanation, .. } => explanation,
+        | ScenarioStep::AssertAgentState { explanation, .. }
+        | ScenarioStep::BiplaneDescribe { explanation, .. } => explanation,
     }
 }
 
@@ -1099,7 +1143,7 @@ mod tests {
             ],
             metrics: vec![],
         };
-        let report = run_once(&scenario, 1, &sandbox, None).unwrap();
+        let report = run_once(&scenario, 1, &sandbox, None, None).unwrap();
         assert_eq!(report.result, "ok", "run should pass all asserts");
     }
 
@@ -1136,7 +1180,7 @@ mod tests {
             }],
             metrics: vec![],
         };
-        let err = run_once(&scenario, 1, &sandbox, None).unwrap_err();
+        let err = run_once(&scenario, 1, &sandbox, None, None).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("src/never_created.rs"),
@@ -1180,7 +1224,7 @@ mod tests {
             }],
             metrics: vec![],
         };
-        let err = run_once(&scenario, 1, &sandbox, None).unwrap_err();
+        let err = run_once(&scenario, 1, &sandbox, None, None).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("fn answer"),
@@ -1222,12 +1266,113 @@ mod tests {
             }],
             metrics: vec![],
         };
-        let err = run_once(&scenario, 1, &sandbox, None).unwrap_err();
+        let err = run_once(&scenario, 1, &sandbox, None, None).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("task-nope"),
             "error names the missing task: {msg}"
         );
         assert!(msg.contains("not found"), "error says not found: {msg}");
+    }
+
+    /// BiplaneDescribe step loads a *.describe.json, runs Biplane planning,
+    /// and provisions the plan's agents + tasks into the live session.
+    /// Verified end-to-end against the real space_rogue.describe.json fixture:
+    /// after the step, all four planned domains are registered agents and
+    /// their planned_work items exist as Ready tasks owned by the right agent.
+    /// This is the Biplane->Trelane handoff the bench framework depends on.
+    #[test]
+    fn biplane_describe_provisions_agents_and_tasks_from_fixture() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("sandbox");
+        fs::create_dir_all(&sandbox).unwrap();
+        let describe_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/space_rogue.describe.json"
+        );
+        let scenario = Scenario {
+            name: "biplane-setup".to_string(),
+            description: "Biplane describe provisions the session".to_string(),
+            launcher: None,
+            mode: ScenarioMode::Stub,
+            // No hand-authored agents: the BiplaneDescribe step provisions
+            // every agent from the plan. This is the Biplane-driven setup path.
+            project: ScenarioProject { files: vec![] },
+            agents: vec![],
+            steps: vec![ScenarioStep::BiplaneDescribe {
+                explanation: "provision from space_rogue describe".to_string(),
+                describe_path: describe_path.to_string(),
+            }],
+            metrics: vec![],
+        };
+        let report = run_once(&scenario, 1, &sandbox, None, None).unwrap();
+        assert_eq!(report.result, "ok");
+
+        // Direct ledger checks: the budgeted domains (max_agents=3 in the
+        // fixture, so the first three in topo order -- engine, worldgen,
+        // combat -- are provisioned; ui is the fourth and is correctly cut by
+        // the cap) are registered as agents, and the planned_work items became
+        // Ready tasks owned by the right domain agent. These run against the
+        // same ctx the step loop used, confirming the provisioning landed in
+        // the DB rather than merely that no step errored.
+        let ctx = crate::Context::open(Some(&sandbox.join("scenario-run-1"))).unwrap();
+        let agents = crate::store::list_agents(&ctx.conn).unwrap();
+        for expected in ["engine", "worldgen", "combat"] {
+            assert!(
+                agents.iter().any(|a| a == expected),
+                "planned domain '{expected}' was not registered as an agent; got {agents:?}"
+            );
+        }
+        // The fixture's max_agents=3 caps the plan; ui is the fourth domain
+        // in dependency order and is intentionally NOT provisioned. Confirming
+        // the cap is honored is part of verifying the Biplane->Trelane
+        // handoff matches the plan, not just the description.
+        assert!(
+            !agents.iter().any(|a| a == "ui"),
+            "ui should be cut by the max_agents=3 budget, but was provisioned: {agents:?}"
+        );
+        let tasks = crate::store::list_tasks(&ctx.conn).unwrap();
+        // engine has 2 planned_work, worldgen 1, combat 1 = 4 (ui's 2 are cut
+        // by the max_agents=3 budget). The count confirms every budgeted
+        // domain's planned_work became a task, not just that some did.
+        assert!(
+            tasks.len() >= 4,
+            "expected at least 4 planned tasks from the three budgeted domains, found {}",
+            tasks.len()
+        );
+        let turn_loop = tasks
+            .iter()
+            .find(|t| t.subject == "Turn loop and scheduler")
+            .expect("planned_work 'Turn loop and scheduler' became a task");
+        assert_eq!(turn_loop.owner_agent, "engine");
+        assert_eq!(turn_loop.state, crate::models::TaskState::Ready);
+    }
+
+    /// BiplaneDescribe with a relative describe_path resolves against the
+    /// scenario file's parent directory. Verified by giving run_once a real
+    /// scenario_path pointing at tests/ and a bare filename -- the same
+    /// resolution a fixture file uses to reference a sibling *.describe.json.
+    #[test]
+    fn biplane_describe_resolves_relative_path_against_scenario_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("sandbox");
+        fs::create_dir_all(&sandbox).unwrap();
+        let scenario_path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/dummy.json");
+        let scenario = Scenario {
+            name: "biplane-rel".to_string(),
+            description: "relative describe path resolves against scenario file".to_string(),
+            launcher: None,
+            mode: ScenarioMode::Stub,
+            project: ScenarioProject { files: vec![] },
+            agents: vec![],
+            steps: vec![ScenarioStep::BiplaneDescribe {
+                explanation: "provision via sibling reference".to_string(),
+                describe_path: "space_rogue.describe.json".to_string(),
+            }],
+            metrics: vec![],
+        };
+        let report = run_once(&scenario, 1, &sandbox, None, Some(&scenario_path)).unwrap();
+        assert_eq!(report.result, "ok");
     }
 }

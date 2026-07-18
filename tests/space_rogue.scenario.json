@@ -1,0 +1,37 @@
+{
+  "name": "space_rogue",
+  "description": "Biplane-driven fixture: provisions the session from space_rogue.describe.json via Biplane planning, then pumps the squire to wake the planned agents against their ready tasks. Stub mode here verifies the Biplane->Trelane handoff (agents + tasks provisioned, no deadlock); the Bench/free-model variant (step 3 of the bench framework) will run the same fixture against real free models and add AssertFileExists/AssertFileContains for the planned_work output.",
+  "launcher": "trelane --root {root} stub {agent}",
+  "project": {
+    "files": []
+  },
+  "agents": [],
+  "steps": [
+    {
+      "type": "BiplaneDescribe",
+      "explanation": "Provision the session from the Biplane describe fixture: validate, plan (max_agents=3), and apply -- registering engine/worldgen/combat as agents and their planned_work as Ready tasks.",
+      "describe_path": "space_rogue.describe.json"
+    },
+    {
+      "type": "Pump",
+      "explanation": "Wake the planned agents against their ready tasks. In Stub mode cmd_stub runs the deterministic no-LLM agent (which does not write real content here); this tick still exercises the squire's wake-plan against a Biplane-provisioned swarm.",
+      "ticks": 2
+    },
+    {
+      "type": "AssertParkedCount",
+      "explanation": "No parked tasks should remain after the pump drains the inboxes.",
+      "count": 0
+    },
+    {
+      "type": "AssertNoDeadlock",
+      "explanation": "The Biplane-planned swarm must not produce a wait-cycle."
+    },
+    {
+      "type": "AssertAgentState",
+      "explanation": "engine has ready owned tasks after the pump (Stub mode cannot complete them -- no real content); in Bench/free-model mode this assert changes to 'idle' once the planned work is actually produced.",
+      "agent": "engine",
+      "state": "owned-work-ready"
+    }
+  ],
+  "metrics": ["messages_sent", "pumps"]
+}
