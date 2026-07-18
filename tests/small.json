@@ -61,6 +61,17 @@
     {
       "type": "AssertNoDeadlock",
       "explanation": "A single directed wait can never cycle."
+    },
+    {
+      "type": "AssertFileExists",
+      "explanation": "The sandbox story file must still exist at end of run.",
+      "path": "src/story.md"
+    },
+    {
+      "type": "AssertFileContains",
+      "explanation": "The style guide must retain its voice heading.",
+      "path": "style/guide.md",
+      "contains": "# Style Guide"
     }
   ],
   "metrics": ["messages_sent", "prop_ticks"]

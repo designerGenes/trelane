@@ -118,6 +118,37 @@ pub enum ScenarioStep {
         explanation: String,
         count: usize,
     },
+    /// Verify a file exists in the sandbox project. The floor assertion for
+    /// "did this run actually generate anything": a Stub run with
+    /// hand-placed files passes; a free-model run that produced nothing fails.
+    AssertFileExists {
+        explanation: String,
+        path: String,
+    },
+    /// Verify a file's contents include a substring. Stronger than
+    /// AssertFileExists: catches an agent that created a placeholder file
+    /// with no real content. Substring (not regex) to keep scenarios portable.
+    AssertFileContains {
+        explanation: String,
+        path: String,
+        contains: String,
+    },
+    /// Verify a task is in a named state ("ready"/"active"/"done"/...).
+    /// Asserts the project's task ledger reflects what the scenario expected,
+    /// not just that no deadlock remains.
+    AssertTaskState {
+        explanation: String,
+        task_id: String,
+        state: String,
+    },
+    /// Verify an agent's derived activity state ("idle"/"running"/"blocked"/
+    /// "owned-work-ready"/...). Delegates to squire::agent_activity_status so
+    /// the assertion uses the same derivation the squire itself uses.
+    AssertAgentState {
+        explanation: String,
+        agent: String,
+        state: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -459,6 +490,73 @@ fn run_once(
                     )));
                 }
             }
+            ScenarioStep::AssertFileExists {
+                explanation: _,
+                path,
+            } => {
+                let abs = ctx.root.join(path);
+                if !abs.exists() {
+                    return Err(TrelaneError::msg(format!(
+                        "scenario assertion failed: expected file to exist but it does not: {}",
+                        path
+                    )));
+                }
+            }
+            ScenarioStep::AssertFileContains {
+                explanation: _,
+                path,
+                contains,
+            } => {
+                let abs = ctx.root.join(path);
+                let contents = fs::read_to_string(&abs).map_err(|e| {
+                    TrelaneError::msg(format!(
+                        "scenario assertion failed: cannot read {} for substring check: {e}",
+                        path
+                    ))
+                })?;
+                if !contents.contains(contains.as_str()) {
+                    return Err(TrelaneError::msg(format!(
+                        "scenario assertion failed: {} does not contain expected substring {:?} \
+                         (file has {} bytes)",
+                        path,
+                        contains,
+                        contents.len()
+                    )));
+                }
+            }
+            ScenarioStep::AssertTaskState {
+                explanation: _,
+                task_id,
+                state,
+            } => {
+                let task = crate::store::get_task(&ctx.conn, task_id)?.ok_or_else(|| {
+                    TrelaneError::msg(format!(
+                        "scenario assertion failed: task '{task_id}' not found"
+                    ))
+                })?;
+                if task.state.as_str() != state.as_str() {
+                    return Err(TrelaneError::msg(format!(
+                        "scenario assertion failed: task '{task_id}' expected state '{state}' \
+                         but is '{}'",
+                        task.state.as_str()
+                    )));
+                }
+            }
+            ScenarioStep::AssertAgentState {
+                explanation: _,
+                agent,
+                state,
+            } => {
+                let status = crate::squire::agent_activity_status(&ctx, agent)?;
+                if status.state.as_str() != state.as_str() {
+                    return Err(TrelaneError::msg(format!(
+                        "scenario assertion failed: agent '{agent}' expected activity state \
+                         '{state}' but is '{}' ({})",
+                        status.state.as_str(),
+                        status.reason
+                    )));
+                }
+            }
         }
     }
 
@@ -501,6 +599,10 @@ fn step_name(step: &ScenarioStep) -> &'static str {
         ScenarioStep::Redomain { .. } => "redomain",
         ScenarioStep::AssertNoDeadlock { .. } => "assert-no-deadlock",
         ScenarioStep::AssertParkedCount { .. } => "assert-parked-count",
+        ScenarioStep::AssertFileExists { .. } => "assert-file-exists",
+        ScenarioStep::AssertFileContains { .. } => "assert-file-contains",
+        ScenarioStep::AssertTaskState { .. } => "assert-task-state",
+        ScenarioStep::AssertAgentState { .. } => "assert-agent-state",
     }
 }
 
@@ -514,7 +616,11 @@ fn step_explanation(step: &ScenarioStep) -> &str {
         | ScenarioStep::ClaimExpectDenied { explanation, .. }
         | ScenarioStep::Redomain { explanation, .. }
         | ScenarioStep::AssertNoDeadlock { explanation }
-        | ScenarioStep::AssertParkedCount { explanation, .. } => explanation,
+        | ScenarioStep::AssertParkedCount { explanation, .. }
+        | ScenarioStep::AssertFileExists { explanation, .. }
+        | ScenarioStep::AssertFileContains { explanation, .. }
+        | ScenarioStep::AssertTaskState { explanation, .. }
+        | ScenarioStep::AssertAgentState { explanation, .. } => explanation,
     }
 }
 
@@ -866,5 +972,262 @@ mod tests {
             }),
             "assert-no-deadlock"
         );
+        assert_eq!(
+            step_name(&ScenarioStep::AssertFileExists {
+                explanation: "x".to_string(),
+                path: "src/a.rs".to_string()
+            }),
+            "assert-file-exists"
+        );
+        assert_eq!(
+            step_name(&ScenarioStep::AssertFileContains {
+                explanation: "x".to_string(),
+                path: "src/a.rs".to_string(),
+                contains: "fn main".to_string()
+            }),
+            "assert-file-contains"
+        );
+        assert_eq!(
+            step_name(&ScenarioStep::AssertTaskState {
+                explanation: "x".to_string(),
+                task_id: "t1".to_string(),
+                state: "done".to_string()
+            }),
+            "assert-task-state"
+        );
+        assert_eq!(
+            step_name(&ScenarioStep::AssertAgentState {
+                explanation: "x".to_string(),
+                agent: "alpha".to_string(),
+                state: "idle".to_string()
+            }),
+            "assert-agent-state"
+        );
+    }
+
+    /// The new Assert* variants deserialize from scenario JSON with the
+    /// expected fields. This is the parse contract the fixture files rely on.
+    #[test]
+    fn load_scenario_parses_assert_steps() {
+        let json = r#"{
+          "name": "asserts",
+          "description": "demo assert scenario",
+          "project": { "files": [{ "path": "README.md", "contents": "hi" }] },
+          "agents": [{ "name": "alpha", "description": "ui", "writable": ["src/**"] }],
+          "steps": [
+            { "type": "AssertFileExists", "explanation": "a", "path": "README.md" },
+            { "type": "AssertFileContains", "explanation": "b", "path": "README.md", "contains": "hi" },
+            { "type": "AssertAgentState", "explanation": "c", "agent": "alpha", "state": "idle" }
+          ]
+        }"#;
+        let scenario: Scenario = serde_json::from_str(json).unwrap();
+        assert_eq!(scenario.steps.len(), 3);
+        match &scenario.steps[0] {
+            ScenarioStep::AssertFileExists { path, .. } => assert_eq!(path, "README.md"),
+            other => panic!("expected AssertFileExists, got {:?}", other),
+        }
+        match &scenario.steps[1] {
+            ScenarioStep::AssertFileContains { path, contains, .. } => {
+                assert_eq!(path, "README.md");
+                assert_eq!(contains, "hi");
+            }
+            other => panic!("expected AssertFileContains, got {:?}", other),
+        }
+        match &scenario.steps[2] {
+            ScenarioStep::AssertAgentState { agent, state, .. } => {
+                assert_eq!(agent, "alpha");
+                assert_eq!(state, "idle");
+            }
+            other => panic!("expected AssertAgentState, got {:?}", other),
+        }
+    }
+
+    /// End-to-end through run_once (the real scenario runner path): a Stub
+    /// scenario with AssertFileExists/AssertFileContains against a
+    /// project.files entry passes, and AssertAgentState passes for an idle
+    /// freshly-registered agent. Verifies the new steps execute correctly
+    /// inside the step loop against a real sandbox.
+    #[test]
+    fn run_once_passes_assert_steps_against_intact_sandbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("sandbox");
+        fs::create_dir_all(&sandbox).unwrap();
+        let scenario = Scenario {
+            name: "assert-pass".to_string(),
+            description: "asserts pass against hand-placed files".to_string(),
+            launcher: None,
+            mode: ScenarioMode::Stub,
+            project: ScenarioProject {
+                files: vec![
+                    ScenarioFile {
+                        path: "README.md".to_string(),
+                        contents: "# Demo\nfn main placeholder.\n".to_string(),
+                    },
+                    ScenarioFile {
+                        path: "src/lib.rs".to_string(),
+                        contents: "pub fn answer() -> u8 { 42 }\n".to_string(),
+                    },
+                ],
+            },
+            agents: vec![ScenarioAgent {
+                name: "alpha".to_string(),
+                description: "ui".to_string(),
+                writable: vec!["src/**".to_string()],
+                forbidden_write: vec![],
+                launcher_agent: None,
+            }],
+            steps: vec![
+                ScenarioStep::AssertFileExists {
+                    explanation: "README present".to_string(),
+                    path: "README.md".to_string(),
+                },
+                ScenarioStep::AssertFileContains {
+                    explanation: "README has the demo heading".to_string(),
+                    path: "README.md".to_string(),
+                    contains: "# Demo".to_string(),
+                },
+                ScenarioStep::AssertFileContains {
+                    explanation: "lib has the answer fn".to_string(),
+                    path: "src/lib.rs".to_string(),
+                    contains: "fn answer".to_string(),
+                },
+                ScenarioStep::AssertAgentState {
+                    explanation: "alpha is idle before any work".to_string(),
+                    agent: "alpha".to_string(),
+                    state: "idle".to_string(),
+                },
+            ],
+            metrics: vec![],
+        };
+        let report = run_once(&scenario, 1, &sandbox, None).unwrap();
+        assert_eq!(report.result, "ok", "run should pass all asserts");
+    }
+
+    /// AssertFileExists on a missing path must fail the run -- this is the
+    /// floor assertion's whole point: a run that produced nothing cannot
+    /// pass. Confirms the assertion errors propagate out of run_once
+    /// rather than being silently swallowed.
+    #[test]
+    fn run_once_fails_when_assert_file_exists_targets_missing_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("sandbox");
+        fs::create_dir_all(&sandbox).unwrap();
+        let scenario = Scenario {
+            name: "assert-fail".to_string(),
+            description: "missing file fails the run".to_string(),
+            launcher: None,
+            mode: ScenarioMode::Stub,
+            project: ScenarioProject {
+                files: vec![ScenarioFile {
+                    path: "README.md".to_string(),
+                    contents: "hi".to_string(),
+                }],
+            },
+            agents: vec![ScenarioAgent {
+                name: "alpha".to_string(),
+                description: "ui".to_string(),
+                writable: vec!["src/**".to_string()],
+                forbidden_write: vec![],
+                launcher_agent: None,
+            }],
+            steps: vec![ScenarioStep::AssertFileExists {
+                explanation: "nonexistent file must fail".to_string(),
+                path: "src/never_created.rs".to_string(),
+            }],
+            metrics: vec![],
+        };
+        let err = run_once(&scenario, 1, &sandbox, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("src/never_created.rs"),
+            "error names the missing path: {msg}"
+        );
+        assert!(
+            msg.contains("but it does not"),
+            "error says the file is absent: {msg}"
+        );
+    }
+
+    /// AssertFileContains on a present file with the wrong substring must
+    /// fail. Catches the agent that wrote a placeholder with no real content.
+    #[test]
+    fn run_once_fails_when_assert_file_contains_misses() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("sandbox");
+        fs::create_dir_all(&sandbox).unwrap();
+        let scenario = Scenario {
+            name: "assert-contains-fail".to_string(),
+            description: "wrong substring fails".to_string(),
+            launcher: None,
+            mode: ScenarioMode::Stub,
+            project: ScenarioProject {
+                files: vec![ScenarioFile {
+                    path: "src/lib.rs".to_string(),
+                    contents: "// nothing here\n".to_string(),
+                }],
+            },
+            agents: vec![ScenarioAgent {
+                name: "alpha".to_string(),
+                description: "ui".to_string(),
+                writable: vec!["src/**".to_string()],
+                forbidden_write: vec![],
+                launcher_agent: None,
+            }],
+            steps: vec![ScenarioStep::AssertFileContains {
+                explanation: "must contain the real impl".to_string(),
+                path: "src/lib.rs".to_string(),
+                contains: "fn answer".to_string(),
+            }],
+            metrics: vec![],
+        };
+        let err = run_once(&scenario, 1, &sandbox, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fn answer"),
+            "error names expected substring: {msg}"
+        );
+        assert!(msg.contains("src/lib.rs"), "error names the file: {msg}");
+    }
+
+    /// AssertTaskState on an unknown task must fail the run with the task id
+    /// in the message -- catches a scenario that asserts against a task the
+    /// setup never created.
+    #[test]
+    fn run_once_fails_when_assert_task_state_targets_unknown_task() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("sandbox");
+        fs::create_dir_all(&sandbox).unwrap();
+        let scenario = Scenario {
+            name: "assert-task-fail".to_string(),
+            description: "unknown task fails".to_string(),
+            launcher: None,
+            mode: ScenarioMode::Stub,
+            project: ScenarioProject {
+                files: vec![ScenarioFile {
+                    path: "README.md".to_string(),
+                    contents: "hi".to_string(),
+                }],
+            },
+            agents: vec![ScenarioAgent {
+                name: "alpha".to_string(),
+                description: "ui".to_string(),
+                writable: vec!["src/**".to_string()],
+                forbidden_write: vec![],
+                launcher_agent: None,
+            }],
+            steps: vec![ScenarioStep::AssertTaskState {
+                explanation: "unknown task must fail".to_string(),
+                task_id: "task-nope".to_string(),
+                state: "done".to_string(),
+            }],
+            metrics: vec![],
+        };
+        let err = run_once(&scenario, 1, &sandbox, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("task-nope"),
+            "error names the missing task: {msg}"
+        );
+        assert!(msg.contains("not found"), "error says not found: {msg}");
     }
 }

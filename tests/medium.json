@@ -128,6 +128,17 @@
     {
       "type": "AssertNoDeadlock",
       "explanation": "No residual wait-cycle may remain in the ledger."
+    },
+    {
+      "type": "AssertFileExists",
+      "explanation": "The seeded UI file must still exist at end of run.",
+      "path": "src/ui/app.ts"
+    },
+    {
+      "type": "AssertFileContains",
+      "explanation": "The API routes file must retain its users function.",
+      "path": "src/api/routes.py",
+      "contains": "def users"
     }
   ],
   "metrics": ["messages_sent", "prop_ticks", "redomains"]

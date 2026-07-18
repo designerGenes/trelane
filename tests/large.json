@@ -221,6 +221,17 @@
     {
       "type": "AssertNoDeadlock",
       "explanation": "The scenario must end with a clean ledger."
+    },
+    {
+      "type": "AssertFileExists",
+      "explanation": "The dashboard file must still exist at end of run.",
+      "path": "src/ui/dashboard.tsx"
+    },
+    {
+      "type": "AssertFileContains",
+      "explanation": "The API server file must retain its serve function.",
+      "path": "src/api/server.py",
+      "contains": "def serve"
     }
   ],
   "metrics": ["messages_sent", "prop_ticks", "redomains", "deadlocks_detected"]
