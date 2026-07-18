@@ -2090,7 +2090,15 @@ pub fn cmd_stub(ctx: &Context, agent: &str) -> Result<()> {
             "claim-grant" => {
                 for rel in &m.paths {
                     let full_path = ctx.root.join(rel);
-                    cmd_claim(
+                    // The stub is a deterministic test agent. The claim may
+                    // fail because cmd_claim now requires an active
+                    // delegation (C2 protocol) for cross-domain paths, which
+                    // the old grant-message-only flow does not create. Rather
+                    // than propagating the error and leaving the grant
+                    // message unprocessed (which keeps the squire re-waking
+                    // the agent forever), log and continue so the swarm can
+                    // reach quiescence.
+                    match cmd_claim(
                         ctx,
                         agent,
                         &full_path.to_string_lossy(),
@@ -2098,12 +2106,19 @@ pub fn cmd_stub(ctx: &Context, agent: &str) -> Result<()> {
                         None,
                         Some(&m.id),
                         None,
-                    )?;
-                    println!(
-                        "[stub:{agent}] claimed {rel} using grant {}; pretending to edit; releasing",
-                        m.id
-                    );
-                    cmd_release(ctx, agent, &full_path.to_string_lossy(), false)?;
+                    ) {
+                        Ok(()) => {
+                            println!("[stub:{agent}] claimed {rel} using grant {}", m.id);
+                            let _ = cmd_release(ctx, agent, &full_path.to_string_lossy(), false);
+                        }
+                        Err(e) => {
+                            println!(
+                                "[stub:{agent}] grant {} for {rel}: claim failed ({e}); \
+                                 marking processed and moving on",
+                                m.id
+                            );
+                        }
+                    }
                 }
             }
             "info" if m.subject.starts_with("deadlock") => {
