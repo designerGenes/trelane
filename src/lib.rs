@@ -1,3 +1,4 @@
+pub mod bench;
 pub mod biplane;
 pub mod biplane_ui;
 pub mod cli;
@@ -852,6 +853,25 @@ pub fn handle(cli: Cli) -> Result<()> {
             diagnostic::run(&ctx)
         }
         Some(Command::Config { action }) => cmd_config(&action),
+        Some(Command::Bench { action }) => match action {
+            cli::BenchAction::Run {
+                scenario,
+                runs,
+                max_turns,
+                model,
+                report,
+                sandbox_root,
+                free_models_only,
+            } => bench::run_bench(
+                &scenario,
+                runs,
+                report.as_deref(),
+                sandbox_root.as_deref(),
+                max_turns,
+                model.as_deref(),
+                free_models_only,
+            ),
+        },
         Some(Command::Help { action }) => {
             let ctx = Context::open(cli.root.as_deref())?;
             commands::cmd_help(&ctx, &action)
@@ -868,12 +888,12 @@ pub fn handle(cli: Cli) -> Result<()> {
 
 /// Comma-separated list of config keys the `config` command understands, for
 /// use in "unknown key" errors. Keep in sync with the match arms below.
-const KNOWN_CONFIG_KEYS: &str =
-    "squire.max_concurrent, squire.interval_s, squire.reply_timeout_s, \
+const KNOWN_CONFIG_KEYS: &str = "squire.max_concurrent, squire.interval_s, squire.reply_timeout_s, \
      squire.breaker_escalation_count, squire.starvation_ticks, \
      di.objection_window_s, di.request_timeout_s, di.claim_contested_timeout_s, \
      retention.hot_days, retention.dormant_days, retention.purge_days, \
-     claims.default_ttl_s, workspace.mode";
+     claims.default_ttl_s, workspace.mode, \
+     bench.default_max_turns, bench.default_model, bench.free_models, bench.slice_timeout_s";
 
 fn unknown_config_key(key: &str) -> TrelaneError {
     TrelaneError::msg(format!(
@@ -905,6 +925,16 @@ fn config_get(config: &Config, key: &str) -> Result<String> {
             .unwrap_or_else(|| "none".to_string()),
         "claims.default_ttl_s" => config.claims.default_ttl_s.to_string(),
         "workspace.mode" => config.workspace.mode.as_str().to_string(),
+        "bench.default_max_turns" => config.bench.default_max_turns.to_string(),
+        "bench.default_model" => config
+            .bench
+            .default_model
+            .clone()
+            .unwrap_or_else(|| "none".to_string()),
+        "bench.free_models" => {
+            serde_json::to_string(&config.bench.free_models).unwrap_or_else(|_| "[]".to_string())
+        }
+        "bench.slice_timeout_s" => config.bench.slice_timeout_s.to_string(),
         _ => return Err(unknown_config_key(key)),
     })
 }
@@ -942,9 +972,7 @@ fn config_set(config: &mut Config, key: &str, value: &str) -> Result<()> {
         "squire.starvation_ticks" => config.squire.starvation_ticks = parse_u64(value)? as i64,
         "di.objection_window_s" => config.di.objection_window_s = parse_u64(value)?,
         "di.request_timeout_s" => config.di.request_timeout_s = parse_u64(value)?,
-        "di.claim_contested_timeout_s" => {
-            config.di.claim_contested_timeout_s = parse_u64(value)?
-        }
+        "di.claim_contested_timeout_s" => config.di.claim_contested_timeout_s = parse_u64(value)?,
         "retention.hot_days" => config.retention.hot_days = parse_u64(value)?,
         "retention.dormant_days" => config.retention.dormant_days = parse_u64(value)?,
         "retention.purge_days" => {
@@ -955,11 +983,31 @@ fn config_set(config: &mut Config, key: &str, value: &str) -> Result<()> {
         }
         "claims.default_ttl_s" => config.claims.default_ttl_s = parse_u64(value)?,
         "workspace.mode" => {
-            config.workspace.mode = crate::models::WorkspaceMode::parse(value)
-                .ok_or_else(|| TrelaneError::msg(format!(
-                    "'{value}' is not a valid workspace mode (use 'shared' or 'worktree')"
+            config.workspace.mode =
+                crate::models::WorkspaceMode::parse(value).ok_or_else(|| {
+                    TrelaneError::msg(format!(
+                        "'{value}' is not a valid workspace mode (use 'shared' or 'worktree')"
+                    ))
+                })?;
+        }
+        "bench.default_max_turns" => {
+            config.bench.default_max_turns = value.parse::<u32>().map_err(|_| {
+                TrelaneError::msg(format!("'{value}' is not a valid integer for {key}"))
+            })?;
+        }
+        "bench.default_model" => {
+            config.bench.default_model = match value {
+                "none" | "off" | "" => None,
+                v => Some(v.to_string()),
+            };
+        }
+        "bench.free_models" => {
+            config.bench.free_models = serde_json::from_str(value)
+                .map_err(|_| TrelaneError::msg(format!(
+                    "'{value}' is not a valid JSON array of model ids (e.g. '[\"openrouter/z-ai/glm-5.2\"]')"
                 )))?;
         }
+        "bench.slice_timeout_s" => config.bench.slice_timeout_s = parse_u64(value)?,
         _ => return Err(unknown_config_key(key)),
     }
     // 4A config-inversion guard: any change to a di.* key re-validates the

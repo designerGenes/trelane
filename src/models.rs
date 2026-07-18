@@ -64,6 +64,8 @@ pub struct Config {
     #[serde(default)]
     pub biplane: BiplaneConfig,
     #[serde(default)]
+    pub bench: BenchConfig,
+    #[serde(default)]
     pub workspace: WorkspaceConfig,
 }
 
@@ -116,6 +118,7 @@ impl Default for Config {
             retention: RetentionConfig::default(),
             ui: UiConfig::default(),
             biplane: BiplaneConfig::default(),
+            bench: BenchConfig::default(),
             workspace: WorkspaceConfig::default(),
         }
     }
@@ -407,6 +410,53 @@ impl Default for BiplaneConfig {
     }
 }
 
+/// Bench mode configuration. Bench runs headless free-model agents with an
+/// explicit --max-turns budget so they cannot run away in the background.
+/// The free_models allowlist prevents accidental paid-model spend: when
+/// non-empty, `trelane bench run --free-models-only` rejects any model not
+/// in the list before launching.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BenchConfig {
+    /// Free model ids the bench may use. Empty = no restriction. Set via
+    /// `trelane config set bench.free_models '["openrouter/z-ai/glm-5.2"]'`.
+    #[serde(default)]
+    pub free_models: Vec<String>,
+    /// Default --max-turns per agent slice (default 50). A slice ends when
+    /// the agent exits (calls `trelane done`); the squire re-wakes it next
+    /// tick with a fresh budget if there is still ready work.
+    #[serde(default = "default_bench_max_turns")]
+    pub default_max_turns: u32,
+    /// Default model to launch all agents with when --model is not passed on
+    /// the CLI. Optional: if None, --model is required.
+    #[serde(default)]
+    pub default_model: Option<String>,
+    /// Maximum seconds to wait for all launched agents to finish after a
+    /// tick before declaring them timed out (default 600 = 10 min). A
+    /// free-model slice can take minutes; this is the outer bound.
+    #[serde(default = "default_bench_slice_timeout_s")]
+    pub slice_timeout_s: u64,
+}
+
+fn default_bench_max_turns() -> u32 {
+    50
+}
+
+fn default_bench_slice_timeout_s() -> u64 {
+    600
+}
+
+impl Default for BenchConfig {
+    fn default() -> Self {
+        Self {
+            free_models: Vec::new(),
+            default_max_turns: default_bench_max_turns(),
+            default_model: None,
+            slice_timeout_s: default_bench_slice_timeout_s(),
+        }
+    }
+}
+
 /// C5: workspace mode for delegated changes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -681,7 +731,13 @@ impl Message {
 // additive -- existing park / claim / message flows are unchanged.
 
 pub const TASK_STATES: &[&str] = &[
-    "draft", "ready", "active", "blocked", "review", "done", "cancelled",
+    "draft",
+    "ready",
+    "active",
+    "blocked",
+    "review",
+    "done",
+    "cancelled",
 ];
 
 /// Lifecycle state of a task in the ledger.
@@ -1153,8 +1209,14 @@ mod tests {
     #[test]
     fn agent_activity_state_as_str_is_stable() {
         assert_eq!(AgentActivityState::Running.as_str(), "running");
-        assert_eq!(AgentActivityState::AvailableToHelp.as_str(), "available-to-help");
-        assert_eq!(AgentActivityState::ProjectComplete.as_str(), "project-complete");
+        assert_eq!(
+            AgentActivityState::AvailableToHelp.as_str(),
+            "available-to-help"
+        );
+        assert_eq!(
+            AgentActivityState::ProjectComplete.as_str(),
+            "project-complete"
+        );
     }
 
     #[test]

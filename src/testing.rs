@@ -50,6 +50,10 @@ pub enum ScenarioMode {
     #[default]
     Stub,
     Interactive,
+    /// Bench mode: headless free-model agents launched as subprocesses with
+    /// --max-turns. Like Stub mode in structure (squire::tick + wait_for_idle)
+    /// but with a longer slice timeout and an events file the live TUI tails.
+    Bench,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,6 +297,17 @@ fn run_once(
     commands::cmd_attach_project(Some(run_dir.clone()), None, None, false)?;
 
     let ctx = Context::open(Some(&run_dir))?;
+
+    // Bench mode: open the events file the live TUI (step 4) will tail.
+    // One file per run, in the sandbox, so concurrent runs don't collide.
+    let mut bench_events = if matches!(scenario.mode, ScenarioMode::Bench) {
+        Some(crate::bench::BenchEvents::create(
+            &run_dir.join("bench-events.jsonl"),
+        )?)
+    } else {
+        None
+    };
+
     for agent in &scenario.agents {
         println!("[testing] add-agent {}", agent.name);
         commands::cmd_add_agent(
@@ -395,9 +410,22 @@ fn run_once(
                 let override_arg = (!launcher.is_empty()).then_some(launcher.as_str());
                 for tick in 0..*ticks {
                     println!("[testing] pump tick {} of {}", tick + 1, ticks);
-                    crate::squire::tick(&ctx, override_arg, false)?;
+                    let launched = crate::squire::tick(&ctx, override_arg, false)?;
                     if matches!(scenario.mode, ScenarioMode::Stub) {
                         wait_for_idle(&ctx, 40, std::time::Duration::from_millis(250))?;
+                    } else if matches!(scenario.mode, ScenarioMode::Bench) {
+                        let running = count_running(&ctx);
+                        if let Some(ref mut events) = bench_events {
+                            events.after_tick(&ctx.conn, tick + 1, launched, running)?;
+                        }
+                        // Free-model slices can take minutes; wait up to the
+                        // configured slice timeout before declaring a stall.
+                        let timeout_s = ctx.config.bench.slice_timeout_s;
+                        wait_for_idle(
+                            &ctx,
+                            ((timeout_s / 2).max(1)) as usize,
+                            std::time::Duration::from_secs(2),
+                        )?;
                     }
                     counters.pumps += 1;
                 }
@@ -421,10 +449,21 @@ fn run_once(
                 let mut quiesced = false;
                 for tick in 0..*max_ticks {
                     println!("[testing] pump watch tick {} of {}", tick + 1, max_ticks);
-                    crate::squire::tick(&ctx, override_arg, false)?;
+                    let launched = crate::squire::tick(&ctx, override_arg, false)?;
                     counters.pumps += 1;
                     if matches!(scenario.mode, ScenarioMode::Stub) {
                         wait_for_idle(&ctx, 40, std::time::Duration::from_millis(250))?;
+                    } else if matches!(scenario.mode, ScenarioMode::Bench) {
+                        let running = count_running(&ctx);
+                        if let Some(ref mut events) = bench_events {
+                            events.after_tick(&ctx.conn, tick + 1, launched, running)?;
+                        }
+                        let timeout_s = ctx.config.bench.slice_timeout_s;
+                        wait_for_idle(
+                            &ctx,
+                            ((timeout_s / 2).max(1)) as usize,
+                            std::time::Duration::from_secs(2),
+                        )?;
                     }
                     if swarm_quiescent(&ctx)? {
                         idle_ticks += 1;
@@ -626,6 +665,7 @@ fn run_once(
         mode: match scenario.mode {
             ScenarioMode::Stub => "stub".to_string(),
             ScenarioMode::Interactive => "interactive".to_string(),
+            ScenarioMode::Bench => "bench".to_string(),
         },
     })
 }
@@ -741,7 +781,19 @@ fn resolve_pump_launcher(scenario: &Scenario, launcher_override: Option<&str>) -
             .map(str::to_string)
             .or_else(|| scenario.launcher.clone())
             .unwrap_or_default(),
+        ScenarioMode::Bench => launcher_override.map(str::to_string).unwrap_or_default(),
     }
+}
+
+/// Count how many registered agents currently have a running lock.
+fn count_running(ctx: &Context) -> usize {
+    crate::store::list_agents(&ctx.conn)
+        .map(|ags| {
+            ags.iter()
+                .filter(|a| commands::is_running(&ctx.conn, a).unwrap_or(false))
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 fn launch_interactive_tmux_supervisor(
@@ -962,6 +1014,19 @@ fn send_and_capture(ctx: &Context, input: SendCaptureInput<'_>) -> Result<String
         .last()
         .map(|m| m.id.clone())
         .ok_or_else(|| TrelaneError::msg("failed to capture message id after send"))
+}
+
+#[cfg(test)]
+pub(crate) fn bench_test_ctx(temp: &tempfile::TempDir) -> Context {
+    let root = temp.path().to_path_buf();
+    let db_path = root.join(".trelane").join("trelane.db");
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let conn = crate::db::open(&db_path).unwrap();
+    Context {
+        root,
+        conn,
+        config: crate::models::Config::default(),
+    }
 }
 
 #[cfg(test)]

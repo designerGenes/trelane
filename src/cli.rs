@@ -381,6 +381,15 @@ pub enum Command {
         json: bool,
     },
 
+    /// Run repeatable benchmarks against free-model agents (step 3 of the
+    /// bench framework). Measures generation speed; writes events for the
+    /// live TUI (step 4); produces comparable JSON for `bench compare`
+    /// (step 5).
+    Bench {
+        #[command(subcommand)]
+        action: BenchAction,
+    },
+
     /// Rate another agent's run (inter-agent consensus)
     Rate {
         agent: String,
@@ -678,5 +687,33 @@ pub enum WorkAction {
         reject: bool,
         #[arg(long, default_value = "")]
         notes: String,
+    },
+}
+
+/// Subcommands for `trelane bench`.
+#[derive(Subcommand)]
+pub enum BenchAction {
+    /// Run a scenario against headless free-model agents with --max-turns.
+    Run {
+        /// Path to the scenario JSON file.
+        scenario: PathBuf,
+        /// Number of runs (default 1).
+        #[arg(long = "runs", default_value = "1")]
+        runs: u32,
+        /// Max turns per agent slice (default: bench.default_max_turns from config).
+        #[arg(long = "max-turns")]
+        max_turns: Option<u32>,
+        /// Model id to launch all agents with (default: bench.default_model from config).
+        #[arg(long = "model")]
+        model: Option<String>,
+        /// Path to the JSONL report output.
+        #[arg(long = "report")]
+        report: Option<PathBuf>,
+        /// Sandbox root directory (default: system temp).
+        #[arg(long = "sandbox-root")]
+        sandbox_root: Option<PathBuf>,
+        /// Reject any model not in bench.free_models (prevents paid-model spend).
+        #[arg(long = "free-models-only")]
+        free_models_only: bool,
     },
 }
