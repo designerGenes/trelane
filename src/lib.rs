@@ -196,6 +196,33 @@ fn run_session_command(cli: Cli) -> Result<()> {
         }
     }
 
+    // Seed agents from an existing Biplane plan. If no agents are registered
+    // yet but a biplane-description.json exists (the common case after running
+    // `trelane biplane`), register its domains as the session's default agents
+    // and queue their planned work. Idempotent: agents that already exist are
+    // re-synced, not duplicated, so this is safe to run every launch.
+    {
+        let ctx = Context::open(Some(&root))?;
+        let has_agents = !crate::store::list_agents(&ctx.conn)?.is_empty();
+        let desc_path = root.join(TRELANE_DIR).join("biplane-description.json");
+        if !has_agents && desc_path.is_file() {
+            match biplane::load_project_description(&desc_path) {
+                Ok(desc) => match biplane::apply_description_to_session(&ctx, &desc) {
+                    Ok(n) => eprintln!(
+                        "[trelane] launched {n} default agent(s) from {}",
+                        desc_path.display()
+                    ),
+                    Err(e) => eprintln!(
+                        "[trelane] warning: could not apply biplane-description.json: {e}"
+                    ),
+                },
+                Err(e) => eprintln!(
+                    "[trelane] warning: could not read biplane-description.json: {e}"
+                ),
+            }
+        }
+    }
+
     let ctx = Context::open(Some(&root))?;
 
     // Clear stale running-locks from a previous session so liveness checks
@@ -225,6 +252,137 @@ fn run_session_command(cli: Cli) -> Result<()> {
         // Default: the tabbed monitor UI with the squire behind it.
         monitor::run_session(&ctx, cli.launcher.clone(), cli.verbose)
     }
+}
+
+/// Open the Biplane UI, with the markdown-gathering / report-detection flow in
+/// front of it:
+///  1. Candidate dirs = the project root plus every `-i/--include` dir.
+///  2. If a `biplane-description.json` (the editable plan) exists in any
+///     candidate dir and `--regenerate` was not passed, that IS the plan to
+///     view/edit: open the UI on it, no gathering. A `biplane-report.json`
+///     (live-session snapshot) is a secondary fallback.
+///  3. Otherwise gather all markdown recursively from the candidate dirs, warn
+///     if the set is large, ask before submitting to a model, generate a plan
+///     from the sources, persist it as an editable description, and open the UI.
+fn biplane_open_ui(root: &Path, include: &[PathBuf], regenerate: bool) -> Result<()> {
+    use std::io::{IsTerminal, Write};
+
+    // Candidate dirs: the root first (so its report wins ties), then includes.
+    let mut dirs: Vec<PathBuf> = vec![root.to_path_buf()];
+    dirs.extend(include.iter().cloned());
+
+    // Step 1: existing PLAN detection. A biplane-description.json is the
+    // editable domain plan the UI loads and a session launches from. If one
+    // exists (in root or any include dir) and --regenerate wasn't passed, that
+    // IS the plan to view/edit -- open the UI on it, no markdown gathering.
+    if !regenerate
+        && let Some(desc_path) = biplane::find_description_in_dirs(&dirs)
+    {
+        println!(
+            "[biplane] found existing plan: {}",
+            desc_path.display()
+        );
+        // The UI loads from <root>/.trelane/biplane-description.json. If the
+        // found plan lives elsewhere (an include dir), copy it into place so
+        // the UI picks it up, without disturbing the original.
+        let ui_desc = root.join(TRELANE_DIR).join("biplane-description.json");
+        if desc_path != ui_desc {
+            if let Some(parent) = ui_desc.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&desc_path, &ui_desc)?;
+        }
+        return biplane_ui::run_with_includes(root, include);
+    }
+
+    // Step 2: existing report detection (live-session snapshot). Kept as a
+    // secondary signal: if no editable plan exists but a report does, open on
+    // it so its analysis is visible.
+    if !regenerate
+        && let Some(report_path) = biplane::find_report_in_dirs(&dirs)
+    {
+        println!("[biplane] found existing report: {}", report_path.display());
+        // The UI loads the report from <root>/.trelane/biplane-report.json. If
+        // the found report lives elsewhere (an include dir), copy it into place
+        // so the UI picks it up, without disturbing the original.
+        let ui_report = root.join(TRELANE_DIR).join("biplane-report.json");
+        if report_path != ui_report {
+            if let Some(parent) = ui_report.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&report_path, &ui_report)?;
+        }
+        return biplane_ui::run_with_includes(root, include);
+    }
+
+    // Step 3: gather markdown for the size warning + confirmation. The actual
+    // generation uses run_biplane_plan_from_sources (which re-scans the same
+    // dirs); this gather is what lets us count/size-check and confirm first.
+    let gather = biplane::gather_markdown_files(&dirs);
+    if gather.count() == 0 {
+        println!(
+            "[biplane] no markdown files found in {} director(ies). Opening the editor \
+             with a scaffold from the project structure instead.",
+            dirs.len()
+        );
+        return biplane_ui::run_with_includes(root, include);
+    }
+
+    let kb = gather.total_bytes / 1024;
+    println!(
+        "[biplane] gathered {} markdown file(s) ({} KB) from {} director(ies).",
+        gather.count(),
+        kb,
+        dirs.len()
+    );
+    if gather.is_large() {
+        println!(
+            "  WARNING: that's a large amount of markdown ({} files, {} KB). Submitting all \
+             of it may be slow, costly, or exceed the model's context window.",
+            gather.count(),
+            kb
+        );
+    }
+
+    // Confirm before submitting to a model (skip the prompt when not a TTY --
+    // a non-interactive caller can't answer, so default to not submitting).
+    if !std::io::stdin().is_terminal() {
+        println!(
+            "[biplane] non-interactive: not submitting to a model. Re-run in a terminal to \
+             confirm, or use --describe for an offline path."
+        );
+        return biplane_ui::run_with_includes(root, include);
+    }
+    print!(
+        "  Submit these {} markdown file(s) to the model for report generation? [y/N] ",
+        gather.count()
+    );
+    std::io::stdout().flush().ok();
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim(), "y" | "Y" | "yes" | "Yes") {
+        println!("[biplane] skipped submission. Opening the editor on the current description.");
+        return biplane_ui::run_with_includes(root, include);
+    }
+
+    // Generate a plan from the gathered sources, convert to an editable
+    // description, and persist it where the UI loads from.
+    let model = biplane::default_biplane_model();
+    let max_agents = 3;
+    println!("[biplane] submitting to {model}...");
+    let plan = biplane::run_biplane_plan_from_sources(root, include, &model, max_agents)?;
+    let project_name = root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project");
+    let desc = biplane::plan_to_description(&plan, project_name, max_agents);
+    let desc_path = root.join(TRELANE_DIR).join("biplane-description.json");
+    if let Some(parent) = desc_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&desc_path, serde_json::to_string_pretty(&desc)?)?;
+    println!("[biplane] report generated. Opening the editor...");
+    biplane_ui::run_with_includes(root, include)
 }
 
 #[allow(dead_code)]
@@ -482,6 +640,8 @@ pub fn handle(cli: Cli) -> Result<()> {
             json,
             refine,
             refine_model,
+            include,
+            regenerate,
         }) => {
             if refine {
                 // Slice 5: the deliberate, model-calling refinement pass
@@ -504,7 +664,7 @@ pub fn handle(cli: Cli) -> Result<()> {
                     Some(p) => p.to_path_buf(),
                     None => std::env::current_dir()?,
                 };
-                biplane_ui::run(&root)
+                return biplane_open_ui(&root, &include, regenerate);
             } else if interactive {
                 // Interactive/describe paths need no DB, so they work even
                 // before a project is initialized as a trelane session.

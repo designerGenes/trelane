@@ -375,6 +375,20 @@ pub enum Command {
             help = "model/launcher profile for --refine decisions (default: config launcher default)"
         )]
         refine_model: Option<String>,
+        #[arg(
+            short = 'i',
+            long = "include",
+            value_name = "DIR",
+            help = "additional folder(s) whose markdown files are gathered recursively for \
+                    report generation (repeatable: -i dirA -i dirB). Also searched for an \
+                    existing biplane-report.json to load."
+        )]
+        include: Vec<PathBuf>,
+        #[arg(
+            long = "regenerate",
+            help = "ignore any existing biplane-report.json and regenerate from gathered markdown"
+        )]
+        regenerate: bool,
     },
 
     /// Review Biplane split proposals for owned domains (R20/R29)

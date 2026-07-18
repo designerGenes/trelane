@@ -112,6 +112,8 @@ pub struct BiplaneUiState {
     pub report_json: Option<String>,
     /// Scroll offset for the Project view's content (both panes can be long).
     pub project_scroll: u16,
+    /// Whether the `?` help overlay is currently shown.
+    pub show_help: bool,
 }
 
 impl BiplaneUiState {
@@ -141,6 +143,7 @@ impl BiplaneUiState {
             project_pane: ProjectPane::Summary,
             report_json: None,
             project_scroll: 0,
+            show_help: false,
         }
     }
 
@@ -312,6 +315,13 @@ impl BiplaneUiState {
 /// exists, otherwise scaffolds from the project structure, then runs the
 /// editor. No-ops with a message when stdout is not a TTY.
 pub fn run(root: &std::path::Path) -> Result<()> {
+    run_with_includes(root, &[])
+}
+
+/// Like `run`, but the `G` (generate) action inside the UI also gathers
+/// markdown from these extra include dirs (the `-i` folders), matching the CLI
+/// gather flow. `run` passes an empty slice.
+pub fn run_with_includes(root: &std::path::Path, includes: &[std::path::PathBuf]) -> Result<()> {
     use std::io::IsTerminal;
     if !std::io::stdout().is_terminal() {
         println!("trelane biplane --ui requires an interactive terminal (TTY).");
@@ -347,7 +357,7 @@ pub fn run(root: &std::path::Path) -> Result<()> {
         state = state.with_report_json(pretty);
     }
 
-    run_loop(root, &mut state)
+    run_loop(root, includes, &mut state)
 }
 
 fn save_description(root: &std::path::Path, desc: &ProjectDescription) -> Result<()> {
@@ -358,7 +368,11 @@ fn save_description(root: &std::path::Path, desc: &ProjectDescription) -> Result
     Ok(())
 }
 
-fn run_loop(root: &std::path::Path, state: &mut BiplaneUiState) -> Result<()> {
+fn run_loop(
+    root: &std::path::Path,
+    includes: &[std::path::PathBuf],
+    state: &mut BiplaneUiState,
+) -> Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind};
     use crossterm::execute;
     use crossterm::terminal::{
@@ -381,14 +395,54 @@ fn run_loop(root: &std::path::Path, state: &mut BiplaneUiState) -> Result<()> {
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
+                    // When the help overlay is open it captures input: only
+                    // '?', Esc, or 'q' dismiss it; everything else is swallowed
+                    // so the user can't accidentally edit behind the overlay.
+                    if state.show_help {
+                        match key.code {
+                            KeyCode::Char('?') | KeyCode::Esc | KeyCode::Char('q') => {
+                                state.show_help = false;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     // Keys common to every view come first; view-specific keys
                     // are dispatched by the active sub-screen. This is the one
                     // place that knows which view is active, so the pure state
                     // methods stay view-agnostic and individually testable.
                     match key.code {
+                        KeyCode::Char('?') => state.show_help = true,
                         KeyCode::Char('q') | KeyCode::Esc => state.should_quit = true,
                         KeyCode::Char('T') | KeyCode::Tab => state.toggle_view(),
                         KeyCode::Char('V') => state.toggle_project_pane(),
+                        KeyCode::Char('G') | KeyCode::Char('g') => {
+                            // AI analysis: gather markdown (root + include dirs)
+                            // and submit to a model, replacing the current
+                            // domains with the generated plan. The call takes
+                            // seconds and prints, so it runs with the alternate
+                            // screen suspended, then the TUI is restored.
+                            match generate_via_model(&mut terminal, root, includes) {
+                                Ok(new_state) => {
+                                    let report = state.report_json.clone();
+                                    *state = new_state;
+                                    // Preserve any report already shown if the
+                                    // regen didn't produce one.
+                                    if state.report_json.is_none() {
+                                        state.report_json = report;
+                                    }
+                                    state.status =
+                                        Some("generated domains from AI analysis".to_string());
+                                }
+                                Err(e) => {
+                                    state.last_error = Some(format!("generate failed: {e}"));
+                                    state.status = Some(format!("generate failed: {e}"));
+                                }
+                            }
+                            // A full redraw next frame clears any residue the
+                            // suspended model output may have left.
+                            terminal.clear()?;
+                        }
                         KeyCode::Char('s') => {
                             if let Some(desc) = state.validated() {
                                 save_description(root, &desc)?;
@@ -428,6 +482,68 @@ fn run_loop(root: &std::path::Path, state: &mut BiplaneUiState) -> Result<()> {
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     outcome
+}
+
+/// Run AI analysis over the project (root + include dirs) and return a fresh
+/// UI state built from the generated plan. The model call is a subprocess that
+/// prints and takes seconds, so the alternate screen is LEFT for the duration
+/// (raw mode disabled, cursor shown) and re-entered afterward -- otherwise the
+/// model's stdout would corrupt the TUI. The generated description is persisted
+/// so it survives a later reload, and its report JSON is attached for the
+/// Project view. Any failure (model error, no network) propagates as an Err for
+/// the caller to surface in the status line; the TUI is always restored first.
+fn generate_via_model(
+    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    root: &std::path::Path,
+    includes: &[std::path::PathBuf],
+) -> Result<BiplaneUiState> {
+    use crossterm::execute;
+    use crossterm::terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    };
+
+    // Leave the alternate screen so the model subprocess can print to a normal
+    // terminal without fighting the TUI's cells.
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    println!();
+    println!("[biplane] generating domains via AI analysis...");
+
+    // Do the work, capturing the result so we can always restore the TUI
+    // regardless of success or failure.
+    let result = (|| -> Result<BiplaneUiState> {
+        let model = crate::biplane::default_biplane_model();
+        let max_agents = 3;
+        let plan =
+            crate::biplane::run_biplane_plan_from_sources(root, includes, &model, max_agents)?;
+        let project_name = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("project");
+        let desc = crate::biplane::plan_to_description(&plan, project_name, max_agents);
+
+        // Persist so a later reload picks it up, matching the CLI flow.
+        let desc_path = root.join(".trelane").join("biplane-description.json");
+        if let Some(parent) = desc_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&desc_path, serde_json::to_string_pretty(&desc)?)?;
+
+        let mut new_state = BiplaneUiState::from_description(&desc, "generated by AI analysis");
+        if let Ok(json) = serde_json::to_string_pretty(&plan) {
+            new_state = new_state.with_report_json(json);
+        }
+        Ok(new_state)
+    })();
+
+    // Re-enter the alternate screen no matter what happened above.
+    enable_raw_mode()?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+    terminal.hide_cursor()?;
+    terminal.clear()?;
+
+    result
 }
 
 fn tc(rgb: (u8, u8, u8)) -> ratatui::style::Color {
@@ -584,9 +700,9 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
     // Footer — hint depends on the active view so keys shown are the live ones.
     let default_hint = match state.view {
         BiplaneView::Domains => {
-            "↑↓ move  space include  ←→ agents  [ ] budget  K/J reorder  T project  s save  q quit"
+            "↑↓ move  space include  ←→ agents  [ ] budget  K/J reorder  G generate  T project  s save  ? help  q quit"
         }
-        BiplaneView::Project => "↑↓ scroll  V switch pane  T domains  s save  q quit",
+        BiplaneView::Project => "↑↓ scroll  V switch pane  G generate  T domains  s save  ? help  q quit",
     };
     let hint = state
         .status
@@ -598,6 +714,82 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
             .border_style(Style::default().fg(dim)),
     );
     f.render_widget(footer, chunks[2]);
+
+    // Help overlay: drawn last so it sits on top of everything.
+    if state.show_help {
+        render_help_overlay(f, accent, dim);
+    }
+}
+
+/// A centered, bordered help overlay listing every key binding, grouped by
+/// view. Drawn over a Clear so nothing behind it shows through.
+fn render_help_overlay(
+    f: &mut ratatui::Frame,
+    accent: ratatui::style::Color,
+    dim: ratatui::style::Color,
+) {
+    use ratatui::layout::Rect;
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+
+    // A key/description row helper for consistent alignment.
+    fn key<'a>(k: &'a str, desc: &'a str) -> Line<'a> {
+        Line::from(vec![
+            Span::styled(format!("  {k:<12}"), Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(desc),
+        ])
+    }
+
+    let area = f.area();
+    // Center a fixed-size box within the frame.
+    let w = 66u16.min(area.width.saturating_sub(4));
+    let h = 22u16.min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "Biplane — key bindings",
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("Domains view", Style::default().fg(accent))),
+        key("↑ ↓", "move the row cursor"),
+        key("space / Enter", "toggle whether the domain is included"),
+        key("← →", "decrease / increase this domain's agent count"),
+        key("[ ]", "decrease / increase the overall agent budget"),
+        key("K / J", "reorder the focused domain up / down"),
+        Line::from(""),
+        Line::from(Span::styled("Project view", Style::default().fg(accent))),
+        key("↑ ↓", "scroll the content"),
+        key("V", "switch between the summary and report-JSON panes"),
+        Line::from(""),
+        Line::from(Span::styled("Anywhere", Style::default().fg(accent))),
+        key("T / Tab", "switch between Domains and Project views"),
+        key("G", "generate domains via AI analysis (gathers markdown, calls a model)"),
+        key("s", "save the description"),
+        key("?", "toggle this help"),
+        key("q / Esc", "quit"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  press ?, Esc, or q to close",
+            Style::default().fg(dim),
+        )),
+    ];
+
+    f.render_widget(Clear, popup);
+    let para = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Help ")
+            .border_style(Style::default().fg(accent)),
+    );
+    f.render_widget(para, popup);
 }
 
 #[cfg(test)]
@@ -646,6 +838,13 @@ mod tests {
         assert!(s.rows.iter().all(|r| r.include));
         assert_eq!(s.included_count(), 3);
         assert_eq!(s.budget, 3);
+    }
+
+    #[test]
+    fn help_overlay_defaults_off() {
+        // The `?` help overlay starts hidden; the input loop flips show_help.
+        let s = state();
+        assert!(!s.show_help);
     }
 
     #[test]

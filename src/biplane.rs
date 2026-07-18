@@ -560,6 +560,128 @@ fn collect_feature_text(base: &Path, dir: &Path, texts: &mut Vec<String>) {
     }
 }
 
+/// A gathered markdown file: its path (for display) and content.
+#[derive(Debug, Clone)]
+pub struct GatheredMarkdown {
+    pub path: PathBuf,
+    pub content: String,
+}
+
+/// Result of gathering markdown across one or more directories.
+#[derive(Debug, Clone, Default)]
+pub struct MarkdownGather {
+    pub files: Vec<GatheredMarkdown>,
+    pub total_bytes: usize,
+}
+
+impl MarkdownGather {
+    pub fn count(&self) -> usize {
+        self.files.len()
+    }
+    /// Whether this gather is large enough to warrant a pre-submission warning.
+    /// Trips on EITHER many files OR a large total size, since model context is
+    /// what actually constrains submission and both dimensions can blow it.
+    pub fn is_large(&self) -> bool {
+        self.count() > MARKDOWN_WARN_FILE_COUNT || self.total_bytes > MARKDOWN_WARN_TOTAL_BYTES
+    }
+    /// The combined text submitted to the model, each file prefixed with its
+    /// path as a heading so the model can attribute content to sources.
+    pub fn combined_text(&self) -> String {
+        self.files
+            .iter()
+            .map(|f| format!("## {}\n\n{}", f.path.display(), f.content))
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n")
+    }
+}
+
+/// Warn before submission above ~50 markdown files...
+pub const MARKDOWN_WARN_FILE_COUNT: usize = 50;
+/// ...or ~500 KB of total markdown, whichever trips first.
+pub const MARKDOWN_WARN_TOTAL_BYTES: usize = 500 * 1024;
+
+/// Recursively gather every `.md` file under each of `dirs`. Skips `.trelane`
+/// and hidden directories (dotfolders) so we don't sweep in machine state or
+/// VCS internals. A file reachable from two `dirs` is included once (dedup by
+/// canonical path). Unreadable files and dirs are skipped, not fatal.
+pub fn gather_markdown_files(dirs: &[PathBuf]) -> MarkdownGather {
+    let mut gather = MarkdownGather::default();
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for dir in dirs {
+        gather_md_recursive(dir, &mut gather, &mut seen);
+    }
+    // Stable, path-sorted order so the same tree always produces the same
+    // combined text (deterministic prompts, easier diffing).
+    gather.files.sort_by(|a, b| a.path.cmp(&b.path));
+    gather
+}
+
+fn gather_md_recursive(
+    dir: &Path,
+    gather: &mut MarkdownGather,
+    seen: &mut std::collections::HashSet<PathBuf>,
+) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // Skip .trelane, .git, and any dotfolder.
+            let is_hidden = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('.'));
+            if !is_hidden {
+                gather_md_recursive(&path, gather, seen);
+            }
+        } else if path.extension().is_some_and(|ext| ext == "md") {
+            let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if !seen.insert(canon) {
+                continue; // already gathered via another include dir
+            }
+            if let Ok(content) = fs::read_to_string(&path) {
+                gather.total_bytes += content.len();
+                gather.files.push(GatheredMarkdown { path, content });
+            }
+        }
+    }
+}
+
+/// Look for an existing `biplane-report.json` in any of `dirs` (top-level of
+/// each, not recursive -- a report is a top-level artifact). Returns the first
+/// found, in the order the dirs were given (current dir first).
+pub fn find_report_in_dirs(dirs: &[PathBuf]) -> Option<PathBuf> {
+    for dir in dirs {
+        let candidate = dir.join(BIPLANE_REPORT_FILENAME);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Look for an existing `biplane-description.json` under `<dir>/.trelane/` for
+/// each of `dirs`. This is the editable domain plan the Biplane UI loads and a
+/// Trelane session launches its agents from -- distinct from the live-session
+/// `biplane-report.json`. Returns the first found, current dir first. Also
+/// accepts a description sitting directly in `dir` (e.g. when the user points
+/// at a `.trelane` folder itself), so detection is robust to either layout.
+pub fn find_description_in_dirs(dirs: &[PathBuf]) -> Option<PathBuf> {
+    for dir in dirs {
+        let nested = dir.join(".trelane").join("biplane-description.json");
+        if nested.is_file() {
+            return Some(nested);
+        }
+        let direct = dir.join("biplane-description.json");
+        if direct.is_file() {
+            return Some(direct);
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct BiplaneReport {
     pub project_root: String,
@@ -2176,6 +2298,152 @@ pub fn cmd_biplane_interactive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gather_markdown_recurses_and_skips_dotfolders() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("README.md"), "top level").unwrap();
+        std::fs::create_dir_all(root.join("docs/sub")).unwrap();
+        std::fs::write(root.join("docs/guide.md"), "guide").unwrap();
+        std::fs::write(root.join("docs/sub/deep.md"), "deep nested").unwrap();
+        std::fs::write(root.join("notes.txt"), "not markdown").unwrap();
+        // A dotfolder that must be skipped (e.g. .trelane machine state).
+        std::fs::create_dir_all(root.join(".trelane")).unwrap();
+        std::fs::write(root.join(".trelane/state.md"), "should be skipped").unwrap();
+
+        let g = gather_markdown_files(&[root.to_path_buf()]);
+        assert_eq!(g.count(), 3, "3 real .md, dotfolder + .txt excluded");
+        assert!(g.files.iter().all(|f| f.path.extension().unwrap() == "md"));
+        assert!(!g.combined_text().contains("should be skipped"));
+    }
+
+    #[test]
+    fn gather_markdown_dedups_across_include_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join("a/x.md"), "content").unwrap();
+        // Pass the same dir twice and also the parent that contains it: the
+        // file must be counted once.
+        let g = gather_markdown_files(&[
+            root.join("a"),
+            root.join("a"),
+            root.to_path_buf(),
+        ]);
+        assert_eq!(g.count(), 1, "same file via multiple dirs counted once");
+    }
+
+    #[test]
+    fn gather_reports_total_bytes_and_large_flag() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("a.md"), "12345").unwrap(); // 5 bytes
+        std::fs::write(root.join("b.md"), "678").unwrap(); // 3 bytes
+        let g = gather_markdown_files(&[root.to_path_buf()]);
+        assert_eq!(g.total_bytes, 8);
+        assert!(!g.is_large(), "tiny gather is not large");
+    }
+
+    #[test]
+    fn is_large_trips_on_either_count_or_size() {
+        // Many small files -> large by count.
+        let by_count = MarkdownGather {
+            files: (0..MARKDOWN_WARN_FILE_COUNT + 1)
+                .map(|i| GatheredMarkdown {
+                    path: PathBuf::from(format!("f{i}.md")),
+                    content: String::new(),
+                })
+                .collect(),
+            total_bytes: 10,
+        };
+        assert!(by_count.is_large(), "over the file-count threshold");
+
+        // Few files but huge -> large by size.
+        let by_size = MarkdownGather {
+            files: vec![GatheredMarkdown {
+                path: PathBuf::from("big.md"),
+                content: String::new(),
+            }],
+            total_bytes: MARKDOWN_WARN_TOTAL_BYTES + 1,
+        };
+        assert!(by_size.is_large(), "over the total-size threshold");
+    }
+
+    #[test]
+    fn find_report_returns_first_dir_with_report() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        // Report only in b.
+        std::fs::write(root.join("b").join(BIPLANE_REPORT_FILENAME), "{}").unwrap();
+        let found = find_report_in_dirs(&[root.join("a"), root.join("b")]);
+        assert_eq!(found, Some(root.join("b").join(BIPLANE_REPORT_FILENAME)));
+        // None when absent.
+        assert!(find_report_in_dirs(&[root.join("a")]).is_none());
+    }
+
+    #[test]
+    fn find_report_prefers_earlier_dir_on_ties() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("first")).unwrap();
+        std::fs::create_dir_all(root.join("second")).unwrap();
+        std::fs::write(root.join("first").join(BIPLANE_REPORT_FILENAME), "{}").unwrap();
+        std::fs::write(root.join("second").join(BIPLANE_REPORT_FILENAME), "{}").unwrap();
+        let found = find_report_in_dirs(&[root.join("first"), root.join("second")]);
+        assert_eq!(found, Some(root.join("first").join(BIPLANE_REPORT_FILENAME)));
+    }
+
+    #[test]
+    fn find_description_detects_nested_trelane_layout() {
+        // The real layout: <root>/.trelane/biplane-description.json
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let td = root.join(".trelane");
+        std::fs::create_dir_all(&td).unwrap();
+        std::fs::write(td.join("biplane-description.json"), "{}").unwrap();
+        assert_eq!(
+            find_description_in_dirs(&[root.to_path_buf()]),
+            Some(td.join("biplane-description.json"))
+        );
+    }
+
+    #[test]
+    fn find_description_detects_direct_layout() {
+        // Pointing at a folder that directly holds the description.
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join("biplane-description.json"), "{}").unwrap();
+        assert_eq!(
+            find_description_in_dirs(&[root.to_path_buf()]),
+            Some(root.join("biplane-description.json"))
+        );
+    }
+
+    #[test]
+    fn find_description_searches_include_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let empty = root.join("empty");
+        let other = root.join("other");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(other.join(".trelane")).unwrap();
+        std::fs::write(other.join(".trelane").join("biplane-description.json"), "{}").unwrap();
+        // Root (empty) has none; the include dir does.
+        let found = find_description_in_dirs(&[empty, other.clone()]);
+        assert_eq!(
+            found,
+            Some(other.join(".trelane").join("biplane-description.json"))
+        );
+    }
+
+    #[test]
+    fn find_description_none_when_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(find_description_in_dirs(&[temp.path().to_path_buf()]).is_none());
+    }
 
     fn migrated_ctx(temp: &tempfile::TempDir) -> crate::Context {
         let root = temp.path().to_path_buf();
