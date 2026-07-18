@@ -266,10 +266,8 @@ impl Tracer {
         end_ns: u64,
     ) -> Result<SpanId> {
         let span_id = generate_span_id();
-        let mut attrs: Vec<OtlpAttribute> = attributes
-            .iter()
-            .map(|(k, v)| attr_str(k, v))
-            .collect();
+        let mut attrs: Vec<OtlpAttribute> =
+            attributes.iter().map(|(k, v)| attr_str(k, v)).collect();
         attrs.push(attr_str("project.root", &self.project_root));
         attrs.push(attr_str("session.name", &self.session_name));
         let span = OtlpSpan {
@@ -291,7 +289,8 @@ impl Tracer {
         Ok(span_id)
     }
 
-    fn resource(&self) -> OtlpResource {        OtlpResource {
+    fn resource(&self) -> OtlpResource {
+        OtlpResource {
             attributes: vec![
                 attr_str("service.name", "trelane"),
                 attr_str("service.version", env!("CARGO_PKG_VERSION")),

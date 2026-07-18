@@ -1879,7 +1879,11 @@ fn apply_plan_to_session(
         let task_id = if let Some(found) = existing.iter().find(|et| et.subject == t.work.subject) {
             found.id.clone()
         } else {
-            let id = t.work.id.clone().unwrap_or_else(|| crate::crypto::new_id("task"));
+            let id = t
+                .work
+                .id
+                .clone()
+                .unwrap_or_else(|| crate::crypto::new_id("task"));
             let task = crate::models::Task {
                 id: id.clone(),
                 owner_agent: t.agent.clone(),
@@ -1911,7 +1915,10 @@ fn apply_plan_to_session(
             if sub_existing.iter().any(|et| et.subject == sub.subject) {
                 continue;
             }
-            let sub_id = sub.id.clone().unwrap_or_else(|| crate::crypto::new_id("task"));
+            let sub_id = sub
+                .id
+                .clone()
+                .unwrap_or_else(|| crate::crypto::new_id("task"));
             let sub_path = if !sub.path_scope.is_empty() {
                 sub.path_scope.clone()
             } else {
@@ -1943,16 +1950,19 @@ fn apply_plan_to_session(
         // Create reviewer assignment if designated.
         if let Some(ref reviewer) = t.work.reviewer {
             if crate::store::agent_exists(&ctx.conn, reviewer)? {
-                crate::store::upsert_assignment(&ctx.conn, &crate::models::TaskAssignment {
-                    task_id: task_id.clone(),
-                    agent: reviewer.clone(),
-                    role: crate::models::TaskRole::Reviewer,
-                    state: "assigned".to_string(),
-                    offer_id: None,
-                    delegation_id: None,
-                    started_at: None,
-                    completed_at: None,
-                })?;
+                crate::store::upsert_assignment(
+                    &ctx.conn,
+                    &crate::models::TaskAssignment {
+                        task_id: task_id.clone(),
+                        agent: reviewer.clone(),
+                        role: crate::models::TaskRole::Reviewer,
+                        state: "assigned".to_string(),
+                        offer_id: None,
+                        delegation_id: None,
+                        started_at: None,
+                        completed_at: None,
+                    },
+                )?;
             }
         }
 
@@ -1977,7 +1987,9 @@ fn apply_plan_to_session(
         }
         let existing = crate::store::list_tasks_for_owner(&ctx.conn, &t.agent)?;
         if let Some(found) = existing.iter().find(|et| et.subject == t.work.subject) {
-            let resolved: Vec<String> = t.work.depends_on
+            let resolved: Vec<String> = t
+                .work
+                .depends_on
                 .iter()
                 .filter_map(|dep| id_map.get(dep).cloned())
                 .collect();
@@ -2728,7 +2740,10 @@ mod tests {
         let tasks = crate::store::list_tasks_for_owner(&ctx.conn, "backend").unwrap();
         assert_eq!(tasks.len(), 2, "parent and child task");
         let child = tasks.iter().find(|t| t.subject == "add API tests").unwrap();
-        assert!(child.parent_task.is_some(), "child must have parent_task set");
+        assert!(
+            child.parent_task.is_some(),
+            "child must have parent_task set"
+        );
         let parent = tasks.iter().find(|t| t.subject == "build API").unwrap();
         assert_eq!(child.parent_task.as_ref().unwrap(), &parent.id);
     }
@@ -2755,8 +2770,12 @@ mod tests {
         let tasks = crate::store::list_tasks_for_owner(&ctx.conn, "backend").unwrap();
         let task = tasks.iter().find(|t| t.subject == "build API").unwrap();
         let assignments = crate::store::list_assignments_for_task(&ctx.conn, &task.id).unwrap();
-        assert!(assignments.iter().any(|a| a.role == crate::models::TaskRole::Reviewer),
-            "reviewer assignment must be created");
+        assert!(
+            assignments
+                .iter()
+                .any(|a| a.role == crate::models::TaskRole::Reviewer),
+            "reviewer assignment must be created"
+        );
     }
 
     #[test]

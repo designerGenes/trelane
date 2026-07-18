@@ -42,10 +42,7 @@ pub struct DiRequest {
     pub approvals: Vec<String>,
 }
 
-fn row_to_request(
-    conn: &rusqlite::Connection,
-    row: &rusqlite::Row,
-) -> rusqlite::Result<DiRequest> {
+fn row_to_request(conn: &rusqlite::Connection, row: &rusqlite::Row) -> rusqlite::Result<DiRequest> {
     let id: String = row.get("id")?;
     let approvals = approvals_of(conn, &id).unwrap_or_default();
     Ok(DiRequest {
@@ -64,8 +61,7 @@ fn row_to_request(
     })
 }
 
-const REQUEST_COLS: &str =
-    "id, requester_agent, target_domain, path_glob, purpose, status, created_at, \
+const REQUEST_COLS: &str = "id, requester_agent, target_domain, path_glob, purpose, status, created_at, \
      objection_deadline, resolved_at, veto_agent, veto_reason";
 
 fn approvals_of(conn: &rusqlite::Connection, request_id: &str) -> Result<Vec<String>> {
@@ -91,13 +87,12 @@ pub fn get_request(conn: &rusqlite::Connection, id: &str) -> Result<Option<DiReq
     Ok(result)
 }
 
-pub fn list_requests(
-    conn: &rusqlite::Connection,
-    status: Option<&str>,
-) -> Result<Vec<DiRequest>> {
+pub fn list_requests(conn: &rusqlite::Connection, status: Option<&str>) -> Result<Vec<DiRequest>> {
     let (sql, with_status) = match status {
         Some(_) => (
-            format!("SELECT {REQUEST_COLS} FROM domain_intrusion_requests WHERE status = ?1 ORDER BY created_at"),
+            format!(
+                "SELECT {REQUEST_COLS} FROM domain_intrusion_requests WHERE status = ?1 ORDER BY created_at"
+            ),
             true,
         ),
         None => (
@@ -137,10 +132,7 @@ fn iso_plus(now_iso: &str, seconds: u64) -> String {
 /// claim-time hard-forbidden guard remains the absolute enforcement.
 fn glob_targets_forbidden(glob: &str) -> bool {
     let g = glob.trim_start_matches('/');
-    g == ".trelane"
-        || g == ".git"
-        || g.starts_with(".trelane/")
-        || g.starts_with(".git/")
+    g == ".trelane" || g == ".git" || g.starts_with(".trelane/") || g.starts_with(".git/")
 }
 
 /// Open a DI request: validate, record, broadcast to all enabled agents, and
@@ -423,15 +415,8 @@ mod tests {
             conn,
             config: crate::models::Config::default(),
         };
-        crate::commands::cmd_add_agent(
-            &ctx,
-            "owner",
-            &["src/**".to_string()],
-            &[],
-            None,
-            None,
-        )
-        .unwrap();
+        crate::commands::cmd_add_agent(&ctx, "owner", &["src/**".to_string()], &[], None, None)
+            .unwrap();
         crate::commands::cmd_add_agent(&ctx, "helper", &["lib/**".to_string()], &[], None, None)
             .unwrap();
         crate::commands::cmd_add_agent(&ctx, "third", &["docs/**".to_string()], &[], None, None)
@@ -588,9 +573,7 @@ mod tests {
     fn path_outside_target_domain_rejected() {
         let temp = tempfile::tempdir().unwrap();
         let ctx = ctx_with_agents(&temp);
-        assert!(
-            create_request(&ctx, "helper", "owner", "lib/foo.rs", "not their file").is_err()
-        );
+        assert!(create_request(&ctx, "helper", "owner", "lib/foo.rs", "not their file").is_err());
     }
 
     #[test]

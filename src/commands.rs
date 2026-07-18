@@ -1056,15 +1056,18 @@ fn bulletin_autopost_on_claim(ctx: &Context, agent: &str, rel: &str) {
                 .unwrap_or_else(|| agent.to_string())
         };
         let active = store::get_active_bulletin_entry(&ctx.conn, &scope, agent)?;
-        let mut paths = active
-            .as_ref()
-            .map(|a| a.paths.clone())
-            .unwrap_or_default();
+        let mut paths = active.as_ref().map(|a| a.paths.clone()).unwrap_or_default();
         if paths.iter().any(|p| p == rel) {
             return Ok(()); // already announced
         }
         paths.push(rel.to_string());
-        post_bulletin(ctx, agent, &scope, &paths, "working-set update (auto-posted on claim)")?;
+        post_bulletin(
+            ctx,
+            agent,
+            &scope,
+            &paths,
+            "working-set update (auto-posted on claim)",
+        )?;
         Ok(())
     })();
 }
@@ -1140,7 +1143,10 @@ pub fn cmd_di(ctx: &Context, action: &crate::cli::DiAction) -> Result<()> {
             } else {
                 println!("id          : {}", req.id);
                 println!("requester   : {}", req.requester_agent);
-                println!("target      : {} (path {})", req.target_domain, req.path_glob);
+                println!(
+                    "target      : {} (path {})",
+                    req.target_domain, req.path_glob
+                );
                 println!("purpose     : {}", req.purpose);
                 println!("status      : {}", req.status);
                 println!("created     : {}", req.created_at);
@@ -1149,7 +1155,10 @@ pub fn cmd_di(ctx: &Context, action: &crate::cli::DiAction) -> Result<()> {
                     println!("resolved    : {resolved}");
                 }
                 if let Some(veto) = &req.veto_agent {
-                    println!("veto        : {veto}: {}", req.veto_reason.as_deref().unwrap_or(""));
+                    println!(
+                        "veto        : {veto}: {}",
+                        req.veto_reason.as_deref().unwrap_or("")
+                    );
                 }
                 println!(
                     "approvals   : {}",
@@ -1215,10 +1224,8 @@ fn overlapping_bulletins(ctx: &Context, req: &crate::di::DiRequest) -> Result<Ve
         if e.from == req.requester_agent {
             continue;
         }
-        let overlap = e.paths.is_empty()
-            || e.paths.iter().any(|p| {
-                di_glob_overlap(&req.path_glob, p)
-            });
+        let overlap =
+            e.paths.is_empty() || e.paths.iter().any(|p| di_glob_overlap(&req.path_glob, p));
         if overlap {
             out.push(format!(
                 "{} is working in {}: {}",
@@ -1975,10 +1982,7 @@ pub fn cmd_done(ctx: &Context, agent: &str) -> Result<()> {
     }
 
     // Record telemetry: read wake metadata, compute diff, emit span.
-    let wake_meta = ctx
-        .trelane_dir()
-        .join("agents")
-        .join("wake.json");
+    let wake_meta = ctx.trelane_dir().join("agents").join("wake.json");
     if wake_meta.exists()
         && let Ok(text) = std::fs::read_to_string(&wake_meta)
         && let Ok(data) = serde_json::from_str::<serde_json::Value>(&text)
@@ -2438,7 +2442,8 @@ fn cmd_help_offer(
     // not keep waking this helper for the same unchanged backlog.
     let assistable = store::list_assistable_tasks(&ctx.conn, helper, &crypto::now_iso())?;
     let fingerprint = store::assist_backlog_fingerprint(&assistable);
-    let _ = store::record_offer_fingerprint(&ctx.conn, helper, &fingerprint, &id, &crypto::now_iso());
+    let _ =
+        store::record_offer_fingerprint(&ctx.conn, helper, &fingerprint, &id, &crypto::now_iso());
     println!("{id}");
     Ok(())
 }
@@ -3689,7 +3694,11 @@ mod tests {
         let ctx = assistance_ctx(&temp);
         // Snapshot at the end of owner's last run: clean tree.
         store::save_audit_baseline(&ctx.conn, "owner", &git_dirty(root).unwrap()).unwrap();
-        assert!(domain_change_since_baseline(&ctx, "owner").unwrap().is_empty());
+        assert!(
+            domain_change_since_baseline(&ctx, "owner")
+                .unwrap()
+                .is_empty()
+        );
 
         // Another agent dirties one file in owner's domain and one outside it.
         std::fs::write(root.join("src/a.rs"), "const A: u8 = 2;\n").unwrap();
@@ -3707,7 +3716,11 @@ mod tests {
         // The done-time refresh captures the current state as the new "seen"
         // baseline -- the agent's own acknowledged work never re-flags.
         store::save_audit_baseline(&ctx.conn, "owner", &git_dirty(root).unwrap()).unwrap();
-        assert!(domain_change_since_baseline(&ctx, "owner").unwrap().is_empty());
+        assert!(
+            domain_change_since_baseline(&ctx, "owner")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// No prior snapshot (first-ever run) means nothing to diff against.
@@ -3721,7 +3734,11 @@ mod tests {
         let ctx = assistance_ctx(&temp);
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/new.rs"), "// new\n").unwrap();
-        assert!(domain_change_since_baseline(&ctx, "owner").unwrap().is_empty());
+        assert!(
+            domain_change_since_baseline(&ctx, "owner")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// 4B remainder: redomain archives the agent's still-active bulletin
@@ -3771,9 +3788,7 @@ mod tests {
         );
         // But the entry survives in history (archived, not deleted).
         assert_eq!(
-            store::get_bulletin(&ctx.conn, "owner", true)
-                .unwrap()
-                .len(),
+            store::get_bulletin(&ctx.conn, "owner", true).unwrap().len(),
             1
         );
     }
@@ -3820,8 +3835,7 @@ mod tests {
         std::fs::write(&file, "// nope\n").unwrap();
         let abs = file.to_string_lossy().to_string();
         let ctx = assistance_ctx(&temp);
-        let err = cmd_claim(&ctx, "helper", &abs, None, None, None, None)
-            .unwrap_err();
+        let err = cmd_claim(&ctx, "helper", &abs, None, None, None, None).unwrap_err();
         assert!(err.to_string().contains("delegation"));
     }
 
@@ -3848,8 +3862,7 @@ mod tests {
         crate::di::approve(&ctx, &id, "owner").unwrap();
         crate::di::resolve_pending(&ctx).unwrap();
 
-        let err = cmd_claim(&ctx, "helper", &abs, None, None, None, None)
-            .unwrap_err();
+        let err = cmd_claim(&ctx, "helper", &abs, None, None, None, None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("DENIED"), "got: {msg}");
         assert!(msg.contains("--wait-contested-claim"), "got: {msg}");

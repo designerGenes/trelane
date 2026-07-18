@@ -229,10 +229,7 @@ impl SessionHealth {
     /// Build the running/asleep rollup from agent rows, attaching an optional
     /// entropy score. Pure: the counts are a fold over the rows, so this is
     /// unit-tested without a live session.
-    pub fn from_rows(
-        agents: &[AgentRow],
-        entropy: Option<crate::entropy::EntropyScore>,
-    ) -> Self {
+    pub fn from_rows(agents: &[AgentRow], entropy: Option<crate::entropy::EntropyScore>) -> Self {
         let running = agents.iter().filter(|a| a.running).count();
         SessionHealth {
             running,
@@ -744,14 +741,10 @@ fn gather_state(ctx: &crate::Context) -> Result<DiagnosticState> {
     };
     let health = SessionHealth::from_rows(&rows, entropy);
 
-    Ok(DiagnosticState::new(
-        project,
-        session_line,
-        rows,
-        deadlock,
-        &ctx.config,
+    Ok(
+        DiagnosticState::new(project, session_line, rows, deadlock, &ctx.config)
+            .with_health(health),
     )
-    .with_health(health))
 }
 
 fn run_loop(ctx: &crate::Context, state: &mut DiagnosticState) -> Result<()> {
@@ -943,10 +936,7 @@ fn render(f: &mut ratatui::Frame, state: &DiagnosticState) {
                         Style::default().fg(theme_color(THEME_OK)),
                     ),
                     Span::styled("  /  ", Style::default().fg(dim)),
-                    Span::styled(
-                        format!("{} asleep", h.asleep),
-                        Style::default().fg(dim),
-                    ),
+                    Span::styled(format!("{} asleep", h.asleep), Style::default().fg(dim)),
                 ]));
 
                 // Entropy line, colored by band so a glance conveys risk.
@@ -964,7 +954,10 @@ fn render(f: &mut ratatui::Frame, state: &DiagnosticState) {
                 };
                 lines.push(Line::from(vec![
                     Span::styled("Entropy:  ", Style::default().fg(dim)),
-                    Span::styled(etext, Style::default().fg(ecolor).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        etext,
+                        Style::default().fg(ecolor).add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(
                         "  (static deadlock-likelihood estimate)",
                         Style::default().fg(dim),
@@ -1445,9 +1438,27 @@ mod tests {
 
     fn rows_2r_1a() -> Vec<AgentRow> {
         vec![
-            AgentRow { name: "a".into(), domain: "src/a/**".into(), running: true, inbox: 0, model: "m".into() },
-            AgentRow { name: "b".into(), domain: "src/b/**".into(), running: true, inbox: 1, model: "m".into() },
-            AgentRow { name: "c".into(), domain: "src/c/**".into(), running: false, inbox: 0, model: "m".into() },
+            AgentRow {
+                name: "a".into(),
+                domain: "src/a/**".into(),
+                running: true,
+                inbox: 0,
+                model: "m".into(),
+            },
+            AgentRow {
+                name: "b".into(),
+                domain: "src/b/**".into(),
+                running: true,
+                inbox: 1,
+                model: "m".into(),
+            },
+            AgentRow {
+                name: "c".into(),
+                domain: "src/c/**".into(),
+                running: false,
+                inbox: 0,
+                model: "m".into(),
+            },
         ]
     }
 

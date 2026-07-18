@@ -1,5 +1,5 @@
 use crate::error::{Result, TrelaneError};
-use crate::models::{default_granularity_tier, Domain, TRELANE_DIR};
+use crate::models::{Domain, TRELANE_DIR, default_granularity_tier};
 use globset::Glob;
 use std::path::{Path, PathBuf};
 

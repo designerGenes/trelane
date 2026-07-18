@@ -557,7 +557,11 @@ mod tests {
             "rejection_count"
         ));
         assert!(has_column(&conn, "delegation_workspaces", "mode"));
-        assert!(has_column(&conn, "completion_attestations", "snapshot_fingerprint"));
+        assert!(has_column(
+            &conn,
+            "completion_attestations",
+            "snapshot_fingerprint"
+        ));
         assert!(has_column(&conn, "validation_checks", "status"));
         assert!(has_column(&conn, "project_roles", "role"));
     }
@@ -572,7 +576,11 @@ mod tests {
         assert!(has_column(&conn, "claims", "delegation_id"));
         assert!(has_column(&conn, "delegations", "offer_message"));
         assert!(has_column(&conn, "task_submissions", "reviewed_at"));
-        assert!(has_column(&conn, "assist_discovery_state", "cooldown_until"));
+        assert!(has_column(
+            &conn,
+            "assist_discovery_state",
+            "cooldown_until"
+        ));
         let version: u32 = conn
             .query_row("SELECT user_version FROM pragma_user_version", [], |r| {
                 r.get(0)
@@ -589,12 +597,12 @@ mod tests {
         conn.execute_batch(SCHEMA_C2).unwrap();
         conn.execute_batch("PRAGMA user_version = 7;").unwrap();
         migrate(&conn).unwrap();
-        assert!(has_column(&conn, "assist_discovery_state", "cooldown_until"));
         assert!(has_column(
             &conn,
-            "assist_rejection_backoff",
-            "retry_after"
+            "assist_discovery_state",
+            "cooldown_until"
         ));
+        assert!(has_column(&conn, "assist_rejection_backoff", "retry_after"));
         assert!(has_column(&conn, "delegation_workspaces", "mode"));
         assert!(has_column(&conn, "completion_attestations", "recorded_by"));
         let version: u32 = conn

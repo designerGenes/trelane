@@ -221,7 +221,13 @@ pub fn compose_prompt(
                 } else {
                     m.paths.join(", ")
                 };
-                format!("- {} [{}] {}: {}", m.id, m.from, files, m.body.lines().next().unwrap_or(""))
+                format!(
+                    "- {} [{}] {}: {}",
+                    m.id,
+                    m.from,
+                    files,
+                    m.body.lines().next().unwrap_or("")
+                )
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -253,9 +259,11 @@ pub fn compose_prompt(
     // list is attached -- detection is mechanical, acting is the agent's
     // call. R29: unreviewed split proposals surface the same way.
     let adjacency_summary = crate::refine::exhaustion_adjacency_summary(conn, agent)
-        .unwrap_or_else(|| "(no adjacency list yet -- none computed, or you still have ready work.)".to_string());
-    let split_proposal_summary = crate::refine::pending_split_summary(conn, agent)
-        .unwrap_or_else(|| "(none)".to_string());
+        .unwrap_or_else(|| {
+            "(no adjacency list yet -- none computed, or you still have ready work.)".to_string()
+        });
+    let split_proposal_summary =
+        crate::refine::pending_split_summary(conn, agent).unwrap_or_else(|| "(none)".to_string());
 
     let mut tpl = full_bootstrap();
     let subs: HashMap<&str, String> = [

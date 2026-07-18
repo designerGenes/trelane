@@ -1,7 +1,7 @@
 use crate::error::{Result, TrelaneError};
 use crate::models::{
-    AssistDiscoveryState, AssistPolicy, CompletionBlocker, Delegation, DelegationStatus,
-    Domain, DomainAdjacency, LaunchTarget, Lease, Message, ParkedTask, ProjectCompletionReport,
+    AssistDiscoveryState, AssistPolicy, CompletionBlocker, Delegation, DelegationStatus, Domain,
+    DomainAdjacency, LaunchTarget, Lease, Message, ParkedTask, ProjectCompletionReport,
     ReviewDecision, RunningLock, SplitProposal, Task, TaskAssignment, TaskReview, TaskRole,
     TaskState, TaskSubmission, Violation,
 };
@@ -164,7 +164,10 @@ pub fn insert_message(conn: &Connection, msg: &Message) -> Result<()> {
     // R15/4D: replying to or superseding a message touches it, keeping it hot
     // while it is still part of a live conversation. Best-effort: a missing
     // target row is fine.
-    for target in [msg.re.as_ref(), msg.supersedes.as_ref()].into_iter().flatten() {
+    for target in [msg.re.as_ref(), msg.supersedes.as_ref()]
+        .into_iter()
+        .flatten()
+    {
         let _ = conn.execute(
             "UPDATE messages SET last_touched_at = ?2 WHERE id = ?1",
             params![target, msg.created_at],
@@ -861,7 +864,6 @@ pub struct CycleBreakAttempt {
     pub escalated: bool,
 }
 
-
 /// List all cycle break attempt records (for diagnostics and cleanup).
 pub fn list_cycle_break_attempts(conn: &Connection) -> Result<Vec<CycleBreakAttempt>> {
     let mut stmt = conn.prepare(
@@ -1003,15 +1005,18 @@ pub fn list_pending_split_proposals_for(
     Ok(out)
 }
 
-pub fn list_split_proposals(
-    conn: &Connection,
-    status: Option<&str>,
-) -> Result<Vec<SplitProposal>> {
+pub fn list_split_proposals(conn: &Connection, status: Option<&str>) -> Result<Vec<SplitProposal>> {
     let (sql, filtered) = match status {
-        Some(_) => ("SELECT id, domain, owner_at_split_time, proposal_json, status, created_at, resolved_at
-             FROM split_proposals WHERE status = ?1 ORDER BY created_at", true),
-        None => ("SELECT id, domain, owner_at_split_time, proposal_json, status, created_at, resolved_at
-             FROM split_proposals ORDER BY created_at", false),
+        Some(_) => (
+            "SELECT id, domain, owner_at_split_time, proposal_json, status, created_at, resolved_at
+             FROM split_proposals WHERE status = ?1 ORDER BY created_at",
+            true,
+        ),
+        None => (
+            "SELECT id, domain, owner_at_split_time, proposal_json, status, created_at, resolved_at
+             FROM split_proposals ORDER BY created_at",
+            false,
+        ),
     };
     let mut stmt = conn.prepare(sql)?;
     let map_row = |r: &rusqlite::Row| {
@@ -1030,7 +1035,9 @@ pub fn list_split_proposals(
             .filter_map(|r| r.ok())
             .collect()
     } else {
-        stmt.query_map([], map_row)?.filter_map(|r| r.ok()).collect()
+        stmt.query_map([], map_row)?
+            .filter_map(|r| r.ok())
+            .collect()
     };
     Ok(rows)
 }
@@ -1086,9 +1093,8 @@ pub fn get_starvation_count(conn: &Connection, agent: &str) -> Result<i64> {
 /// All agents with a non-zero starvation count, as a map. Read once per tick in
 /// `wake_plan` so the sort can consult it without a per-candidate query.
 pub fn starvation_counts(conn: &Connection) -> Result<std::collections::HashMap<String, i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT agent, deferred_ticks FROM agent_starvation WHERE deferred_ticks > 0",
-    )?;
+    let mut stmt = conn
+        .prepare("SELECT agent, deferred_ticks FROM agent_starvation WHERE deferred_ticks > 0")?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
     let mut out = std::collections::HashMap::new();
     for row in rows {
@@ -2238,9 +2244,7 @@ pub fn record_rejection_backoff(
     let delay = (base_secs * multiplier).min(max_secs);
     let retry_after = chrono::DateTime::parse_from_rfc3339(now)
         .ok()
-        .and_then(|dt| {
-            dt.checked_add_signed(chrono::Duration::seconds(delay as i64))
-        })
+        .and_then(|dt| dt.checked_add_signed(chrono::Duration::seconds(delay as i64)))
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string());
     conn.execute(
         "INSERT INTO assist_rejection_backoff
@@ -2343,9 +2347,18 @@ pub fn evaluate_project_completion(conn: &Connection) -> Result<ProjectCompletio
     let tasks = list_tasks(conn)?;
     let draft = tasks.iter().filter(|t| t.state == TaskState::Draft).count();
     let ready = tasks.iter().filter(|t| t.state == TaskState::Ready).count();
-    let active = tasks.iter().filter(|t| t.state == TaskState::Active).count();
-    let blocked = tasks.iter().filter(|t| t.state == TaskState::Blocked).count();
-    let review = tasks.iter().filter(|t| t.state == TaskState::Review).count();
+    let active = tasks
+        .iter()
+        .filter(|t| t.state == TaskState::Active)
+        .count();
+    let blocked = tasks
+        .iter()
+        .filter(|t| t.state == TaskState::Blocked)
+        .count();
+    let review = tasks
+        .iter()
+        .filter(|t| t.state == TaskState::Review)
+        .count();
     if draft > 0 {
         blockers.push(CompletionBlocker {
             kind: "draft_tasks".to_string(),
@@ -2469,7 +2482,14 @@ pub fn completion_fingerprint(conn: &Connection) -> Result<String> {
     // Tasks: sorted by id.
     let mut task_ids: Vec<String> = conn
         .prepare("SELECT id, state, updated_at FROM tasks ORDER BY id")?
-        .query_map([], |r| Ok(format!("{}|{}|{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+        .query_map([], |r| {
+            Ok(format!(
+                "{}|{}|{}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?
+            ))
+        })?
         .filter_map(|r| r.ok())
         .collect();
     task_ids.sort();
@@ -2481,7 +2501,14 @@ pub fn completion_fingerprint(conn: &Connection) -> Result<String> {
     // Delegations: sorted by id.
     let mut del_rows: Vec<String> = conn
         .prepare("SELECT id, task_id, status FROM delegations ORDER BY id")?
-        .query_map([], |r| Ok(format!("{}|{}|{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+        .query_map([], |r| {
+            Ok(format!(
+                "{}|{}|{}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?
+            ))
+        })?
         .filter_map(|r| r.ok())
         .collect();
     del_rows.sort();
@@ -2493,7 +2520,14 @@ pub fn completion_fingerprint(conn: &Connection) -> Result<String> {
     // Reviews: sorted by id.
     let mut rev_rows: Vec<String> = conn
         .prepare("SELECT id, task_id, decision FROM task_reviews ORDER BY id")?
-        .query_map([], |r| Ok(format!("{}|{}|{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+        .query_map([], |r| {
+            Ok(format!(
+                "{}|{}|{}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?
+            ))
+        })?
         .filter_map(|r| r.ok())
         .collect();
     rev_rows.sort();
@@ -2505,7 +2539,13 @@ pub fn completion_fingerprint(conn: &Connection) -> Result<String> {
     // Validation checks: sorted by name.
     let mut val_rows: Vec<String> = conn
         .prepare("SELECT name, status FROM validation_checks ORDER BY name")?
-        .query_map([], |r| Ok(format!("{}|{}", r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .query_map([], |r| {
+            Ok(format!(
+                "{}|{}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?
+            ))
+        })?
         .filter_map(|r| r.ok())
         .collect();
     val_rows.sort();
@@ -3044,7 +3084,15 @@ mod ledger_tests {
     #[test]
     fn delegation_workspace_round_trips() {
         let c = conn();
-        insert_delegation_workspace(&c, "del_1", "worktree", "/tmp/wt1", "trelane/del_1", "2026-07-12T00:00:00Z").unwrap();
+        insert_delegation_workspace(
+            &c,
+            "del_1",
+            "worktree",
+            "/tmp/wt1",
+            "trelane/del_1",
+            "2026-07-12T00:00:00Z",
+        )
+        .unwrap();
         let ws = get_delegation_workspace(&c, "del_1").unwrap().unwrap();
         assert_eq!(ws.0, "worktree");
         assert_eq!(ws.1, "/tmp/wt1");
@@ -3088,10 +3136,19 @@ mod ledger_tests {
     fn submitted_delegation_blocks_completion() {
         let c = conn();
         insert_task(&c, &sample_task("task_1")).unwrap();
-        insert_delegation(&c, &sample_delegation("del_1", "beta", DelegationStatus::Submitted)).unwrap();
+        insert_delegation(
+            &c,
+            &sample_delegation("del_1", "beta", DelegationStatus::Submitted),
+        )
+        .unwrap();
         let report = evaluate_project_completion(&c).unwrap();
         assert!(!report.eligible);
-        assert!(report.blockers.iter().any(|b| b.kind == "submitted_delegations"));
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|b| b.kind == "submitted_delegations")
+        );
     }
 
     #[test]
@@ -3121,12 +3178,26 @@ mod ledger_tests {
         let report = evaluate_project_completion(&c).unwrap();
         assert!(report.eligible);
         // Record attestation.
-        record_completion_attestation(&c, "owner", "integrator", "all done", "2026-07-12T01:00:00Z").unwrap();
+        record_completion_attestation(
+            &c,
+            "owner",
+            "integrator",
+            "all done",
+            "2026-07-12T01:00:00Z",
+        )
+        .unwrap();
         let report2 = evaluate_project_completion(&c).unwrap();
         assert!(report2.complete);
         assert_eq!(report2.attested_by.as_deref(), Some("owner"));
         // Non-designated agent cannot attest.
-        let err = record_completion_attestation(&c, "other", "integrator", "nope", "2026-07-12T02:00:00Z").unwrap_err();
+        let err = record_completion_attestation(
+            &c,
+            "other",
+            "integrator",
+            "nope",
+            "2026-07-12T02:00:00Z",
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("does not have role"));
     }
 
@@ -3134,7 +3205,8 @@ mod ledger_tests {
     fn new_task_invalidates_old_attestation() {
         let c = conn();
         designate_project_role(&c, "owner", "integrator", "user", "2026-07-12T00:00:00Z").unwrap();
-        record_completion_attestation(&c, "owner", "integrator", "done", "2026-07-12T01:00:00Z").unwrap();
+        record_completion_attestation(&c, "owner", "integrator", "done", "2026-07-12T01:00:00Z")
+            .unwrap();
         assert!(evaluate_project_completion(&c).unwrap().complete);
         // Add a task — this changes the fingerprint and invalidates the attestation.
         insert_task(&c, &sample_task("task_new")).unwrap();

@@ -308,8 +308,13 @@ pub fn wake_plan(ctx: &Context) -> Result<WakePlan> {
                          path is already leased, park on the contention instead of retrying: \
                          `trelane park {} --wait-contested-claim {} --waiting-on <holder>` (R26). \
                          Never write .trelane/** or .git/** regardless of approval (R11).",
-                        req.id, req.path_glob, req.target_domain, agent, req.path_glob,
-                        agent, req.path_glob
+                        req.id,
+                        req.path_glob,
+                        req.target_domain,
+                        agent,
+                        req.path_glob,
+                        agent,
+                        req.path_glob
                     ),
                 ),
                 crate::di::STATUS_VETOED => (
@@ -442,10 +447,7 @@ pub fn wake_plan(ctx: &Context) -> Result<WakePlan> {
             cands.push(WakeCandidate {
                 agent: agent.clone(),
                 kind: WakeKind::OwnedTask,
-                reason: format!(
-                    "owned task ready: {} ({})",
-                    best.id, best.subject
-                ),
+                reason: format!("owned task ready: {} ({})", best.id, best.subject),
                 urgency_rank: rank,
                 task_id: Some(best.id.clone()),
                 delegation_id: None,
@@ -461,8 +463,7 @@ pub fn wake_plan(ctx: &Context) -> Result<WakePlan> {
         if seen.contains(agent) || commands::is_running(&ctx.conn, agent)? {
             continue;
         }
-        let assignments =
-            store::list_runnable_helper_assignments(&ctx.conn, agent, &now)?;
+        let assignments = store::list_runnable_helper_assignments(&ctx.conn, agent, &now)?;
         if let Some((_, task, delegation)) = assignments.first() {
             cands.push(WakeCandidate {
                 agent: agent.clone(),
@@ -616,10 +617,9 @@ pub fn tick(ctx: &Context, launcher_override: Option<&str>, verbose: bool) -> Re
     // any work so the span covers the whole tick.
     let start_ns = crate::telemetry::now_nanos();
     let emit_tick_span = |launched: usize, running: usize, cycle: bool| {
-        if let Ok(tracer) = crate::telemetry::Tracer::ephemeral(
-            &ctx.trelane_dir(),
-            &ctx.root.display().to_string(),
-        ) {
+        if let Ok(tracer) =
+            crate::telemetry::Tracer::ephemeral(&ctx.trelane_dir(), &ctx.root.display().to_string())
+        {
             let _ = tracer.record_squire_tick(
                 launched,
                 running,
@@ -698,7 +698,10 @@ pub fn tick(ctx: &Context, launcher_override: Option<&str>, verbose: bool) -> Re
     for cand in &plan.candidates {
         if launched >= budget {
             if verbose {
-                eprintln!("deferred wake of {} (concurrency budget reached)", cand.agent);
+                eprintln!(
+                    "deferred wake of {} (concurrency budget reached)",
+                    cand.agent
+                );
             }
             // R23: this candidate was valid but deferred past the budget this
             // tick. Bump its consecutive-deferral count so that, once it crosses
@@ -708,8 +711,18 @@ pub fn tick(ctx: &Context, launcher_override: Option<&str>, verbose: bool) -> Re
             let _ = store::increment_starvation(&ctx.conn, &cand.agent, &now);
             continue;
         }
-        eprintln!("{} waking {}: {}", crate::crypto::now_iso(), cand.agent, cand.reason);
-        match commands::cmd_wake(ctx, &cand.agent, Some(cand.reason.as_str()), launcher_override) {
+        eprintln!(
+            "{} waking {}: {}",
+            crate::crypto::now_iso(),
+            cand.agent,
+            cand.reason
+        );
+        match commands::cmd_wake(
+            ctx,
+            &cand.agent,
+            Some(cand.reason.as_str()),
+            launcher_override,
+        ) {
             Ok(()) => {
                 launched += 1;
                 launched_agents.insert(cand.agent.as_str());
@@ -747,7 +760,10 @@ pub fn tick(ctx: &Context, launcher_override: Option<&str>, verbose: bool) -> Re
                                     member.clone(),
                                     "system".to_string(),
                                     "critical".to_string(),
-                                    format!("cycle escalation: {} failed break attempts", attempt_count),
+                                    format!(
+                                        "cycle escalation: {} failed break attempts",
+                                        attempt_count
+                                    ),
                                     format!(
                                         "The wait-cycle has been broken {attempt_count} times without resolution. \
                                         Each member must reassess their parked tasks and either unpark with a \
@@ -763,10 +779,8 @@ pub fn tick(ctx: &Context, launcher_override: Option<&str>, verbose: bool) -> Re
                             }
                             let alerts_dir = ctx.trelane_dir().join("alerts");
                             let _ = std::fs::create_dir_all(&alerts_dir);
-                            let alert_path = alerts_dir.join(format!(
-                                "{}.txt",
-                                cp.cycle_key.replace(',', "-")
-                            ));
+                            let alert_path =
+                                alerts_dir.join(format!("{}.txt", cp.cycle_key.replace(',', "-")));
                             let _ = std::fs::write(
                                 &alert_path,
                                 format!(
@@ -787,9 +801,7 @@ pub fn tick(ctx: &Context, launcher_override: Option<&str>, verbose: bool) -> Re
                     if let Some(ref fp) = cand.discovery_fingerprint {
                         let cooldown = chrono::DateTime::parse_from_rfc3339(&now)
                             .ok()
-                            .and_then(|dt| {
-                                dt.checked_add_signed(chrono::Duration::seconds(300))
-                            })
+                            .and_then(|dt| dt.checked_add_signed(chrono::Duration::seconds(300)))
                             .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
                             .unwrap_or_else(|| now.clone());
                         let _ = store::record_discovery_wake(
@@ -813,7 +825,14 @@ pub fn tick(ctx: &Context, launcher_override: Option<&str>, verbose: bool) -> Re
     // GAP-06: one squire.wake_candidate span per agent *considered* this tick
     // -- not just the winners -- so "why didn't X wake" is answerable after
     // the fact. Best-effort per R16.
-    emit_wake_candidate_spans(ctx, &plan, &agents, &launched_agents, &launcher_skipped, start_ns);
+    emit_wake_candidate_spans(
+        ctx,
+        &plan,
+        &agents,
+        &launched_agents,
+        &launcher_skipped,
+        start_ns,
+    );
 
     // Record the completed tick: how many launched, how many were running at
     // the start of the launch phase, and whether a wait-cycle was detected.
@@ -886,9 +905,9 @@ fn maybe_post_quiescence_notice(ctx: &Context, running_now: usize) {
             return Ok(());
         }
         // Zero open parked waits -- a parked swarm is waiting, not finished.
-        let open_parks: i64 =
-            ctx.conn
-                .query_row("SELECT COUNT(*) FROM parked_tasks", [], |r| r.get(0))?;
+        let open_parks: i64 = ctx
+            .conn
+            .query_row("SELECT COUNT(*) FROM parked_tasks", [], |r| r.get(0))?;
         if open_parks > 0 {
             return Ok(());
         }
@@ -928,8 +947,10 @@ fn maybe_post_quiescence_notice(ctx: &Context, running_now: usize) {
         let secret = ctx.secret()?;
         crate::crypto::sign(&secret, &mut msg);
         store::insert_message(&ctx.conn, &msg)?;
-        eprintln!("{} quiescence: zero ready work across all domains (notice posted)",
-            crate::crypto::now_iso());
+        eprintln!(
+            "{} quiescence: zero ready work across all domains (notice posted)",
+            crate::crypto::now_iso()
+        );
         Ok(())
     })();
 }
@@ -988,7 +1009,10 @@ pub fn agent_activity_status(ctx: &Context, agent: &str) -> Result<AgentStatus> 
             agent: agent.to_string(),
             state: AgentActivityState::HelpAssignmentReady,
             reason: format!("{} active helper assignment(s)", helper_assignments.len()),
-            task_ids: helper_assignments.iter().map(|(a, _, _)| a.task_id.clone()).collect(),
+            task_ids: helper_assignments
+                .iter()
+                .map(|(a, _, _)| a.task_id.clone())
+                .collect(),
         });
     }
 
@@ -1250,7 +1274,13 @@ mod tests {
         }
     }
 
-    fn make_delegation(id: &str, task_id: &str, owner: &str, helper: &str, status: DelegationStatus) -> Delegation {
+    fn make_delegation(
+        id: &str,
+        task_id: &str,
+        owner: &str,
+        helper: &str,
+        status: DelegationStatus,
+    ) -> Delegation {
         Delegation {
             id: id.to_string(),
             task_id: task_id.to_string(),
@@ -1273,8 +1303,17 @@ mod tests {
     }
 
     fn setup_two_agents(ctx: &crate::Context) {
-        crate::commands::cmd_add_agent(ctx, "alpha", &["src/alpha/**".to_string()], &[], None, None).unwrap();
-        crate::commands::cmd_add_agent(ctx, "beta", &["src/beta/**".to_string()], &[], None, None).unwrap();
+        crate::commands::cmd_add_agent(
+            ctx,
+            "alpha",
+            &["src/alpha/**".to_string()],
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        crate::commands::cmd_add_agent(ctx, "beta", &["src/beta/**".to_string()], &[], None, None)
+            .unwrap();
     }
 
     #[test]
@@ -1289,8 +1328,17 @@ mod tests {
         store::insert_task(&ctx.conn, &child).unwrap();
         let plan = wake_plan(&ctx).unwrap();
         // Child should NOT appear because its dependency is not done.
-        assert!(plan.candidates.iter().any(|c| c.agent == "alpha" && c.task_id == Some("parent".to_string())));
-        assert!(!plan.candidates.iter().any(|c| c.task_id == Some("child".to_string())));
+        assert!(
+            plan.candidates
+                .iter()
+                .any(|c| c.agent == "alpha" && c.task_id == Some("parent".to_string()))
+        );
+        assert!(
+            !plan
+                .candidates
+                .iter()
+                .any(|c| c.task_id == Some("child".to_string()))
+        );
     }
 
     #[test]
@@ -1302,18 +1350,26 @@ mod tests {
         store::insert_task(&ctx.conn, &task).unwrap();
         let del = make_delegation("del_1", "task_1", "alpha", "beta", DelegationStatus::Active);
         store::insert_delegation(&ctx.conn, &del).unwrap();
-        store::upsert_assignment(&ctx.conn, &TaskAssignment {
-            task_id: "task_1".to_string(),
-            agent: "beta".to_string(),
-            role: TaskRole::Helper,
-            state: "active".to_string(),
-            offer_id: Some("offer_del_1".to_string()),
-            delegation_id: Some("del_1".to_string()),
-            started_at: Some("2026-07-12T01:00:00Z".to_string()),
-            completed_at: None,
-        }).unwrap();
+        store::upsert_assignment(
+            &ctx.conn,
+            &TaskAssignment {
+                task_id: "task_1".to_string(),
+                agent: "beta".to_string(),
+                role: TaskRole::Helper,
+                state: "active".to_string(),
+                offer_id: Some("offer_del_1".to_string()),
+                delegation_id: Some("del_1".to_string()),
+                started_at: Some("2026-07-12T01:00:00Z".to_string()),
+                completed_at: None,
+            },
+        )
+        .unwrap();
         let plan = wake_plan(&ctx).unwrap();
-        assert!(plan.candidates.iter().any(|c| c.agent == "beta" && c.kind == WakeKind::HelperAssignment));
+        assert!(
+            plan.candidates
+                .iter()
+                .any(|c| c.agent == "beta" && c.kind == WakeKind::HelperAssignment)
+        );
     }
 
     #[test]
@@ -1323,11 +1379,22 @@ mod tests {
         setup_two_agents(&ctx);
         let task = make_task("task_1", "alpha", TaskState::Ready);
         store::insert_task(&ctx.conn, &task).unwrap();
-        let del = make_delegation("del_1", "task_1", "alpha", "beta", DelegationStatus::Offered);
+        let del = make_delegation(
+            "del_1",
+            "task_1",
+            "alpha",
+            "beta",
+            DelegationStatus::Offered,
+        );
         store::insert_delegation(&ctx.conn, &del).unwrap();
         let plan = wake_plan(&ctx).unwrap();
         // Beta should NOT have a HelperAssignment candidate (offered != active).
-        assert!(!plan.candidates.iter().any(|c| c.agent == "beta" && c.kind == WakeKind::HelperAssignment));
+        assert!(
+            !plan
+                .candidates
+                .iter()
+                .any(|c| c.agent == "beta" && c.kind == WakeKind::HelperAssignment)
+        );
     }
 
     #[test]
@@ -1338,11 +1405,22 @@ mod tests {
         let task = make_task("task_1", "alpha", TaskState::Ready);
         store::insert_task(&ctx.conn, &task).unwrap();
         // Beta has an outstanding offer.
-        let del = make_delegation("del_1", "task_1", "alpha", "beta", DelegationStatus::Offered);
+        let del = make_delegation(
+            "del_1",
+            "task_1",
+            "alpha",
+            "beta",
+            DelegationStatus::Offered,
+        );
         store::insert_delegation(&ctx.conn, &del).unwrap();
         let plan = wake_plan(&ctx).unwrap();
         // Beta should NOT get a discovery wake (outstanding offer = 1, limit = 1).
-        assert!(!plan.candidates.iter().any(|c| c.agent == "beta" && c.kind == WakeKind::AssistDiscovery));
+        assert!(
+            !plan
+                .candidates
+                .iter()
+                .any(|c| c.agent == "beta" && c.kind == WakeKind::AssistDiscovery)
+        );
     }
 
     #[test]
@@ -1355,10 +1433,19 @@ mod tests {
         store::insert_task(&ctx.conn, &task).unwrap();
         let plan = wake_plan(&ctx).unwrap();
         // Alpha gets OwnedTask wake.
-        assert!(plan.candidates.iter().any(|c| c.agent == "alpha" && c.kind == WakeKind::OwnedTask));
+        assert!(
+            plan.candidates
+                .iter()
+                .any(|c| c.agent == "alpha" && c.kind == WakeKind::OwnedTask)
+        );
         // Beta gets AssistDiscovery (running=0 < max_concurrent=2, assistable task exists).
-        assert!(plan.candidates.iter().any(|c| c.agent == "beta" && c.kind == WakeKind::AssistDiscovery),
-            "beta should get a discovery wake; got: {:?}", plan.candidates);
+        assert!(
+            plan.candidates
+                .iter()
+                .any(|c| c.agent == "beta" && c.kind == WakeKind::AssistDiscovery),
+            "beta should get a discovery wake; got: {:?}",
+            plan.candidates
+        );
     }
 
     #[test]
@@ -1369,13 +1456,20 @@ mod tests {
         let task = make_task("task_1", "alpha", TaskState::Ready);
         store::insert_task(&ctx.conn, &task).unwrap();
         // Record that beta already offered for this backlog.
-        let assistable = store::list_assistable_tasks(&ctx.conn, "beta", "2026-07-12T00:00:00Z").unwrap();
+        let assistable =
+            store::list_assistable_tasks(&ctx.conn, "beta", "2026-07-12T00:00:00Z").unwrap();
         let fp = store::assist_backlog_fingerprint(&assistable);
-        store::record_offer_fingerprint(&ctx.conn, "beta", &fp, "del_old", "2026-07-12T00:00:00Z").unwrap();
+        store::record_offer_fingerprint(&ctx.conn, "beta", &fp, "del_old", "2026-07-12T00:00:00Z")
+            .unwrap();
         let plan = wake_plan(&ctx).unwrap();
         // Beta should NOT get a discovery wake (fingerprint unchanged).
-        assert!(!plan.candidates.iter().any(|c| c.agent == "beta" && c.kind == WakeKind::AssistDiscovery),
-            "beta should not be rediscovered for the same backlog");
+        assert!(
+            !plan
+                .candidates
+                .iter()
+                .any(|c| c.agent == "beta" && c.kind == WakeKind::AssistDiscovery),
+            "beta should not be rediscovered for the same backlog"
+        );
     }
 
     #[test]
@@ -1398,20 +1492,29 @@ mod tests {
         let ctx = migrated_ctx(&temp);
         setup_two_agents(&ctx);
         // Insert a parked task that is abandoned (target gone).
-        store::insert_parked_task(&ctx.conn, &ParkedTask {
-            task: "park_1".to_string(),
-            agent: "alpha".to_string(),
-            wait_type: "reply".to_string(),
-            wait_re: Some("msg_1".to_string()),
-            wait_path: None,
-            waiting_on: "nonexistent".to_string(),
-            resume_hint: String::new(),
-            created_at: "2020-01-01T00:00:00Z".to_string(),
-        }).unwrap();
+        store::insert_parked_task(
+            &ctx.conn,
+            &ParkedTask {
+                task: "park_1".to_string(),
+                agent: "alpha".to_string(),
+                wait_type: "reply".to_string(),
+                wait_re: Some("msg_1".to_string()),
+                wait_path: None,
+                waiting_on: "nonexistent".to_string(),
+                resume_hint: String::new(),
+                created_at: "2020-01-01T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
         let plan = wake_plan(&ctx).unwrap();
         // The park should still exist (deletion is deferred to tick).
-        assert!(store::list_parked_tasks(&ctx.conn).unwrap().iter().any(|p| p.task == "park_1"),
-            "abandoned park must survive wake_plan");
+        assert!(
+            store::list_parked_tasks(&ctx.conn)
+                .unwrap()
+                .iter()
+                .any(|p| p.task == "park_1"),
+            "abandoned park must survive wake_plan"
+        );
         // The plan should carry the deletion intent.
         assert!(plan.abandoned_parks.contains_key("alpha"));
     }
@@ -1422,30 +1525,41 @@ mod tests {
         let ctx = migrated_ctx(&temp);
         setup_two_agents(&ctx);
         // Create a cycle: alpha waits on beta, beta waits on alpha.
-        store::insert_parked_task(&ctx.conn, &ParkedTask {
-            task: "park_a".to_string(),
-            agent: "alpha".to_string(),
-            wait_type: "reply".to_string(),
-            wait_re: Some("msg_a".to_string()),
-            wait_path: None,
-            waiting_on: "beta".to_string(),
-            resume_hint: String::new(),
-            created_at: "2026-07-12T00:00:00Z".to_string(),
-        }).unwrap();
-        store::insert_parked_task(&ctx.conn, &ParkedTask {
-            task: "park_b".to_string(),
-            agent: "beta".to_string(),
-            wait_type: "reply".to_string(),
-            wait_re: Some("msg_b".to_string()),
-            wait_path: None,
-            waiting_on: "alpha".to_string(),
-            resume_hint: String::new(),
-            created_at: "2026-07-12T00:00:00Z".to_string(),
-        }).unwrap();
+        store::insert_parked_task(
+            &ctx.conn,
+            &ParkedTask {
+                task: "park_a".to_string(),
+                agent: "alpha".to_string(),
+                wait_type: "reply".to_string(),
+                wait_re: Some("msg_a".to_string()),
+                wait_path: None,
+                waiting_on: "beta".to_string(),
+                resume_hint: String::new(),
+                created_at: "2026-07-12T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        store::insert_parked_task(
+            &ctx.conn,
+            &ParkedTask {
+                task: "park_b".to_string(),
+                agent: "beta".to_string(),
+                wait_type: "reply".to_string(),
+                wait_re: Some("msg_b".to_string()),
+                wait_path: None,
+                waiting_on: "alpha".to_string(),
+                resume_hint: String::new(),
+                created_at: "2026-07-12T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
         let before = store::list_cycle_break_attempts(&ctx.conn).unwrap().len();
         let _plan = wake_plan(&ctx).unwrap();
         let after = store::list_cycle_break_attempts(&ctx.conn).unwrap().len();
-        assert_eq!(before, after, "wake_plan must not record cycle break attempts");
+        assert_eq!(
+            before, after,
+            "wake_plan must not record cycle break attempts"
+        );
     }
 
     #[test]
@@ -1537,7 +1651,16 @@ mod tests {
             .unwrap();
         for to in ["aa", "bb"] {
             crate::commands::cmd_send(
-                &ctx, "user", to, "question", "normal", "q", "", &None, &None, &[],
+                &ctx,
+                "user",
+                to,
+                "question",
+                "normal",
+                "q",
+                "",
+                &None,
+                &None,
+                &[],
             )
             .unwrap();
         }
@@ -1554,12 +1677,18 @@ mod tests {
         for span in candidate_spans {
             let attrs = format!("{:?}", span.attributes);
             assert!(attrs.contains("Inbox"), "kind recorded: {attrs}");
-            assert!(attrs.contains("wake.chosen"), "chosen attr present: {attrs}");
+            assert!(
+                attrs.contains("wake.chosen"),
+                "chosen attr present: {attrs}"
+            );
             assert!(
                 attrs.contains(r#"value: StringValue("false")"#),
                 "not chosen: {attrs}"
             );
-            assert!(attrs.contains("launcher not configured"), "skip reason: {attrs}");
+            assert!(
+                attrs.contains("launcher not configured"),
+                "skip reason: {attrs}"
+            );
         }
         // And the tick span itself is present (GAP-06).
         assert!(spans.iter().any(|s| s.name == "squire.tick"));
@@ -1657,16 +1786,19 @@ mod tests {
             },
         )
         .unwrap();
-        store::insert_parked_task(&ctx.conn, &ParkedTask {
-            task: "contested".to_string(),
-            agent: "helper".to_string(),
-            wait_type: "claim-contested".to_string(),
-            wait_re: None,
-            wait_path: Some("src/enemy.rs".to_string()),
-            waiting_on: "owner".to_string(),
-            resume_hint: String::new(),
-            created_at: "2020-01-01T00:00:00Z".to_string(),
-        })
+        store::insert_parked_task(
+            &ctx.conn,
+            &ParkedTask {
+                task: "contested".to_string(),
+                agent: "helper".to_string(),
+                wait_type: "claim-contested".to_string(),
+                wait_re: None,
+                wait_path: Some("src/enemy.rs".to_string()),
+                waiting_on: "owner".to_string(),
+                resume_hint: String::new(),
+                created_at: "2020-01-01T00:00:00Z".to_string(),
+            },
+        )
         .unwrap();
 
         let plan = wake_plan(&ctx).unwrap();
@@ -1714,11 +1846,51 @@ mod tests {
         let mut ctx = migrated_ctx(&temp);
         ctx.config.squire.max_concurrent = 1;
         ctx.config.squire.starvation_ticks = 3;
-        crate::commands::cmd_add_agent(&ctx, "alpha", &["src/a/**".to_string()], &[], None, Some("opencode")).unwrap();
-        crate::commands::cmd_add_agent(&ctx, "zeta", &["src/z/**".to_string()], &[], None, Some("opencode")).unwrap();
+        crate::commands::cmd_add_agent(
+            &ctx,
+            "alpha",
+            &["src/a/**".to_string()],
+            &[],
+            None,
+            Some("opencode"),
+        )
+        .unwrap();
+        crate::commands::cmd_add_agent(
+            &ctx,
+            "zeta",
+            &["src/z/**".to_string()],
+            &[],
+            None,
+            Some("opencode"),
+        )
+        .unwrap();
         // Both have unread inbox mail -> both are Inbox candidates.
-        crate::commands::cmd_send(&ctx, "user", "alpha", "question", "normal", "for alpha", "", &None, &None, &[]).unwrap();
-        crate::commands::cmd_send(&ctx, "user", "zeta", "question", "normal", "for zeta", "", &None, &None, &[]).unwrap();
+        crate::commands::cmd_send(
+            &ctx,
+            "user",
+            "alpha",
+            "question",
+            "normal",
+            "for alpha",
+            "",
+            &None,
+            &None,
+            &[],
+        )
+        .unwrap();
+        crate::commands::cmd_send(
+            &ctx,
+            "user",
+            "zeta",
+            "question",
+            "normal",
+            "for zeta",
+            "",
+            &None,
+            &None,
+            &[],
+        )
+        .unwrap();
         // zeta has been starved to the threshold.
         let now = crate::crypto::now_iso();
         for _ in 0..3 {
@@ -1740,10 +1912,50 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut ctx = migrated_ctx(&temp);
         ctx.config.squire.starvation_ticks = 3;
-        crate::commands::cmd_add_agent(&ctx, "alpha", &["src/a/**".to_string()], &[], None, Some("opencode")).unwrap();
-        crate::commands::cmd_add_agent(&ctx, "zeta", &["src/z/**".to_string()], &[], None, Some("opencode")).unwrap();
-        crate::commands::cmd_send(&ctx, "user", "alpha", "question", "normal", "for alpha", "", &None, &None, &[]).unwrap();
-        crate::commands::cmd_send(&ctx, "user", "zeta", "question", "normal", "for zeta", "", &None, &None, &[]).unwrap();
+        crate::commands::cmd_add_agent(
+            &ctx,
+            "alpha",
+            &["src/a/**".to_string()],
+            &[],
+            None,
+            Some("opencode"),
+        )
+        .unwrap();
+        crate::commands::cmd_add_agent(
+            &ctx,
+            "zeta",
+            &["src/z/**".to_string()],
+            &[],
+            None,
+            Some("opencode"),
+        )
+        .unwrap();
+        crate::commands::cmd_send(
+            &ctx,
+            "user",
+            "alpha",
+            "question",
+            "normal",
+            "for alpha",
+            "",
+            &None,
+            &None,
+            &[],
+        )
+        .unwrap();
+        crate::commands::cmd_send(
+            &ctx,
+            "user",
+            "zeta",
+            "question",
+            "normal",
+            "for zeta",
+            "",
+            &None,
+            &None,
+            &[],
+        )
+        .unwrap();
         let now = crate::crypto::now_iso();
         store::increment_starvation(&ctx.conn, "zeta", &now).unwrap();
         store::increment_starvation(&ctx.conn, "zeta", &now).unwrap(); // only 2 < 3

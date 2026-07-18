@@ -152,7 +152,9 @@ fn collect_domain_files(
         if path.is_dir() {
             collect_domain_files(root, &path, compiled, out, depth + 1);
         } else if let Ok(rel) = path.strip_prefix(root) {
-            let rel = rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+            let rel = rel
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
             if compiled.is_writable(&rel) {
                 out.push(rel);
             }
@@ -229,9 +231,7 @@ impl SplitDecider for LlmSplitDecider<'_> {
 
 /// Run one model invocation via the configured launcher and return stdout.
 fn run_model_once(ctx: &Context, model: &str, tag: &str, prompt: &str) -> Result<String> {
-    let prompt_file = ctx
-        .trelane_dir()
-        .join(format!("refine-{tag}-prompt.md"));
+    let prompt_file = ctx.trelane_dir().join(format!("refine-{tag}-prompt.md"));
     std::fs::write(&prompt_file, prompt)?;
     let cmd = crate::biplane::resolve_launcher_template(model)?
         .replace("{prompt_file}", &prompt_file.display().to_string())
@@ -258,9 +258,8 @@ fn parse_json_object<T: serde::de::DeserializeOwned>(text: &str) -> Result<T> {
     let start = text.find('{');
     let end = text.rfind('}');
     match (start, end) {
-        (Some(s), Some(e)) if e > s => serde_json::from_str(&text[s..=e]).map_err(|err| {
-            TrelaneError::msg(format!("model returned invalid JSON: {err}"))
-        }),
+        (Some(s), Some(e)) if e > s => serde_json::from_str(&text[s..=e])
+            .map_err(|err| TrelaneError::msg(format!("model returned invalid JSON: {err}"))),
         _ => Err(TrelaneError::msg("model returned no JSON object")),
     }
 }
@@ -270,11 +269,7 @@ fn parse_json_object<T: serde::de::DeserializeOwned>(text: &str) -> Result<T> {
 /// Validate proposed children against R17: each child's coverage must be a
 /// subset of the parent's, children must not overlap each other, and names
 /// must not collide with existing domains.
-fn validate_children(
-    conn: &Connection,
-    parent: &Domain,
-    children: &[SplitChild],
-) -> Result<()> {
+fn validate_children(conn: &Connection, parent: &Domain, children: &[SplitChild]) -> Result<()> {
     if children.is_empty() || children.len() > 4 {
         return Err(TrelaneError::msg(
             "a split must produce between 1 and 4 children",
@@ -521,17 +516,20 @@ pub fn refresh_sibling_adjacency(ctx: &Context, parent: &Domain) -> Result<()> {
 /// The LLM layer of adjacency: rank cross-branch moves between leaves that
 /// are NOT siblings. Cheapest layer (siblings) is always written by the
 /// split itself; this runs on the same opt-in `--refine` invocation.
-pub fn compute_llm_adjacency(
-    ctx: &Context,
-    model: &str,
-    leaves: &[LeafDomain],
-) -> Result<usize> {
+pub fn compute_llm_adjacency(ctx: &Context, model: &str, leaves: &[LeafDomain]) -> Result<usize> {
     if leaves.len() < 2 {
         return Ok(0);
     }
     let leaf_list = leaves
         .iter()
-        .map(|l| format!("- {} (tier {}, {} glob(s))", l.name, l.tier, l.writable.len()))
+        .map(|l| {
+            format!(
+                "- {} (tier {}, {} glob(s))",
+                l.name,
+                l.tier,
+                l.writable.len()
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let prompt = format!(
@@ -558,8 +556,7 @@ pub fn compute_llm_adjacency(
         rationale: String,
     }
     let parsed: Moves = parse_json_object(&output)?;
-    let valid: std::collections::HashSet<&str> =
-        leaves.iter().map(|l| l.name.as_str()).collect();
+    let valid: std::collections::HashSet<&str> = leaves.iter().map(|l| l.name.as_str()).collect();
     let mut grouped: std::collections::HashMap<String, Vec<(String, i64, String, String)>> =
         std::collections::HashMap::new();
     for m in parsed.moves {
@@ -669,11 +666,7 @@ pub struct RefineReport {
 /// Run one refinement pass over the current leaf domains. Explicit and
 /// opt-in only -- this is the deliberate, model-calling Biplane invocation
 /// R19 allows. Never called from the squire.
-pub fn refine(
-    ctx: &Context,
-    model: &str,
-    decider: &dyn SplitDecider,
-) -> Result<RefineReport> {
+pub fn refine(ctx: &Context, model: &str, decider: &dyn SplitDecider) -> Result<RefineReport> {
     let pass_no = store::next_refinement_pass(&ctx.conn)?;
     let leaves = leaf_domains(&ctx.conn)?;
     let max_tier = ctx.config.biplane.max_granularity_tier.clone();
@@ -717,7 +710,13 @@ pub fn refine(
             ));
             continue;
         }
-        match split_domain(ctx, &leaf.name, &decision.children, &decision.rationale, pass_no)? {
+        match split_domain(
+            ctx,
+            &leaf.name,
+            &decision.children,
+            &decision.rationale,
+            pass_no,
+        )? {
             SplitOutcome::Applied(children) => {
                 report
                     .splits_applied
@@ -786,13 +785,15 @@ pub fn cmd_split(ctx: &Context, action: &crate::cli::SplitAction) -> Result<()> 
             if *json {
                 let out: Vec<serde_json::Value> = proposals
                     .iter()
-                    .map(|p| serde_json::json!({
-                        "id": p.id,
-                        "domain": p.domain,
-                        "status": p.status,
-                        "created_at": p.created_at,
-                        "resolved_at": p.resolved_at,
-                    }))
+                    .map(|p| {
+                        serde_json::json!({
+                            "id": p.id,
+                            "domain": p.domain,
+                            "status": p.status,
+                            "created_at": p.created_at,
+                            "resolved_at": p.resolved_at,
+                        })
+                    })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
@@ -809,14 +810,17 @@ pub fn cmd_split(ctx: &Context, action: &crate::cli::SplitAction) -> Result<()> 
             let p = store::get_split_proposal(&ctx.conn, id)?
                 .ok_or_else(|| TrelaneError::msg(format!("unknown split proposal '{id}'")))?;
             if *json {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                    "id": p.id,
-                    "domain": p.domain,
-                    "status": p.status,
-                    "created_at": p.created_at,
-                    "resolved_at": p.resolved_at,
-                    "proposal": serde_json::from_str::<serde_json::Value>(&p.proposal_json)?,
-                }))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "id": p.id,
+                        "domain": p.domain,
+                        "status": p.status,
+                        "created_at": p.created_at,
+                        "resolved_at": p.resolved_at,
+                        "proposal": serde_json::from_str::<serde_json::Value>(&p.proposal_json)?,
+                    }))?
+                );
             } else {
                 println!("id      : {}", p.id);
                 println!("domain  : {}", p.domain);

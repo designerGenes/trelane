@@ -251,7 +251,11 @@ mod tests {
         let (_d, c) = ctx();
         crate::store::insert_message(&c.conn, &msg("m1", "2026-01-01T00:00:00Z")).unwrap();
         sweep(&c, true).unwrap();
-        assert!(crate::store::get_history(&c.conn, None, false).unwrap().is_empty());
+        assert!(
+            crate::store::get_history(&c.conn, None, false)
+                .unwrap()
+                .is_empty()
+        );
         let with_archived = crate::store::get_history(&c.conn, None, true).unwrap();
         assert_eq!(with_archived.len(), 1);
         assert_eq!(with_archived[0].id, "m1");
@@ -267,7 +271,10 @@ mod tests {
         c.config.retention.purge_days = Some(1);
         // Force a second sweep on the "next day" by clearing the gate.
         c.conn
-            .execute("UPDATE project_state SET last_swept_at = NULL WHERE id = 1", [])
+            .execute(
+                "UPDATE project_state SET last_swept_at = NULL WHERE id = 1",
+                [],
+            )
             .unwrap();
         let out = sweep(&c, true).unwrap();
         assert_eq!(out.purged, 1);
