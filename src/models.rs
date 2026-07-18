@@ -419,7 +419,7 @@ impl Default for BiplaneConfig {
 #[serde(default)]
 pub struct BenchConfig {
     /// Free model ids the bench may use. Empty = no restriction. Set via
-    /// `trelane config set bench.free_models '["openrouter/z-ai/glm-5.2"]'`.
+    /// `trelane config set bench.free_models '["openrouter/nvidia/nemotron-3-super-120b-a12b:free"]'`.
     #[serde(default)]
     pub free_models: Vec<String>,
     /// Default --max-turns per agent slice (default 50). A slice ends when

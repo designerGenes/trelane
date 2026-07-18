@@ -2,7 +2,7 @@
   "name": "space_rogue",
   "description": "A roguelike where you pilot a ship through procedurally generated sectors. Example project-description for Biplane's --describe mode.",
   "max_agents": 3,
-  "default_model": "glm-5.2",
+  "default_model": "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
   "domains": [
     {
       "name": "engine",

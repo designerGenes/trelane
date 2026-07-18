@@ -1,7 +1,7 @@
 //! Bench mode: headless free-model orchestration for repeatable benchmarks.
 //!
 //! Bench mode runs a scenario against real free-model agents (e.g. OpenCode
-//! with `--model openrouter/z-ai/glm-5.2`) launched as subprocesses with an
+//! with `--model openrouter/nvidia/nemotron-3-super-120b-a12b:free`) launched as subprocesses with an
 //! explicit `--max-turns` budget. This is the mode that measures generation
 //! speed -- Stub mode writes no real content, and Interactive mode is
 //! tmux-attached and not CI-friendly.
@@ -796,9 +796,9 @@ mod tests {
 
     #[test]
     fn launcher_override_includes_max_turns_and_model() {
-        let cmd = build_launcher_override("openrouter/z-ai/glm-5.2", 50);
+        let cmd = build_launcher_override("openrouter/nvidia/nemotron-3-super-120b-a12b:free", 50);
         assert!(
-            cmd.contains("--model openrouter/z-ai/glm-5.2"),
+            cmd.contains("--model openrouter/nvidia/nemotron-3-super-120b-a12b:free"),
             "has the model: {cmd}"
         );
         assert!(cmd.contains("--max-turns 50"), "has max-turns: {cmd}");
@@ -824,17 +824,21 @@ mod tests {
     fn validate_free_model_passes_when_model_in_list() {
         let mut config = Config::default();
         config.bench.free_models = vec![
-            "openrouter/z-ai/glm-5.2".to_string(),
+            "openrouter/nvidia/nemotron-3-super-120b-a12b:free".to_string(),
             "free-model-x".to_string(),
         ];
-        assert!(validate_free_model(&config, "openrouter/z-ai/glm-5.2").is_ok());
+        assert!(
+            validate_free_model(&config, "openrouter/nvidia/nemotron-3-super-120b-a12b:free")
+                .is_ok()
+        );
         assert!(validate_free_model(&config, "free-model-x").is_ok());
     }
 
     #[test]
     fn validate_free_model_rejects_paid_model() {
         let mut config = Config::default();
-        config.bench.free_models = vec!["openrouter/z-ai/glm-5.2".to_string()];
+        config.bench.free_models =
+            vec!["openrouter/nvidia/nemotron-3-super-120b-a12b:free".to_string()];
         let err = validate_free_model(&config, "anthropic/claude-sonnet-4")
             .unwrap_err()
             .to_string();
