@@ -364,7 +364,7 @@ pub fn cmd_init(project: Option<PathBuf>) -> Result<()> {
 
     std::fs::write(
         trelane_dir.join("prompts").join("bootstrap.md"),
-        prompt::bootstrap_template(),
+        prompt::full_bootstrap(),
     )?;
 
     std::fs::write(
@@ -864,13 +864,47 @@ pub fn cmd_send(
 
 // ------------------------------------------------------------------ inbox
 
-pub fn cmd_inbox(ctx: &Context, agent: &str, json: bool) -> Result<()> {
+pub fn cmd_inbox(ctx: &Context, agent: &str, json: bool, include_archived: bool) -> Result<()> {
     if !store::agent_exists(&ctx.conn, agent)? {
         return Err(TrelaneError::msg(format!("unknown agent '{agent}'")));
     }
     let secret = ctx.secret()?;
-    let msgs = store::get_unprocessed_messages(&ctx.conn, agent)?;
+    let msgs = if include_archived {
+        store::get_unprocessed_messages_opts(&ctx.conn, agent, true)?
+    } else {
+        store::get_unprocessed_messages(&ctx.conn, agent)?
+    };
+    print_messages(&secret, &msgs, json, "(inbox empty)")
+}
 
+// ----------------------------------------------------------------- outbox
+
+/// Outbox surface (4B/OQ4): sent but still-unresolved messages. Readable by
+/// any agent -- the swarm seeing what an agent is waiting on is a feature.
+pub fn cmd_outbox(ctx: &Context, agent: &str, json: bool) -> Result<()> {
+    if !store::agent_exists(&ctx.conn, agent)? {
+        return Err(TrelaneError::msg(format!("unknown agent '{agent}'")));
+    }
+    let secret = ctx.secret()?;
+    let msgs = store::get_outbox(&ctx.conn, agent)?;
+    print_messages(&secret, &msgs, json, "(outbox empty)")
+}
+
+// ---------------------------------------------------------------- history
+
+/// History surface (4B): the full permanent log, threaded via re/supersedes.
+pub fn cmd_history(
+    ctx: &Context,
+    agent: Option<&str>,
+    include_archived: bool,
+    json: bool,
+) -> Result<()> {
+    let secret = ctx.secret()?;
+    let msgs = store::get_history(&ctx.conn, agent, include_archived)?;
+    print_messages(&secret, &msgs, json, "(no history)")
+}
+
+fn print_messages(secret: &[u8], msgs: &[Message], json: bool, empty: &str) -> Result<()> {
     if json {
         let out: Vec<serde_json::Value> = msgs
             .iter()
@@ -879,7 +913,11 @@ pub fn cmd_inbox(ctx: &Context, agent: &str, json: bool) -> Result<()> {
                 if let serde_json::Value::Object(ref mut map) = v {
                     map.insert(
                         "sig_ok".into(),
-                        serde_json::Value::Bool(crypto::verify(&secret, m)),
+                        serde_json::Value::Bool(crypto::verify(secret, m)),
+                    );
+                    map.insert(
+                        "archived".into(),
+                        serde_json::Value::Bool(m.archived_at.is_some()),
                     );
                 }
                 v
@@ -888,26 +926,157 @@ pub fn cmd_inbox(ctx: &Context, agent: &str, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
         if msgs.is_empty() {
-            println!("(inbox empty)");
+            println!("{empty}");
         }
-        for m in &msgs {
-            let ok = if crypto::verify(&secret, m) {
+        for m in msgs {
+            let ok = if crypto::verify(secret, m) {
                 ""
             } else {
                 "  [BAD SIGNATURE -- do not trust]"
             };
+            let archived = if m.archived_at.is_some() {
+                "  [archived]"
+            } else {
+                ""
+            };
             println!(
-                "{}  {:<13} from={:<12} re={:<28} {}{}",
+                "{}  {:<13} from={:<12} re={:<28} {}{}{}",
                 m.id,
                 m.msg_type,
                 m.from,
                 m.re.as_deref().unwrap_or("-"),
                 m.subject,
-                ok
+                ok,
+                archived
             );
         }
     }
     Ok(())
+}
+
+// --------------------------------------------------------------- bulletin
+
+pub fn cmd_bulletin(ctx: &Context, action: &crate::cli::BulletinAction) -> Result<()> {
+    match action {
+        crate::cli::BulletinAction::Post {
+            from,
+            domain,
+            files,
+            body,
+        } => {
+            if !store::agent_exists(&ctx.conn, from)? {
+                return Err(TrelaneError::msg(format!("unknown agent '{from}'")));
+            }
+            let paths: Vec<String> = files
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|p| domain::norm_rel(&ctx.root, p))
+                .collect::<Result<_>>()?;
+            let id = post_bulletin(ctx, from, domain, &paths, body)?;
+            println!("{id}");
+            Ok(())
+        }
+        crate::cli::BulletinAction::List {
+            domain,
+            include_archived,
+            json,
+        } => {
+            let secret = ctx.secret()?;
+            let msgs = store::get_bulletin(&ctx.conn, domain, *include_archived)?;
+            print_messages(&secret, &msgs, *json, "(bulletin board empty)")
+        }
+    }
+}
+
+/// Post a bulletin entry for a domain, superseding the poster's previous
+/// active entry for that scope (R12). Never wakes anyone (R13). Returns the
+/// new message id.
+pub fn post_bulletin(
+    ctx: &Context,
+    from: &str,
+    scope: &str,
+    paths: &[String],
+    body: &str,
+) -> Result<String> {
+    let previous = store::get_active_bulletin_entry(&ctx.conn, scope, from)?;
+    let subject = if paths.is_empty() {
+        format!("bulletin: {from} in {scope}")
+    } else {
+        format!("bulletin: {from} in {scope} ({} file(s))", paths.len())
+    };
+    let mut msg = Message::new(
+        crypto::new_id("msg"),
+        from.to_string(),
+        String::new(), // bulletins are not addressed to anyone
+        "bulletin".to_string(),
+        "low".to_string(),
+        subject,
+        body.to_string(),
+        None,
+        None,
+        paths.to_vec(),
+        crypto::now_iso(),
+    );
+    msg.channel = crate::models::CHANNEL_BULLETIN.to_string();
+    msg.scope = Some(scope.to_string());
+    msg.supersedes = previous.map(|p| p.id);
+    let secret = ctx.secret()?;
+    crypto::sign(&secret, &mut msg);
+    store::insert_message(&ctx.conn, &msg)?;
+    Ok(msg.id)
+}
+
+/// R12 side effect: claiming a path outside the agent's currently-announced
+/// working set auto-posts/updates a bulletin entry. Best-effort and
+/// non-blocking by contract -- a bulletin failure must never fail a claim.
+fn bulletin_autopost_on_claim(ctx: &Context, agent: &str, rel: &str) {
+    let _ = (|| -> Result<()> {
+        // Scope to the domain the claimed path belongs to: the agent's own
+        // domain when it covers the path, otherwise the owning agent's
+        // domain so watchers of that domain see the work.
+        let dom = store::get_domain(&ctx.conn, agent)?
+            .ok_or_else(|| TrelaneError::msg("agent not found"))?;
+        let own_covers = crate::domain::CompiledDomain::from_domain(&dom)?.is_writable(rel);
+        let scope = if own_covers {
+            agent.to_string()
+        } else {
+            owners_of(&ctx.conn, rel, Some(agent))?
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| agent.to_string())
+        };
+        let active = store::get_active_bulletin_entry(&ctx.conn, &scope, agent)?;
+        let mut paths = active
+            .as_ref()
+            .map(|a| a.paths.clone())
+            .unwrap_or_default();
+        if paths.iter().any(|p| p == rel) {
+            return Ok(()); // already announced
+        }
+        paths.push(rel.to_string());
+        post_bulletin(ctx, agent, &scope, &paths, "working-set update (auto-posted on claim)")?;
+        Ok(())
+    })();
+}
+
+// -------------------------------------------------------------- retention
+
+pub fn cmd_retention(ctx: &Context, action: &crate::cli::RetentionAction) -> Result<()> {
+    match action {
+        crate::cli::RetentionAction::Sweep { now } => {
+            let out = crate::retention::sweep(ctx, *now)?;
+            if !out.ran {
+                println!("retention: already swept today (use --now to force)");
+            } else {
+                println!(
+                    "retention: archived {} message(s), purged {}, dormant={}",
+                    out.archived, out.purged, out.dormant
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 // ------------------------------------------------------------------- ack
@@ -1025,6 +1194,8 @@ pub fn cmd_claim(
                 expires_at,
                 &expires_human,
             )?;
+            // R12: keep the bulletin current as the working set changes.
+            bulletin_autopost_on_claim(ctx, agent, &rel);
             println!("renewed lease on {rel} (until {expires_human})");
             return Ok(());
         }
@@ -1053,6 +1224,9 @@ pub fn cmd_claim(
             } else {
                 ""
             };
+            // R12: claiming a path outside the announced working set
+            // auto-posts/updates the bulletin (best-effort, non-blocking).
+            bulletin_autopost_on_claim(ctx, agent, &rel);
             println!("claimed {rel} for {agent}, ttl {ttl}s{tag}");
             Ok(())
         }

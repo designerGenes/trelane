@@ -81,6 +81,12 @@ Requires Rust 1.85+ (edition 2024). SQLite is compiled in via
         --subject "build the login page" --body "..."
     trelane squire --watch          # or: --once from cron
 
+**Liveness boundary (hard rule):** Trelane never restarts the squire itself.
+Keeping the squire alive is the *host supervisor's* job -- launchd, systemd,
+cron (`trelane squire --once`), or a `while true` shell loop. This is
+deliberate: a restarter that can get stuck would need another restarter above
+it, forever (R3). The squire is the bottom of that stack by design.
+
 Or launch everything at once with Biplane:
 
     trelane /path/to/repo --models glm-5.2 --max-agents 3 --with-biplane

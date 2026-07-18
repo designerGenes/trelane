@@ -176,6 +176,11 @@ pub struct DiagnosticState {
     pub session_line: String,
     pub agents: Vec<AgentRow>,
     pub deadlock: Option<String>,
+    /// Live session health for the Overview panel: running/asleep rollup plus
+    /// the static entropy estimate from the latest Biplane analysis. Optional
+    /// so the state can be built without it (e.g. when no analysis has run);
+    /// the render layer shows a friendly placeholder in that case.
+    pub health: Option<SessionHealth>,
     pub fields: Vec<ConfigField>,
     /// Catalog of selectable model/launcher-profile names, plus the
     /// "(default)" sentinel at index 0 meaning "no launcher_agent override".
@@ -204,6 +209,46 @@ pub struct AgentRow {
     pub running: bool,
     pub inbox: usize,
     pub model: String,
+}
+
+/// Live session health shown on the Overview: how many agents are running vs.
+/// asleep, and the static deadlock-likelihood ("entropy") estimate from the
+/// most recent Biplane analysis. This is a display rollup, not a source of
+/// truth — the counts are derived from the agent rows, and the entropy comes
+/// straight from the stored Biplane report.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionHealth {
+    pub running: usize,
+    pub asleep: usize,
+    /// The entropy score (0–100) and its factors from the latest analysis, or
+    /// None if no analysis has produced one yet.
+    pub entropy: Option<crate::entropy::EntropyScore>,
+}
+
+impl SessionHealth {
+    /// Build the running/asleep rollup from agent rows, attaching an optional
+    /// entropy score. Pure: the counts are a fold over the rows, so this is
+    /// unit-tested without a live session.
+    pub fn from_rows(
+        agents: &[AgentRow],
+        entropy: Option<crate::entropy::EntropyScore>,
+    ) -> Self {
+        let running = agents.iter().filter(|a| a.running).count();
+        SessionHealth {
+            running,
+            asleep: agents.len() - running,
+            entropy,
+        }
+    }
+
+    /// One-line entropy summary for compact display, e.g. "HIGH (62)". Returns
+    /// a placeholder when no analysis has run, so the panel never renders blank.
+    pub fn entropy_line(&self) -> String {
+        match &self.entropy {
+            Some(e) => format!("{} ({})", e.level().label(), e.score),
+            None => "not analyzed".to_string(),
+        }
+    }
 }
 
 impl DiagnosticState {
@@ -241,6 +286,87 @@ impl DiagnosticState {
                     min: 30,
                     max: 86_400,
                     step: 30,
+                },
+            },
+            ConfigField {
+                key: "squire.breaker_escalation_count",
+                label: "Breaker escalation count",
+                value: FieldValue::Uint {
+                    value: config.squire.breaker_escalation_count as u64,
+                    min: 1,
+                    max: 100,
+                    step: 1,
+                },
+            },
+            ConfigField {
+                key: "squire.starvation_ticks",
+                label: "Starvation guarantee (ticks)",
+                value: FieldValue::Uint {
+                    value: config.squire.starvation_ticks as u64,
+                    min: 1,
+                    max: 10_000,
+                    step: 1,
+                },
+            },
+            ConfigField {
+                key: "di.objection_window_s",
+                label: "DI objection window (s)",
+                value: FieldValue::Uint {
+                    value: config.di.objection_window_s,
+                    min: 0,
+                    max: 86_400,
+                    step: 30,
+                },
+            },
+            ConfigField {
+                key: "di.request_timeout_s",
+                label: "DI request timeout (s)",
+                value: FieldValue::Uint {
+                    value: config.di.request_timeout_s,
+                    min: 60,
+                    max: 604_800,
+                    step: 60,
+                },
+            },
+            ConfigField {
+                key: "di.claim_contested_timeout_s",
+                label: "DI claim-contested timeout (s)",
+                value: FieldValue::Uint {
+                    value: config.di.claim_contested_timeout_s,
+                    min: 60,
+                    max: 604_800,
+                    step: 60,
+                },
+            },
+            ConfigField {
+                key: "retention.hot_days",
+                label: "Retention hot window (days)",
+                value: FieldValue::Uint {
+                    value: config.retention.hot_days,
+                    min: 1,
+                    max: 3650,
+                    step: 1,
+                },
+            },
+            ConfigField {
+                key: "retention.dormant_days",
+                label: "Project dormant window (days)",
+                value: FieldValue::Uint {
+                    value: config.retention.dormant_days,
+                    min: 1,
+                    max: 3650,
+                    step: 1,
+                },
+            },
+            ConfigField {
+                key: "retention.purge_days",
+                label: "Retention purge (days)",
+                value: FieldValue::OptUint {
+                    value: config.retention.purge_days,
+                    default_on: 365,
+                    min: 1,
+                    max: 3650,
+                    step: 1,
                 },
             },
             ConfigField {
@@ -290,6 +416,30 @@ impl DiagnosticState {
                 ("squire.reply_timeout_s", FieldValue::OptUint { value, .. }) => {
                     config.squire.reply_timeout_s = *value
                 }
+                ("squire.breaker_escalation_count", FieldValue::Uint { value, .. }) => {
+                    config.squire.breaker_escalation_count = *value as i64
+                }
+                ("squire.starvation_ticks", FieldValue::Uint { value, .. }) => {
+                    config.squire.starvation_ticks = *value as i64
+                }
+                ("di.objection_window_s", FieldValue::Uint { value, .. }) => {
+                    config.di.objection_window_s = *value
+                }
+                ("di.request_timeout_s", FieldValue::Uint { value, .. }) => {
+                    config.di.request_timeout_s = *value
+                }
+                ("di.claim_contested_timeout_s", FieldValue::Uint { value, .. }) => {
+                    config.di.claim_contested_timeout_s = *value
+                }
+                ("retention.hot_days", FieldValue::Uint { value, .. }) => {
+                    config.retention.hot_days = *value
+                }
+                ("retention.dormant_days", FieldValue::Uint { value, .. }) => {
+                    config.retention.dormant_days = *value
+                }
+                ("retention.purge_days", FieldValue::OptUint { value, .. }) => {
+                    config.retention.purge_days = *value
+                }
                 ("claims.default_ttl_s", FieldValue::Uint { value, .. }) => {
                     config.claims.default_ttl_s = *value
                 }
@@ -328,6 +478,7 @@ impl DiagnosticState {
             session_line,
             agents,
             deadlock,
+            health: None,
             fields: Self::fields_from_config(config),
             models,
             pending_models: std::collections::HashMap::new(),
@@ -338,6 +489,14 @@ impl DiagnosticState {
             should_quit: false,
             status: None,
         }
+    }
+
+    /// Attach session health for the Overview. Kept as a separate builder so
+    /// the `new` signature is unchanged — any existing caller keeps compiling,
+    /// and the health panel is purely additive. Chainable.
+    pub fn with_health(mut self, health: SessionHealth) -> Self {
+        self.health = Some(health);
+        self
     }
 
     /// Index of a model name in the catalog, defaulting to 0 ("(default)")
@@ -572,13 +731,27 @@ fn gather_state(ctx: &crate::Context) -> Result<DiagnosticState> {
         .unwrap_or_else(|| ctx.root.display().to_string());
     let session_line = format!("{} agent(s) | {}", agent_names.len(), state_label);
 
+    // Pull the entropy estimate from the latest stored Biplane report, if one
+    // exists. Best-effort: a missing or unparseable report just means the
+    // health panel shows "not analyzed" rather than failing the whole view.
+    let entropy = {
+        let report_path = ctx.trelane_dir().join("biplane-report.json");
+        std::fs::read_to_string(&report_path)
+            .ok()
+            .and_then(|txt| serde_json::from_str::<serde_json::Value>(&txt).ok())
+            .and_then(|v| v.get("entropy").cloned())
+            .and_then(|e| serde_json::from_value::<crate::entropy::EntropyScore>(e).ok())
+    };
+    let health = SessionHealth::from_rows(&rows, entropy);
+
     Ok(DiagnosticState::new(
         project,
         session_line,
         rows,
         deadlock,
         &ctx.config,
-    ))
+    )
+    .with_health(health))
 }
 
 fn run_loop(ctx: &crate::Context, state: &mut DiagnosticState) -> Result<()> {
@@ -753,6 +926,57 @@ fn render(f: &mut ratatui::Frame, state: &DiagnosticState) {
                     Span::styled("none", Style::default().fg(theme_color(THEME_OK))),
                 ])),
             }
+            lines.push(Line::from(""));
+
+            // Session-health panel: running/asleep rollup + entropy estimate.
+            // Rendered from state.health when present; absent only if the state
+            // was built without it (e.g. a caller that skipped with_health).
+            if let Some(h) = &state.health {
+                lines.push(Line::from(vec![
+                    Span::styled("Agents:   ", Style::default().fg(dim)),
+                    Span::styled(
+                        format!("{} running", h.running),
+                        Style::default().fg(theme_color(THEME_OK)),
+                    ),
+                    Span::styled("  /  ", Style::default().fg(dim)),
+                    Span::styled(
+                        format!("{} asleep", h.asleep),
+                        Style::default().fg(dim),
+                    ),
+                ]));
+
+                // Entropy line, colored by band so a glance conveys risk.
+                let (etext, ecolor) = match &h.entropy {
+                    Some(e) => {
+                        use crate::entropy::EntropyLevel::*;
+                        let c = match e.level() {
+                            Low => THEME_OK,
+                            Moderate => THEME_BIPLANE_ACCENT,
+                            High | Critical => THEME_WARN,
+                        };
+                        (h.entropy_line(), theme_color(c))
+                    }
+                    None => (h.entropy_line(), dim),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("Entropy:  ", Style::default().fg(dim)),
+                    Span::styled(etext, Style::default().fg(ecolor).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "  (static deadlock-likelihood estimate)",
+                        Style::default().fg(dim),
+                    ),
+                ]));
+                // Top entropy factor, if any, so the number is explained inline.
+                if let Some(e) = &h.entropy {
+                    if let Some(top) = e.factors.first() {
+                        lines.push(Line::from(vec![
+                            Span::styled("          ", Style::default().fg(dim)),
+                            Span::styled(format!("↳ {top}"), Style::default().fg(dim)),
+                        ]));
+                    }
+                }
+            }
+
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "Tab: switch view   ↑↓: move   ←→/space: edit (Config)   s: save   K: kill   q: quit",
@@ -1211,5 +1435,49 @@ mod tests {
         s.mark_models_saved();
         assert!(!s.models_dirty);
         assert!(s.pending_models.is_empty());
+    }
+
+    // ------------------------------------------------------ SessionHealth
+
+    fn rows_2r_1a() -> Vec<AgentRow> {
+        vec![
+            AgentRow { name: "a".into(), domain: "src/a/**".into(), running: true, inbox: 0, model: "m".into() },
+            AgentRow { name: "b".into(), domain: "src/b/**".into(), running: true, inbox: 1, model: "m".into() },
+            AgentRow { name: "c".into(), domain: "src/c/**".into(), running: false, inbox: 0, model: "m".into() },
+        ]
+    }
+
+    #[test]
+    fn health_rollup_counts_running_and_asleep() {
+        let h = SessionHealth::from_rows(&rows_2r_1a(), None);
+        assert_eq!(h.running, 2);
+        assert_eq!(h.asleep, 1);
+    }
+
+    #[test]
+    fn health_entropy_line_placeholder_when_unanalyzed() {
+        let h = SessionHealth::from_rows(&rows_2r_1a(), None);
+        assert_eq!(h.entropy_line(), "not analyzed");
+    }
+
+    #[test]
+    fn health_entropy_line_formats_level_and_score() {
+        let e = crate::entropy::EntropyScore {
+            score: 62,
+            factors: vec!["overlapping globs".into()],
+        };
+        let h = SessionHealth::from_rows(&rows_2r_1a(), Some(e));
+        // 62 lands in the High band per entropy::EntropyScore::level.
+        assert_eq!(h.entropy_line(), "HIGH (62)");
+    }
+
+    #[test]
+    fn with_health_attaches_and_is_optional() {
+        let s = state_with_defaults();
+        assert!(s.health.is_none(), "health absent until attached");
+        let h = SessionHealth::from_rows(&s.agents, None);
+        let s = s.with_health(h);
+        assert!(s.health.is_some());
+        assert_eq!(s.health.as_ref().unwrap().running, 1); // alpha running, beta not
     }
 }

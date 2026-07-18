@@ -181,6 +181,7 @@ CREATE TABLE IF NOT EXISTS task_submissions (
     summary           TEXT NOT NULL DEFAULT '',
     tests             TEXT NOT NULL DEFAULT '',
     changed_paths_json TEXT NOT NULL DEFAULT '[]',
+    message_id        TEXT NOT NULL DEFAULT '',
     status            TEXT NOT NULL DEFAULT 'pending',
     created_at        TEXT NOT NULL,
     reviewed_at       TEXT
@@ -262,6 +263,56 @@ CREATE TABLE IF NOT EXISTS completion_attestations (
 
 CREATE INDEX IF NOT EXISTS idx_completion_recorded_at
     ON completion_attestations(recorded_at);
+"#;
+
+/// Slice 4 bundle (GAP-03/04/05/07): TMP envelope columns on messages, the
+/// four-surface message model, retention timestamps, domain-intrusion
+/// tables, and the singleton project-state record.
+const SCHEMA_V11: &str = r#"
+-- 4B/4D: TMP envelope + retention columns on messages.
+ALTER TABLE messages ADD COLUMN channel TEXT NOT NULL DEFAULT 'direct';
+ALTER TABLE messages ADD COLUMN scope TEXT;
+ALTER TABLE messages ADD COLUMN supersedes TEXT;
+ALTER TABLE messages ADD COLUMN tmp_version TEXT NOT NULL DEFAULT '1.0';
+ALTER TABLE messages ADD COLUMN last_touched_at TEXT;
+ALTER TABLE messages ADD COLUMN archived_at TEXT;
+UPDATE messages SET last_touched_at = created_at WHERE last_touched_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_channel_scope ON messages(channel, scope);
+CREATE INDEX IF NOT EXISTS idx_messages_supersedes ON messages(supersedes);
+CREATE INDEX IF NOT EXISTS idx_messages_last_touched ON messages(last_touched_at);
+
+-- 4A: domain intrusion requests (R9/R25). Approvals live in a child table
+-- since more than one may arrive before resolution.
+CREATE TABLE IF NOT EXISTS domain_intrusion_requests (
+    id                 TEXT PRIMARY KEY,
+    requester_agent    TEXT NOT NULL,
+    target_domain      TEXT NOT NULL,
+    path_glob          TEXT NOT NULL,
+    purpose            TEXT NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'pending',
+    created_at         TEXT NOT NULL,
+    objection_deadline TEXT NOT NULL,
+    resolved_at        TEXT,
+    veto_agent         TEXT,
+    veto_reason        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_di_requests_status
+    ON domain_intrusion_requests(status);
+
+CREATE TABLE IF NOT EXISTS domain_intrusion_approvals (
+    request_id TEXT NOT NULL,
+    agent      TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (request_id, agent)
+);
+
+-- 4D: singleton project-level record (retention sweep marker, dormancy flag).
+CREATE TABLE IF NOT EXISTS project_state (
+    id            INTEGER PRIMARY KEY CHECK (id = 1),
+    last_swept_at TEXT,
+    dormant       INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO project_state (id) VALUES (1);
 "#;
 
 pub fn open(db_path: &std::path::Path) -> Result<Connection> {
@@ -373,7 +424,54 @@ fn migrate(conn: &Connection) -> Result<()> {
         // C7: project completion and validation state.
         conn.execute_batch(SCHEMA_C7)?;
         conn.execute_batch("PRAGMA user_version = 10;")?;
+        version = 10;
     }
+    if version < 11 {
+        // Slice 4: TMP envelope, retention, domain intrusion, project state.
+        conn.execute_batch(SCHEMA_V11)?;
+        conn.execute_batch("PRAGMA user_version = 11;")?;
+    }
+    if version < 12 {
+        // R23: per-agent starvation counter. Tracks consecutive squire ticks
+        // on which an agent was a valid wake candidate but got deferred past
+        // the concurrency budget. Once the count reaches squire.starvation_ticks
+        // the candidate is promoted ahead of ordinary ordering so it can't be
+        // perpetually starved by lower sort priority.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS agent_starvation (
+                agent            TEXT PRIMARY KEY,
+                deferred_ticks   INTEGER NOT NULL DEFAULT 0,
+                last_deferred_at TEXT
+            );",
+        )?;
+        conn.execute_batch("PRAGMA user_version = 12;")?;
+    }
+
+    // Repair: task_submissions.message_id is referenced by the C2 code path
+    // but was missing from the original C2 migration. Add it wherever absent,
+    // regardless of how the database reached its current version.
+    ensure_column(
+        conn,
+        "task_submissions",
+        "message_id",
+        "message_id TEXT NOT NULL DEFAULT ''",
+    )?;
+    Ok(())
+}
+
+/// Add a column to a table only if it is not already present. SQLite has no
+/// `IF NOT EXISTS` for columns, so guard with `PRAGMA table_info`. No-op when
+/// the table itself does not exist (e.g. a partially-migrated test fixture).
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|n| n.ok())
+        .collect();
+    if columns.is_empty() || columns.iter().any(|n| n == column) {
+        return Ok(());
+    }
+    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {decl};"))?;
     Ok(())
 }
 
@@ -398,7 +496,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 12);
         assert!(has_column(&conn, "claims", "delegation_id"));
         assert!(has_column(&conn, "delegations", "offer_message"));
         assert!(has_column(&conn, "task_submissions", "message_id"));
@@ -434,7 +532,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 12);
     }
 
     #[test]
@@ -458,7 +556,40 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 12);
+    }
+
+    #[test]
+    fn version_ten_database_gains_slice4_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch("PRAGMA user_version = 10;").unwrap();
+        migrate(&conn).unwrap();
+        for col in [
+            "channel",
+            "scope",
+            "supersedes",
+            "tmp_version",
+            "last_touched_at",
+            "archived_at",
+        ] {
+            assert!(has_column(&conn, "messages", col), "missing messages.{col}");
+        }
+        assert!(has_column(&conn, "domain_intrusion_requests", "purpose"));
+        assert!(has_column(
+            &conn,
+            "domain_intrusion_requests",
+            "objection_deadline"
+        ));
+        assert!(has_column(&conn, "domain_intrusion_approvals", "agent"));
+        assert!(has_column(&conn, "project_state", "last_swept_at"));
+        assert!(has_column(&conn, "project_state", "dormant"));
+        let version: u32 = conn
+            .query_row("SELECT user_version FROM pragma_user_version", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 12);
     }
 
     #[test]

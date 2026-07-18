@@ -1,0 +1,824 @@
+[1m[92m   Compiling[0m trelane v0.3.0 (/Users/jadennation/DEV/01_active_projects/trelane)
+[1m[91merror[0m[1m: expected pattern, found `let`[0m
+    [1m[94m--> [0msrc/biplane.rs:1756:5
+     [1m[94m|[0m
+[1m[94m1756[0m [1m[94m|[0m     let now = crate::crypto::now_iso();
+     [1m[94m|[0m     [1m[91m^^^[0m
+     [1m[94m|[0m
+[1m[96mhelp[0m: remove the unnecessary `let` keyword
+     [1m[94m|[0m
+[1m[94m1756[0m [91m- [0m    [91mlet [0mnow = crate::crypto::now_iso();
+[1m[94m1756[0m [92m+ [0m    now = crate::crypto::now_iso();
+     [1m[94m|[0m
+
+[1m[91merror[0m[1m: expected one of `=>`, `@`, `if`, or `|`, found `=`[0m
+    [1m[94m--> [0msrc/biplane.rs:1756:13
+     [1m[94m|[0m
+[1m[94m1756[0m [1m[94m|[0m     let now = crate::crypto::now_iso();
+     [1m[94m|[0m             [1m[91m^[0m
+     [1m[94m|[0m             [1m[91m|[0m
+     [1m[94m|[0m             [1m[91mexpected one of `=>`, `@`, `if`, or `|`[0m
+     [1m[94m|[0m             [1m[91mhelp: use a fat arrow to start a match arm: `=>`[0m
+
+[1m[91merror[0m[1m: `match` arm body without braces[0m
+    [1m[94m--> [0msrc/biplane.rs:1756:15
+     [1m[94m|[0m
+[1m[94m1756[0m [1m[94m|[0m     let now = crate::crypto::now_iso();
+     [1m[94m|[0m             [1m[94m-[0m [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mthis statement is not surrounded by a body[0m
+     [1m[94m|[0m             [1m[94m|[0m
+     [1m[94m|[0m             [1m[94mwhile parsing the `match` arm starting here[0m
+     [1m[94m|[0m
+[1m[96mhelp[0m: replace `;` with `,` to end a `match` arm expression
+     [1m[94m|[0m
+[1m[94m1756[0m [91m- [0m    let now = crate::crypto::now_iso()[91m;[0m
+[1m[94m1756[0m [92m+ [0m    let now = crate::crypto::now_iso()[92m,[0m
+     [1m[94m|[0m
+
+[1m[91merror[0m[1m: expected item after doc comment[0m
+    [1m[94m--> [0msrc/biplane.rs:1761:1
+     [1m[94m|[0m
+[1m[94m1761[0m [1m[94m|[0m /// Register the plan's agents in a live session and queue their planned work as
+     [1m[94m|[0m [1m[91m^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^[0m [1m[91mthis doc comment doesn't document anything[0m
+
+[1m[91merror[0m[1m: expected identifier, found keyword `pub`[0m
+   [1m[94m--> [0msrc/models.rs:370:1
+    [1m[94m|[0m
+[1m[94m370[0m [1m[94m|[0m pub const TASK_STATES: &[&str] = &[
+    [1m[94m|[0m [1m[91m^^^[0m [1m[91mexpected identifier, found keyword[0m
+
+[1m[91merror[0m[1m: expected one of `:` or `|`, found keyword `const`[0m
+   [1m[94m--> [0msrc/models.rs:370:5
+    [1m[94m|[0m
+[1m[94m370[0m [1m[94m|[0m pub const TASK_STATES: &[&str] = &[
+    [1m[94m|[0m     [1m[91m^^^^^[0m [1m[91mexpected one of `:` or `|`[0m
+
+[1m[91merror[E0432][0m[1m: unresolved imports `crate::models::AssistPolicy`, `crate::models::Delegation`, `crate::models::DelegationStatus`, `crate::models::ReviewDecision`, `crate::models::Task`, `crate::models::TaskAssignment`, `crate::models::TaskReview`, `crate::models::TaskRole`, `crate::models::TaskState`[0m
+ [1m[94m--> [0msrc/store.rs:3:27
+  [1m[94m|[0m
+[1m[94m3[0m [1m[94m|[0m     AssistDiscoveryState, AssistPolicy, CompletionBlocker, Delegation, DelegationStatus,
+  [1m[94m|[0m                           [1m[91m^^^^^^^^^^^^[0m                     [1m[91m^^^^^^^^^^[0m  [1m[91m^^^^^^^^^^^^^^^^[0m [1m[91mno `DelegationStatus` in `models`[0m
+  [1m[94m|[0m                           [1m[91m|[0m                                [1m[91m|[0m
+  [1m[94m|[0m                           [1m[91m|[0m                                [1m[91mno `Delegation` in `models`[0m
+  [1m[94m|[0m                           [1m[91mno `AssistPolicy` in `models`[0m
+[1m[94m4[0m [1m[94m|[0m     Domain, LaunchTarget, Lease, Message, ParkedTask, ProjectCompletionReport, ReviewDecision,
+  [1m[94m|[0m                                                                                [1m[91m^^^^^^^^^^^^^^[0m [1m[91mno `ReviewDecision` in `models`[0m
+[1m[94m5[0m [1m[94m|[0m     RunningLock, Task, TaskAssignment, TaskReview, TaskRole, TaskState, TaskSubmission, Violation,
+  [1m[94m|[0m                  [1m[91m^^^^[0m  [1m[91m^^^^^^^^^^^^^^[0m  [1m[91m^^^^^^^^^^[0m  [1m[91m^^^^^^^^[0m  [1m[91m^^^^^^^^^[0m [1m[91mno `TaskState` in `models`[0m
+  [1m[94m|[0m                  [1m[91m|[0m     [1m[91m|[0m               [1m[91m|[0m           [1m[91m|[0m
+  [1m[94m|[0m                  [1m[91m|[0m     [1m[91m|[0m               [1m[91m|[0m           [1m[91mno `TaskRole` in `models`[0m
+  [1m[94m|[0m                  [1m[91m|[0m     [1m[91m|[0m               [1m[91mno `TaskReview` in `models`[0m
+  [1m[94m|[0m                  [1m[91m|[0m     [1m[91mno `TaskAssignment` in `models`[0m
+  [1m[94m|[0m                  [1m[91mno `Task` in `models`[0m
+
+[1m[91merror[E0432][0m[1m: unresolved imports `crate::models::AssistPolicy`, `crate::models::Delegation`, `crate::models::DelegationStatus`, `crate::models::Task`, `crate::models::TaskAssignment`, `crate::models::TaskRole`, `crate::models::TaskState`[0m
+   [1m[94m--> [0msrc/squire.rs:991:9
+    [1m[94m|[0m
+[1m[94m991[0m [1m[94m|[0m         AssistPolicy, Delegation, DelegationStatus, Task, TaskAssignment, TaskRole, TaskState,
+    [1m[94m|[0m         [1m[91m^^^^^^^^^^^^[0m  [1m[91m^^^^^^^^^^[0m  [1m[91m^^^^^^^^^^^^^^^^[0m  [1m[91m^^^^[0m  [1m[91m^^^^^^^^^^^^^^[0m  [1m[91m^^^^^^^^[0m  [1m[91m^^^^^^^^^[0m [1m[91mno `TaskState` in `models`[0m
+    [1m[94m|[0m         [1m[91m|[0m             [1m[91m|[0m           [1m[91m|[0m                 [1m[91m|[0m     [1m[91m|[0m               [1m[91m|[0m
+    [1m[94m|[0m         [1m[91m|[0m             [1m[91m|[0m           [1m[91m|[0m                 [1m[91m|[0m     [1m[91m|[0m               [1m[91mno `TaskRole` in `models`[0m
+    [1m[94m|[0m         [1m[91m|[0m             [1m[91m|[0m           [1m[91m|[0m                 [1m[91m|[0m     [1m[91mno `TaskAssignment` in `models`[0m
+    [1m[94m|[0m         [1m[91m|[0m             [1m[91m|[0m           [1m[91m|[0m                 [1m[91mno `Task` in `models`[0m
+    [1m[94m|[0m         [1m[91m|[0m             [1m[91m|[0m           [1m[91mno `DelegationStatus` in `models`[0m
+    [1m[94m|[0m         [1m[91m|[0m             [1m[91mno `Delegation` in `models`[0m
+    [1m[94m|[0m         [1m[91mno `AssistPolicy` in `models`[0m
+
+[1m[91merror[E0425][0m[1m: cannot find type `Task` in this scope[0m
+   [1m[94m--> [0msrc/commands.rs:155:12
+    [1m[94m|[0m
+[1m[94m155[0m [1m[94m|[0m     task: &Task,
+    [1m[94m|[0m            [1m[91m^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m: cannot find type `Delegation` in this scope[0m
+   [1m[94m--> [0msrc/commands.rs:182:35
+    [1m[94m|[0m
+[1m[94m182[0m [1m[94m|[0m fn delegation_expiry(delegation: &Delegation) -> Result<chrono::DateTime<chrono::Utc>> {
+    [1m[94m|[0m                                   [1m[91m^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m: cannot find type `Delegation` in this scope[0m
+   [1m[94m--> [0msrc/commands.rs:194:18
+    [1m[94m|[0m
+[1m[94m194[0m [1m[94m|[0m     delegation: &Delegation,
+    [1m[94m|[0m                  [1m[91m^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m: cannot find type `Delegation` in this scope[0m
+   [1m[94m--> [0msrc/commands.rs:229:14
+    [1m[94m|[0m
+[1m[94m229[0m [1m[94m|[0m ) -> Result<(Delegation, chrono::DateTime<chrono::Utc>)> {
+    [1m[94m|[0m              [1m[91m^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+    [1m[94m|[0m
+[1m[96mhelp[0m: you might be missing a type parameter
+    [1m[94m|[0m
+[1m[94m222[0m [1m[94m| [0mfn authorize_delegated_claim[92m<Delegation>[0m(
+    [1m[94m|[0m                             [92m++++++++++++[0m
+
+[1m[91merror[E0425][0m[1m: cannot find type `Task` in this scope[0m
+    [1m[94m--> [0msrc/commands.rs:1857:86
+     [1m[94m|[0m
+[1m[94m1857[0m [1m[94m|[0m fn require_open_assistable_task(ctx: &Context, task_id: &str, owner: &str) -> Result<Task> {
+     [1m[94m|[0m                                                                                      [1m[91m^^^^[0m [1m[91mnot found in this scope[0m
+     [1m[94m|[0m
+[1m[96mhelp[0m: you might be missing a type parameter
+     [1m[94m|[0m
+[1m[94m1857[0m [1m[94m| [0mfn require_open_assistable_task[92m<Task>[0m(ctx: &Context, task_id: &str, owner: &str) -> Result<Task> {
+     [1m[94m|[0m                                [92m++++++[0m
+
+[1m[91merror[E0422][0m[1m: cannot find struct, variant or union type `Delegation` in this scope[0m
+    [1m[94m--> [0msrc/commands.rs:2006:22
+     [1m[94m|[0m
+[1m[94m2006[0m [1m[94m|[0m     let delegation = Delegation {
+     [1m[94m|[0m                      [1m[91m^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m: cannot find value `TASK_STATES` in this scope[0m
+    [1m[94m--> [0msrc/commands.rs:2277:17
+     [1m[94m|[0m
+[1m[94m2277[0m [1m[94m|[0m                 TASK_STATES.join(", ")
+     [1m[94m|[0m                 [1m[91m^^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0422][0m[1m: cannot find struct, variant or union type `Task` in this scope[0m
+    [1m[94m--> [0msrc/commands.rs:2475:16
+     [1m[94m|[0m
+[1m[94m2475[0m [1m[94m|[0m     let task = Task {
+     [1m[94m|[0m                [1m[91m^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m: cannot find type `Delegation` in this scope[0m
+    [1m[94m--> [0msrc/commands.rs:2594:60
+     [1m[94m|[0m
+[1m[94m2594[0m [1m[94m|[0m fn invalidate_stale_delegation(ctx: &Context, delegation: &Delegation, reason: &str) -> Result<()> {
+     [1m[94m|[0m                                                            [1m[91m^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m: cannot find type `Task` in this scope[0m
+    [1m[94m--> [0msrc/commands.rs:2615:12
+     [1m[94m|[0m
+[1m[94m2615[0m [1m[94m|[0m     task: &Task,
+     [1m[94m|[0m            [1m[91m^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m: cannot find type `Delegation` in this scope[0m
+    [1m[94m--> [0msrc/commands.rs:2616:18
+     [1m[94m|[0m
+[1m[94m2616[0m [1m[94m|[0m     delegation: &Delegation,
+     [1m[94m|[0m                  [1m[91m^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0422][0m[1m: cannot find struct, variant or union type `TaskReview` in this scope[0m
+    [1m[94m--> [0msrc/commands.rs:2819:18
+     [1m[94m|[0m
+[1m[94m2819[0m [1m[94m|[0m     let review = TaskReview {
+     [1m[94m|[0m                  [1m[91m^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m: cannot find value `from` in this scope[0m
+   [1m[94m--> [0msrc/models.rs:638:13
+    [1m[94m|[0m
+[1m[94m638[0m [1m[94m|[0m             from,
+    [1m[94m|[0m             [1m[91m^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0425][0m[1m: cannot find value `to` in this scope[0m
+   [1m[94m--> [0msrc/models.rs:639:13
+    [1m[94m|[0m
+[1m[94m639[0m [1m[94m|[0m             to,
+    [1m[94m|[0m             [1m[91m^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0282][0m[1m: type annotations needed[0m
+  [1m[94m--> [0msrc/biplane_ui.rs:54:19
+   [1m[94m|[0m
+[1m[94m54[0m [1m[94m|[0m             .map(|d| DomainRow {
+   [1m[94m|[0m                   [1m[91m^[0m
+[1m[94m55[0m [1m[94m|[0m                 spec: d.clone(),
+   [1m[94m|[0m                       [1m[94m-[0m [1m[94mtype must be known at this point[0m
+   [1m[94m|[0m
+[1m[96mhelp[0m: consider giving this closure parameter an explicit type
+   [1m[94m|[0m
+[1m[94m54[0m [1m[94m| [0m            .map(|d[92m: /* Type */[0m| DomainRow {
+   [1m[94m|[0m                    [92m++++++++++++[0m
+
+[1m[91merror[E0282][0m[1m: type annotations needed[0m
+  [1m[94m--> [0msrc/biplane_ui.rs:94:30
+   [1m[94m|[0m
+[1m[94m94[0m [1m[94m|[0m                     .retain(|dep| included.contains(dep.as_str()));
+   [1m[94m|[0m                              [1m[91m^^^[0m                    [1m[94m---[0m [1m[94mtype must be known at this point[0m
+   [1m[94m|[0m
+[1m[96mhelp[0m: consider giving this closure parameter an explicit type
+   [1m[94m|[0m
+[1m[94m94[0m [1m[94m| [0m                    .retain(|dep[92m: /* Type */[0m| included.contains(dep.as_str()));
+   [1m[94m|[0m                                 [92m++++++++++++[0m
+
+[1m[91merror[E0422][0m[1m: cannot find struct, variant or union type `Task` in this scope[0m
+    [1m[94m--> [0msrc/commands.rs:2911:14
+     [1m[94m|[0m
+[1m[94m2911[0m [1m[94m|[0m             &Task {
+     [1m[94m|[0m              [1m[91m^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0422][0m[1m: cannot find struct, variant or union type `Delegation` in this scope[0m
+    [1m[94m--> [0msrc/commands.rs:2954:14
+     [1m[94m|[0m
+[1m[94m2954[0m [1m[94m|[0m             &Delegation {
+     [1m[94m|[0m              [1m[91m^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0422][0m[1m: cannot find struct, variant or union type `Task` in this scope[0m
+    [1m[94m--> [0msrc/commands.rs:3194:24
+     [1m[94m|[0m
+[1m[94m3194[0m [1m[94m|[0m         let mut task = Task {
+     [1m[94m|[0m                        [1m[91m^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0422][0m[1m: cannot find struct, variant or union type `Delegation` in this scope[0m
+    [1m[94m--> [0msrc/commands.rs:3211:26
+     [1m[94m|[0m
+[1m[94m3211[0m [1m[94m|[0m         let delegation = Delegation {
+     [1m[94m|[0m                          [1m[91m^^^^^^^^^^[0m [1m[91mnot found in this scope[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `DelegationStatus`[0m
+   [1m[94m--> [0msrc/commands.rs:232:29
+    [1m[94m|[0m
+[1m[94m232[0m [1m[94m|[0m     if delegation.status != DelegationStatus::Active {
+    [1m[94m|[0m                             [1m[91m^^^^^^^^^^^^^^^^[0m [1m[91muse of undeclared type `DelegationStatus`[0m
+
+[1m[91merror[E0308][0m[1m: mismatched types[0m
+   [1m[94m--> [0msrc/commands.rs:773:13
+    [1m[94m|[0m
+[1m[94m773[0m [1m[94m|[0m [1m[91m/[0m             format!(
+[1m[94m774[0m [1m[94m|[0m [1m[91m|[0m                 "Agent '{agent}' updated its writable globs to: {}",
+[1m[94m775[0m [1m[94m|[0m [1m[91m|[0m                 writable.join(", ")
+[1m[94m776[0m [1m[94m|[0m [1m[91m|[0m             ),
+    [1m[94m|[0m [1m[91m|_____________^[0m [1m[91mexpected `Option<String>`, found `String`[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: expected enum `[1m[35mstd::option::Option[0m[1m[35m<[0mstd::string::String[1m[35m>[0m`
+             found struct `std::string::String`
+    [1m[94m= [0m[1mnote[0m: this error originates in the macro `format` (in Nightly builds, run with -Z macro-backtrace for more info)
+[1m[96mhelp[0m: call `Into::into` on this expression to convert `std::string::String` into `std::option::Option<std::string::String>`
+    [1m[94m|[0m
+[1m[94m776[0m [1m[94m| [0m            )[92m.into()[0m,
+    [1m[94m|[0m              [92m+++++++[0m
+
+[1m[91merror[E0061][0m[1m: this function takes 10 arguments but 11 arguments were supplied[0m
+   [1m[94m--> [0msrc/commands.rs:766:23
+    [1m[94m|[0m
+[1m[94m766[0m [1m[94m|[0m         let mut msg = Message::new(
+    [1m[94m|[0m                       [1m[91m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m778[0m [1m[94m|[0m             None,
+    [1m[94m|[0m             [1m[94m----[0m [1m[94munexpected argument #9 of type `std::option::Option<_>`[0m
+    [1m[94m|[0m
+[1m[92mnote[0m: associated function defined here
+   [1m[94m--> [0msrc/models.rs:359:12
+    [1m[94m|[0m
+[1m[94m359[0m [1m[94m|[0m     pub fn new(
+    [1m[94m|[0m            [1m[92m^^^[0m
+[1m[96mhelp[0m: remove the extra argument
+    [1m[94m|[0m
+[1m[94m777[0m [91m-             None,[0m
+    [1m[94m|[0m
+
+[1m[91merror[E0061][0m[1m: this function takes 10 arguments but 11 arguments were supplied[0m
+   [1m[94m--> [0msrc/commands.rs:843:19
+    [1m[94m|[0m
+[1m[94m843[0m [1m[94m|[0m     let mut msg = Message::new(
+    [1m[94m|[0m                   [1m[91m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m850[0m [1m[94m|[0m         body.to_string(),
+    [1m[94m|[0m         [1m[94m----------------[0m [1m[94mexpected `std::option::Option<std::string::String>`, found `std::string::String`[0m
+[1m[94m851[0m [1m[94m|[0m         re.clone(),
+[1m[94m852[0m [1m[94m|[0m         task.clone(),
+    [1m[94m|[0m         [1m[94m------------[0m [1m[94mexpected `Vec<std::string::String>`, found `std::option::Option<std::string::String>`[0m
+[1m[94m853[0m [1m[94m|[0m         norm_paths,
+    [1m[94m|[0m         [1m[94m----------[0m [1m[94mexpected `std::string::String`, found `Vec<std::string::String>`[0m
+[1m[94m854[0m [1m[94m|[0m         crypto::now_iso(),
+    [1m[94m|[0m         [1m[94m-----------------[0m [1m[94munexpected argument #11 of type `std::string::String`[0m
+    [1m[94m|[0m
+[1m[92mnote[0m: associated function defined here
+   [1m[94m--> [0msrc/models.rs:359:12
+    [1m[94m|[0m
+[1m[94m359[0m [1m[94m|[0m     pub fn new(
+    [1m[94m|[0m            [1m[92m^^^[0m
+[1m[96mhelp[0m: did you mean
+    [1m[94m|[0m
+[1m[94m843[0m [92m~ [0m    let mut msg = Message::new[92m([0m
+[1m[94m844[0m [92m+         id,[0m
+[1m[94m845[0m [92m+         from.to_string(),[0m
+[1m[94m846[0m [92m+         to.to_string(),[0m
+[1m[94m847[0m [92m+         msg_type.to_string(),[0m
+[1m[94m848[0m [92m+         urgency.to_string(),[0m
+[1m[94m849[0m [92m+         subject.to_string(),[0m
+[1m[94m850[0m [92m+         task.clone(),[0m
+[1m[94m851[0m [92m+         re.clone(),[0m
+[1m[94m852[0m [92m+         norm_paths,[0m
+[1m[94m853[0m [92m+         body.to_string(),[0m
+[1m[94m854[0m [92m~     )[0m;
+    [1m[94m|[0m
+
+[1m[91merror[E0061][0m[1m: this function takes 10 arguments but 11 arguments were supplied[0m
+    [1m[94m--> [0msrc/commands.rs:1661:33
+     [1m[94m|[0m
+[1m[94m1661[0m [1m[94m|[0m                 let mut reply = Message::new(
+     [1m[94m|[0m                                 [1m[91m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m1668[0m [1m[94m|[0m                     "Stub answer: yes, proceed with the default approach.".to_string(),
+     [1m[94m|[0m                     [1m[94m------------------------------------------------------------------[0m [1m[94mexpected `std::option::Option<std::string::String>`, found `std::string::String`[0m
+[1m[94m1669[0m [1m[94m|[0m                     Some(m.id.clone()),
+[1m[94m1670[0m [1m[94m|[0m                     None,
+     [1m[94m|[0m                     [1m[94m----[0m [1m[94mexpected `Vec<std::string::String>`, found `std::option::Option<_>`[0m
+[1m[94m1671[0m [1m[94m|[0m                     vec![],
+     [1m[94m|[0m                     [1m[94m------[0m [1m[94mexpected `std::string::String`, found `Vec<_>`[0m
+[1m[94m1672[0m [1m[94m|[0m                     crypto::now_iso(),
+     [1m[94m|[0m                     [1m[94m-----------------[0m [1m[94munexpected argument #11 of type `std::string::String`[0m
+     [1m[94m|[0m
+[1m[92mnote[0m: associated function defined here
+    [1m[94m--> [0msrc/models.rs:359:12
+     [1m[94m|[0m
+[1m[94m 359[0m [1m[94m|[0m     pub fn new(
+     [1m[94m|[0m            [1m[92m^^^[0m
+[1m[96mhelp[0m: did you mean
+     [1m[94m|[0m
+[1m[94m1661[0m [92m~ [0m                let mut reply = Message::new[92m([0m
+[1m[94m1662[0m [92m+                     crypto::new_id("msg"),[0m
+[1m[94m1663[0m [92m+                     agent.to_string(),[0m
+[1m[94m1664[0m [92m+                     m.from.clone(),[0m
+[1m[94m1665[0m [92m+                     "answer".to_string(),[0m
+[1m[94m1666[0m [92m+                     "normal".to_string(),[0m
+[1m[94m1667[0m [92m+                     format!("re: {}", m.subject),[0m
+[1m[94m1668[0m [92m+                     None,[0m
+[1m[94m1669[0m [92m+                     Some(m.id.clone()),[0m
+[1m[94m1670[0m [92m+                     vec![],[0m
+[1m[94m1671[0m [92m+                     "Stub answer: yes, proceed with the default approach.".to_string(),[0m
+[1m[94m1672[0m [92m~                 )[0m;
+     [1m[94m|[0m
+
+[1m[91merror[E0061][0m[1m: this function takes 10 arguments but 11 arguments were supplied[0m
+    [1m[94m--> [0msrc/commands.rs:1680:37
+     [1m[94m|[0m
+[1m[94m1680[0m [1m[94m|[0m                 let mut grant_msg = Message::new(
+     [1m[94m|[0m                                     [1m[91m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m1687[0m [1m[94m|[0m                     "Stub grants this claim. Release when finished.".to_string(),
+     [1m[94m|[0m                     [1m[94m------------------------------------------------------------[0m [1m[94mexpected `std::option::Option<std::string::String>`, found `std::string::String`[0m
+[1m[94m1688[0m [1m[94m|[0m                     Some(m.id.clone()),
+[1m[94m1689[0m [1m[94m|[0m                     None,
+     [1m[94m|[0m                     [1m[94m----[0m [1m[94mexpected `Vec<std::string::String>`, found `std::option::Option<_>`[0m
+[1m[94m1690[0m [1m[94m|[0m                     paths,
+     [1m[94m|[0m                     [1m[94m-----[0m [1m[94mexpected `std::string::String`, found `Vec<std::string::String>`[0m
+[1m[94m1691[0m [1m[94m|[0m                     crypto::now_iso(),
+     [1m[94m|[0m                     [1m[94m-----------------[0m [1m[94munexpected argument #11 of type `std::string::String`[0m
+     [1m[94m|[0m
+[1m[92mnote[0m: associated function defined here
+    [1m[94m--> [0msrc/models.rs:359:12
+     [1m[94m|[0m
+[1m[94m 359[0m [1m[94m|[0m     pub fn new(
+     [1m[94m|[0m            [1m[92m^^^[0m
+[1m[96mhelp[0m: did you mean
+     [1m[94m|[0m
+[1m[94m1680[0m [92m~ [0m                let mut grant_msg = Message::new[92m([0m
+[1m[94m1681[0m [92m+                     crypto::new_id("msg"),[0m
+[1m[94m1682[0m [92m+                     agent.to_string(),[0m
+[1m[94m1683[0m [92m+                     m.from.clone(),[0m
+[1m[94m1684[0m [92m+                     "claim-grant".to_string(),[0m
+[1m[94m1685[0m [92m+                     "normal".to_string(),[0m
+[1m[94m1686[0m [92m+                     format!("granted: {}", m.subject),[0m
+[1m[94m1687[0m [92m+                     None,[0m
+[1m[94m1688[0m [92m+                     Some(m.id.clone()),[0m
+[1m[94m1689[0m [92m+                     paths,[0m
+[1m[94m1690[0m [92m+                     "Stub grants this claim. Release when finished.".to_string(),[0m
+[1m[94m1691[0m [92m~                 )[0m;
+     [1m[94m|[0m
+
+[1m[91merror[E0308][0m[1m: mismatched types[0m
+    [1m[94m--> [0msrc/commands.rs:1756:21
+     [1m[94m|[0m
+[1m[94m1756[0m [1m[94m|[0m [1m[91m/[0m [1m[94m...[0m   format!(
+[1m[94m1757[0m [1m[94m|[0m [1m[91m|[0m [1m[94m...[0m       "I was designated deadlock breaker for the cycle involving us. I unparked '{}' and proceeded assuming: default interface, no breaking changes. Object via a new quest[1m[94m...[0m
+[1m[94m1758[0m [1m[94m|[0m [1m[91m|[0m [1m[94m...[0m       e.task
+[1m[94m1759[0m [1m[94m|[0m [1m[91m|[0m [1m[94m...[0m   ),
+     [1m[94m|[0m [1m[91m|_______^[0m [1m[91mexpected `Option<String>`, found `String`[0m
+     [1m[94m|[0m
+     [1m[94m= [0m[1mnote[0m: expected enum `[1m[35mstd::option::Option[0m[1m[35m<[0mstd::string::String[1m[35m>[0m`
+              found struct `std::string::String`
+     [1m[94m= [0m[1mnote[0m: this error originates in the macro `format` (in Nightly builds, run with -Z macro-backtrace for more info)
+[1m[96mhelp[0m: call `Into::into` on this expression to convert `std::string::String` into `std::option::Option<std::string::String>`
+     [1m[94m|[0m
+[1m[94m1759[0m [1m[94m| [0m                    )[92m.into()[0m,
+     [1m[94m|[0m                      [92m+++++++[0m
+
+[1m[91merror[E0061][0m[1m: this function takes 10 arguments but 11 arguments were supplied[0m
+    [1m[94m--> [0msrc/commands.rs:1749:34
+     [1m[94m|[0m
+[1m[94m1749[0m [1m[94m|[0m                 let mut notify = Message::new(
+     [1m[94m|[0m                                  [1m[91m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m1761[0m [1m[94m|[0m                     None,
+     [1m[94m|[0m                     [1m[94m----[0m [1m[94munexpected argument #9 of type `std::option::Option<_>`[0m
+     [1m[94m|[0m
+[1m[92mnote[0m: associated function defined here
+    [1m[94m--> [0msrc/models.rs:359:12
+     [1m[94m|[0m
+[1m[94m 359[0m [1m[94m|[0m     pub fn new(
+     [1m[94m|[0m            [1m[92m^^^[0m
+[1m[96mhelp[0m: remove the extra argument
+     [1m[94m|[0m
+[1m[94m1760[0m [91m-                     None,[0m
+     [1m[94m|[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `AssistPolicy`[0m
+    [1m[94m--> [0msrc/commands.rs:1872:30
+     [1m[94m|[0m
+[1m[94m1872[0m [1m[94m|[0m     if task.assist_policy != AssistPolicy::Open {
+     [1m[94m|[0m                              [1m[91m^^^^^^^^^^^^[0m [1m[91muse of undeclared type `AssistPolicy`[0m
+
+[1m[91merror[E0061][0m[1m: this function takes 10 arguments but 11 arguments were supplied[0m
+    [1m[94m--> [0msrc/commands.rs:1892:19
+     [1m[94m|[0m
+[1m[94m1892[0m [1m[94m|[0m     let mut msg = Message::new(
+     [1m[94m|[0m                   [1m[91m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m1899[0m [1m[94m|[0m         body,
+     [1m[94m|[0m         [1m[94m----[0m [1m[94mexpected `std::option::Option<std::string::String>`, found `std::string::String`[0m
+[1m[94m1900[0m [1m[94m|[0m         re,
+[1m[94m1901[0m [1m[94m|[0m         task,
+     [1m[94m|[0m         [1m[94m----[0m [1m[94mexpected `Vec<std::string::String>`, found `std::option::Option<std::string::String>`[0m
+[1m[94m1902[0m [1m[94m|[0m         paths,
+     [1m[94m|[0m         [1m[94m-----[0m [1m[94mexpected `std::string::String`, found `Vec<std::string::String>`[0m
+[1m[94m1903[0m [1m[94m|[0m         crypto::now_iso(),
+     [1m[94m|[0m         [1m[94m-----------------[0m [1m[94munexpected argument #11 of type `std::string::String`[0m
+     [1m[94m|[0m
+[1m[92mnote[0m: associated function defined here
+    [1m[94m--> [0msrc/models.rs:359:12
+     [1m[94m|[0m
+[1m[94m 359[0m [1m[94m|[0m     pub fn new(
+     [1m[94m|[0m            [1m[92m^^^[0m
+[1m[96mhelp[0m: did you mean
+     [1m[94m|[0m
+[1m[94m1892[0m [92m~ [0m    let mut msg = Message::new[92m([0m
+[1m[94m1893[0m [92m+         crypto::new_id("msg"),[0m
+[1m[94m1894[0m [92m+         from.to_string(),[0m
+[1m[94m1895[0m [92m+         to.to_string(),[0m
+[1m[94m1896[0m [92m+         msg_type.to_string(),[0m
+[1m[94m1897[0m [92m+         "normal".to_string(),[0m
+[1m[94m1898[0m [92m+         subject,[0m
+[1m[94m1899[0m [92m+         task,[0m
+[1m[94m1900[0m [92m+         re,[0m
+[1m[94m1901[0m [92m+         paths,[0m
+[1m[94m1902[0m [92m+         body,[0m
+[1m[94m1903[0m [92m~     )[0m;
+     [1m[94m|[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `DelegationStatus`[0m
+    [1m[94m--> [0msrc/commands.rs:2023:17
+     [1m[94m|[0m
+[1m[94m2023[0m [1m[94m|[0m         status: DelegationStatus::Offered,
+     [1m[94m|[0m                 [1m[91m^^^^^^^^^^^^^^^^[0m [1m[91muse of undeclared type `DelegationStatus`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `DelegationStatus`[0m
+    [1m[94m--> [0msrc/commands.rs:2050:26
+     [1m[94m|[0m
+[1m[94m2050[0m [1m[94m|[0m     if offered.status != DelegationStatus::Offered {
+     [1m[94m|[0m                          [1m[91m^^^^^^^^^^^^^^^^[0m [1m[91muse of undeclared type `DelegationStatus`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `TaskState`[0m
+    [1m[94m--> [0msrc/commands.rs:2274:20
+     [1m[94m|[0m
+[1m[94m2274[0m [1m[94m|[0m         let want = TaskState::parse(s).ok_or_else(|| {
+     [1m[94m|[0m                    [1m[91m^^^^^^^^^[0m [1m[91muse of undeclared type `TaskState`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `TaskRole`[0m
+    [1m[94m--> [0msrc/commands.rs:2299:40
+     [1m[94m|[0m
+[1m[94m2299[0m [1m[94m|[0m                     assignment.role == TaskRole::Helper
+     [1m[94m|[0m                                        [1m[91m^^^^^^^^[0m [1m[91muse of undeclared type `TaskRole`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `AssistPolicy`[0m
+    [1m[94m--> [0msrc/commands.rs:2313:42
+     [1m[94m|[0m
+[1m[94m2313[0m [1m[94m|[0m                 && task.assist_policy == AssistPolicy::Open
+     [1m[94m|[0m                                          [1m[91m^^^^^^^^^^^^[0m [1m[91muse of undeclared type `AssistPolicy`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `AssistPolicy`[0m
+    [1m[94m--> [0msrc/commands.rs:2460:25
+     [1m[94m|[0m
+[1m[94m2460[0m [1m[94m|[0m     let assist_policy = AssistPolicy::parse(assist).ok_or_else(|| {
+     [1m[94m|[0m                         [1m[91m^^^^^^^^^^^^[0m [1m[91muse of undeclared type `AssistPolicy`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `TaskState`[0m
+    [1m[94m--> [0msrc/commands.rs:2482:16
+     [1m[94m|[0m
+[1m[94m2482[0m [1m[94m|[0m         state: TaskState::Ready,
+     [1m[94m|[0m                [1m[91m^^^^^^^^^[0m [1m[91muse of undeclared type `TaskState`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `DelegationStatus`[0m
+    [1m[94m--> [0msrc/commands.rs:2669:33
+     [1m[94m|[0m
+[1m[94m2669[0m [1m[94m|[0m         || delegation.status != DelegationStatus::Active
+     [1m[94m|[0m                                 [1m[91m^^^^^^^^^^^^^^^^[0m [1m[91muse of undeclared type `DelegationStatus`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `ReviewDecision`[0m
+    [1m[94m--> [0msrc/commands.rs:2780:9
+     [1m[94m|[0m
+[1m[94m2780[0m [1m[94m|[0m         ReviewDecision::Accept
+     [1m[94m|[0m         [1m[91m^^^^^^^^^^^^^^[0m [1m[91muse of undeclared type `ReviewDecision`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `ReviewDecision`[0m
+    [1m[94m--> [0msrc/commands.rs:2782:9
+     [1m[94m|[0m
+[1m[94m2782[0m [1m[94m|[0m         ReviewDecision::RequestChanges
+     [1m[94m|[0m         [1m[91m^^^^^^^^^^^^^^[0m [1m[91muse of undeclared type `ReviewDecision`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `ReviewDecision`[0m
+    [1m[94m--> [0msrc/commands.rs:2784:9
+     [1m[94m|[0m
+[1m[94m2784[0m [1m[94m|[0m         ReviewDecision::Reject
+     [1m[94m|[0m         [1m[91m^^^^^^^^^^^^^^[0m [1m[91muse of undeclared type `ReviewDecision`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `TaskRole`[0m
+    [1m[94m--> [0msrc/commands.rs:2795:78
+     [1m[94m|[0m
+[1m[94m2795[0m [1m[94m|[0m         .any(|assignment| assignment.agent == reviewer && assignment.role == TaskRole::Reviewer);
+     [1m[94m|[0m                                                                              [1m[91m^^^^^^^^[0m [1m[91muse of undeclared type `TaskRole`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `DelegationStatus`[0m
+    [1m[94m--> [0msrc/commands.rs:2803:62
+     [1m[94m|[0m
+[1m[94m2803[0m [1m[94m|[0m     if delegation.task_id != task.id || delegation.status != DelegationStatus::Submitted {
+     [1m[94m|[0m                                                              [1m[91m^^^^^^^^^^^^^^^^[0m [1m[91muse of undeclared type `DelegationStatus`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `ReviewDecision`[0m
+    [1m[94m--> [0msrc/commands.rs:2808:20
+     [1m[94m|[0m
+[1m[94m2808[0m [1m[94m|[0m     if decision == ReviewDecision::RequestChanges
+     [1m[94m|[0m                    [1m[91m^^^^^^^^^^^^^^[0m [1m[91muse of undeclared type `ReviewDecision`[0m
+
+[1m[91merror[E0308][0m[1m: mismatched types[0m
+    [1m[94m--> [0msrc/commands.rs:3431:13
+     [1m[94m|[0m
+[1m[94m3431[0m [1m[94m|[0m [1m[91m/[0m             format!(
+[1m[94m3432[0m [1m[94m|[0m [1m[91m|[0m                 "Your parked task '{}' was waiting on '{}' which has been disabled. \
+[1m[94m3433[0m [1m[94m|[0m [1m[91m|[0m                 The park has been cleared. Proceed with a documented assumption or \
+[1m[94m3434[0m [1m[94m|[0m [1m[91m|[0m                 escalate to the user.",
+[1m[94m3435[0m [1m[94m|[0m [1m[91m|[0m                 entry.task, disabled_agent
+[1m[94m3436[0m [1m[94m|[0m [1m[91m|[0m             ),
+     [1m[94m|[0m [1m[91m|_____________^[0m [1m[91mexpected `Option<String>`, found `String`[0m
+     [1m[94m|[0m
+     [1m[94m= [0m[1mnote[0m: expected enum `[1m[35mstd::option::Option[0m[1m[35m<[0mstd::string::String[1m[35m>[0m`
+              found struct `std::string::String`
+     [1m[94m= [0m[1mnote[0m: this error originates in the macro `format` (in Nightly builds, run with -Z macro-backtrace for more info)
+[1m[96mhelp[0m: call `Into::into` on this expression to convert `std::string::String` into `std::option::Option<std::string::String>`
+     [1m[94m|[0m
+[1m[94m3436[0m [1m[94m| [0m            )[92m.into()[0m,
+     [1m[94m|[0m              [92m+++++++[0m
+
+[1m[91merror[E0061][0m[1m: this function takes 10 arguments but 11 arguments were supplied[0m
+    [1m[94m--> [0msrc/commands.rs:3424:23
+     [1m[94m|[0m
+[1m[94m3424[0m [1m[94m|[0m         let mut msg = Message::new(
+     [1m[94m|[0m                       [1m[91m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m3438[0m [1m[94m|[0m             None,
+     [1m[94m|[0m             [1m[94m----[0m [1m[94munexpected argument #9 of type `std::option::Option<_>`[0m
+     [1m[94m|[0m
+[1m[92mnote[0m: associated function defined here
+    [1m[94m--> [0msrc/models.rs:359:12
+     [1m[94m|[0m
+[1m[94m 359[0m [1m[94m|[0m     pub fn new(
+     [1m[94m|[0m            [1m[92m^^^[0m
+[1m[96mhelp[0m: remove the extra argument
+     [1m[94m|[0m
+[1m[94m3437[0m [91m-             None,[0m
+     [1m[94m|[0m
+
+[1m[91merror[E0061][0m[1m: this function takes 10 arguments but 11 arguments were supplied[0m
+   [1m[94m--> [0msrc/squire.rs:138:31
+    [1m[94m|[0m
+[1m[94m138[0m [1m[94m|[0m                 let mut msg = Message::new(
+    [1m[94m|[0m                               [1m[91m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m145[0m [1m[94m|[0m                     "Your lease expired and was reaped. If you still hold uncommitted work on this file, re-claim before touching it again.".to_string(),
+    [1m[94m|[0m                     [1m[94m------------------------------------------------------------------------------------------------------------------------------------[0m [1m[94mexpected `std::option::Option<std::string::String>`, found `std::string::String`[0m
+[1m[94m146[0m [1m[94m|[0m                     None,
+[1m[94m147[0m [1m[94m|[0m                     None,
+    [1m[94m|[0m                     [1m[94m----[0m [1m[94mexpected `Vec<std::string::String>`, found `std::option::Option<_>`[0m
+[1m[94m148[0m [1m[94m|[0m                     vec![],
+    [1m[94m|[0m                     [1m[94m------[0m [1m[94mexpected `std::string::String`, found `Vec<_>`[0m
+[1m[94m149[0m [1m[94m|[0m                     crate::crypto::now_iso(),
+    [1m[94m|[0m                     [1m[94m------------------------[0m [1m[94munexpected argument #11 of type `std::string::String`[0m
+    [1m[94m|[0m
+[1m[92mnote[0m: associated function defined here
+   [1m[94m--> [0msrc/models.rs:359:12
+    [1m[94m|[0m
+[1m[94m359[0m [1m[94m|[0m     pub fn new(
+    [1m[94m|[0m            [1m[92m^^^[0m
+[1m[96mhelp[0m: did you mean
+    [1m[94m|[0m
+[1m[94m138[0m [92m~ [0m                let mut msg = Message::new[92m([0m
+[1m[94m139[0m [92m+                     crate::crypto::new_id("msg"),[0m
+[1m[94m140[0m [92m+                     "system".to_string(),[0m
+[1m[94m141[0m [92m+                     lease.holder.clone(),[0m
+[1m[94m142[0m [92m+                     "system".to_string(),[0m
+[1m[94m143[0m [92m+                     "normal".to_string(),[0m
+[1m[94m144[0m [92m+                     format!("lease expired: {}", lease.path),[0m
+[1m[94m145[0m [92m+                     None,[0m
+[1m[94m146[0m [92m+                     None,[0m
+[1m[94m147[0m [92m+                     vec![],[0m
+[1m[94m148[0m [92m+                     "Your lease expired and was reaped. If you still hold uncommitted work on this file, re-claim before touching it again.".to_string(),[0m
+[1m[94m149[0m [92m~                 )[0m;
+    [1m[94m|[0m
+
+[1m[91merror[E0308][0m[1m: mismatched types[0m
+   [1m[94m--> [0msrc/squire.rs:592:37
+    [1m[94m|[0m
+[1m[94m592[0m [1m[94m|[0m [1m[91m/[0m [1m[94m...[0m                   format!(
+[1m[94m593[0m [1m[94m|[0m [1m[91m|[0m [1m[94m...[0m                       "The wait-cycle has been broken {attempt_count} times without resolution. \
+[1m[94m594[0m [1m[94m|[0m [1m[91m|[0m [1m[94m...[0m                       Each member must reassess their parked tasks and either unpark with a \
+[1m[94m595[0m [1m[94m|[0m [1m[91m|[0m [1m[94m...[0m                       documented assumption or escalate to the user."
+[1m[94m596[0m [1m[94m|[0m [1m[91m|[0m [1m[94m...[0m                   ),
+    [1m[94m|[0m [1m[91m|_______________________^[0m [1m[91mexpected `Option<String>`, found `String`[0m
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: expected enum `[1m[35mstd::option::Option[0m[1m[35m<[0mstd::string::String[1m[35m>[0m`
+             found struct `std::string::String`
+    [1m[94m= [0m[1mnote[0m: this error originates in the macro `format` (in Nightly builds, run with -Z macro-backtrace for more info)
+[1m[96mhelp[0m: call `Into::into` on this expression to convert `std::string::String` into `std::option::Option<std::string::String>`
+    [1m[94m|[0m
+[1m[94m596[0m [1m[94m| [0m                                    )[92m.into()[0m,
+    [1m[94m|[0m                                      [92m+++++++[0m
+
+[1m[91merror[E0061][0m[1m: this function takes 10 arguments but 11 arguments were supplied[0m
+   [1m[94m--> [0msrc/squire.rs:585:47
+    [1m[94m|[0m
+[1m[94m585[0m [1m[94m|[0m [1m[94m...[0m                   let mut msg = Message::new(
+    [1m[94m|[0m                                     [1m[91m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m598[0m [1m[94m|[0m [1m[94m...[0m                       None,
+    [1m[94m|[0m                           [1m[94m----[0m [1m[94munexpected argument #9 of type `std::option::Option<_>`[0m
+    [1m[94m|[0m
+[1m[92mnote[0m: associated function defined here
+   [1m[94m--> [0msrc/models.rs:359:12
+    [1m[94m|[0m
+[1m[94m359[0m [1m[94m|[0m     pub fn new(
+    [1m[94m|[0m            [1m[92m^^^[0m
+[1m[96mhelp[0m: remove the extra argument
+    [1m[94m|[0m
+[1m[94m597[0m [91m-                                     None,[0m
+    [1m[94m|[0m
+
+[1m[91merror[E0282][0m[1m: type annotations needed[0m
+    [1m[94m--> [0msrc/store.rs:1629:23
+     [1m[94m|[0m
+[1m[94m1629[0m [1m[94m|[0m         hasher.update(id.as_bytes());
+     [1m[94m|[0m                       [1m[91m^^[0m [1m[91mcannot infer type[0m
+
+[1m[91merror[E0282][0m[1m: type annotations needed[0m
+    [1m[94m--> [0msrc/store.rs:1668:16
+     [1m[94m|[0m
+[1m[94m1668[0m [1m[94m|[0m             if exp.as_str() <= now {
+     [1m[94m|[0m                [1m[91m^^^[0m [1m[91mcannot infer type[0m
+
+[1m[91merror[E0282][0m[1m: type annotations needed[0m
+   [1m[94m--> [0msrc/lib.rs:197:35
+    [1m[94m|[0m
+[1m[94m197[0m [1m[94m|[0m                 let report_path = pocket.join("biplane-report.json");
+    [1m[94m|[0m                                   [1m[91m^^^^^^[0m [1m[91mcannot infer type[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `TaskState`[0m
+    [1m[94m--> [0msrc/commands.rs:2918:24
+     [1m[94m|[0m
+[1m[94m2918[0m [1m[94m|[0m                 state: TaskState::Ready,
+     [1m[94m|[0m                        [1m[91m^^^^^^^^^[0m [1m[91muse of undeclared type `TaskState`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `AssistPolicy`[0m
+    [1m[94m--> [0msrc/commands.rs:2920:32
+     [1m[94m|[0m
+[1m[94m2920[0m [1m[94m|[0m                 assist_policy: AssistPolicy::Open,
+     [1m[94m|[0m                                [1m[91m^^^^^^^^^^^^[0m [1m[91muse of undeclared type `AssistPolicy`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `DelegationStatus`[0m
+    [1m[94m--> [0msrc/commands.rs:2967:25
+     [1m[94m|[0m
+[1m[94m2967[0m [1m[94m|[0m                 status: DelegationStatus::Offered,
+     [1m[94m|[0m                         [1m[91m^^^^^^^^^^^^^^^^[0m [1m[91muse of undeclared type `DelegationStatus`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `TaskState`[0m
+    [1m[94m--> [0msrc/commands.rs:3201:20
+     [1m[94m|[0m
+[1m[94m3201[0m [1m[94m|[0m             state: TaskState::Active,
+     [1m[94m|[0m                    [1m[91m^^^^^^^^^[0m [1m[91muse of undeclared type `TaskState`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `AssistPolicy`[0m
+    [1m[94m--> [0msrc/commands.rs:3203:28
+     [1m[94m|[0m
+[1m[94m3203[0m [1m[94m|[0m             assist_policy: AssistPolicy::Open,
+     [1m[94m|[0m                            [1m[91m^^^^^^^^^^^^[0m [1m[91muse of undeclared type `AssistPolicy`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `DelegationStatus`[0m
+    [1m[94m--> [0msrc/commands.rs:3224:21
+     [1m[94m|[0m
+[1m[94m3224[0m [1m[94m|[0m             status: DelegationStatus::Active,
+     [1m[94m|[0m                     [1m[91m^^^^^^^^^^^^^^^^[0m [1m[91muse of undeclared type `DelegationStatus`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `TaskState`[0m
+    [1m[94m--> [0msrc/commands.rs:3324:13
+     [1m[94m|[0m
+[1m[94m3324[0m [1m[94m|[0m             TaskState::Done
+     [1m[94m|[0m             [1m[91m^^^^^^^^^[0m [1m[91muse of undeclared type `TaskState`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `DelegationStatus`[0m
+    [1m[94m--> [0msrc/commands.rs:3331:13
+     [1m[94m|[0m
+[1m[94m3331[0m [1m[94m|[0m             DelegationStatus::Accepted
+     [1m[94m|[0m             [1m[91m^^^^^^^^^^^^^^^^[0m [1m[91muse of undeclared type `DelegationStatus`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `DelegationStatus`[0m
+    [1m[94m--> [0msrc/commands.rs:3394:13
+     [1m[94m|[0m
+[1m[94m3394[0m [1m[94m|[0m             DelegationStatus::Revoked
+     [1m[94m|[0m             [1m[91m^^^^^^^^^^^^^^^^[0m [1m[91muse of undeclared type `DelegationStatus`[0m
+
+[1m[91merror[E0061][0m[1m: this function takes 10 arguments but 11 arguments were supplied[0m
+   [1m[94m--> [0msrc/crypto.rs:102:9
+    [1m[94m|[0m
+[1m[94m102[0m [1m[94m|[0m         Message::new(
+    [1m[94m|[0m         [1m[91m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m109[0m [1m[94m|[0m             "need the schema".to_string(),
+    [1m[94m|[0m             [1m[94m-----------------------------[0m [1m[94mexpected `std::option::Option<std::string::String>`, found `std::string::String`[0m
+[1m[94m110[0m [1m[94m|[0m             None,
+[1m[94m111[0m [1m[94m|[0m             None,
+    [1m[94m|[0m             [1m[94m----[0m [1m[94mexpected `Vec<std::string::String>`, found `std::option::Option<_>`[0m
+[1m[94m112[0m [1m[94m|[0m             vec![],
+    [1m[94m|[0m             [1m[94m------[0m [1m[94mexpected `std::string::String`, found `Vec<_>`[0m
+[1m[94m113[0m [1m[94m|[0m             "2026-07-03T00:00:00Z".to_string(),
+    [1m[94m|[0m             [1m[94m----------------------------------[0m [1m[94munexpected argument #11 of type `std::string::String`[0m
+    [1m[94m|[0m
+[1m[92mnote[0m: associated function defined here
+   [1m[94m--> [0msrc/models.rs:359:12
+    [1m[94m|[0m
+[1m[94m359[0m [1m[94m|[0m     pub fn new(
+    [1m[94m|[0m            [1m[92m^^^[0m
+[1m[96mhelp[0m: did you mean
+    [1m[94m|[0m
+[1m[94m102[0m [92m~ [0m        Message::new[92m([0m
+[1m[94m103[0m [92m+             "msg-test".to_string(),[0m
+[1m[94m104[0m [92m+             "alpha".to_string(),[0m
+[1m[94m105[0m [92m+             "beta".to_string(),[0m
+[1m[94m106[0m [92m+             "question".to_string(),[0m
+[1m[94m107[0m [92m+             "normal".to_string(),[0m
+[1m[94m108[0m [92m+             "what shape?".to_string(),[0m
+[1m[94m109[0m [92m+             None,[0m
+[1m[94m110[0m [92m+             None,[0m
+[1m[94m111[0m [92m+             vec![],[0m
+[1m[94m112[0m [92m+             "need the schema".to_string(),[0m
+[1m[94m113[0m [92m+         )[0m
+    [1m[94m|[0m
+
+[1m[91merror[E0061][0m[1m: this function takes 10 arguments but 11 arguments were supplied[0m
+    [1m[94m--> [0msrc/store.rs:2204:9
+     [1m[94m|[0m
+[1m[94m2204[0m [1m[94m|[0m         Message::new(
+     [1m[94m|[0m         [1m[91m^^^^^^^^^^^^[0m
+[1m[94m...[0m
+[1m[94m2211[0m [1m[94m|[0m             "{}".to_string(),
+     [1m[94m|[0m             [1m[94m----------------[0m [1m[94mexpected `std::option::Option<std::string::String>`, found `std::string::String`[0m
+[1m[94m2212[0m [1m[94m|[0m             None,
+[1m[94m2213[0m [1m[94m|[0m             Some("task_1".to_string()),
+     [1m[94m|[0m             [1m[94m--------------------------[0m [1m[94mexpected `Vec<std::string::String>`, found `std::option::Option<std::string::String>`[0m
+[1m[94m2214[0m [1m[94m|[0m             vec![],
+     [1m[94m|[0m             [1m[94m------[0m [1m[94mexpected `std::string::String`, found `Vec<_>`[0m
+[1m[94m2215[0m [1m[94m|[0m             "2026-07-11T00:00:00Z".to_string(),
+     [1m[94m|[0m             [1m[94m----------------------------------[0m [1m[94munexpected argument #11 of type `std::string::String`[0m
+     [1m[94m|[0m
+[1m[92mnote[0m: associated function defined here
+    [1m[94m--> [0msrc/models.rs:359:12
+     [1m[94m|[0m
+[1m[94m 359[0m [1m[94m|[0m     pub fn new(
+     [1m[94m|[0m            [1m[92m^^^[0m
+[1m[96mhelp[0m: did you mean
+     [1m[94m|[0m
+[1m[94m2204[0m [92m~ [0m        Message::new[92m([0m
+[1m[94m2205[0m [92m+             id.to_string(),[0m
+[1m[94m2206[0m [92m+             "alpha".to_string(),[0m
+[1m[94m2207[0m [92m+             "beta".to_string(),[0m
+[1m[94m2208[0m [92m+             kind.to_string(),[0m
+[1m[94m2209[0m [92m+             "normal".to_string(),[0m
+[1m[94m2210[0m [92m+             kind.to_string(),[0m
+[1m[94m2211[0m [92m+             Some("task_1".to_string()),[0m
+[1m[94m2212[0m [92m+             None,[0m
+[1m[94m2213[0m [92m+             vec![],[0m
+[1m[94m2214[0m [92m+             "{}".to_string(),[0m
+[1m[94m2215[0m [92m+         )[0m
+     [1m[94m|[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `DelegationStatus`[0m
+    [1m[94m--> [0msrc/commands.rs:2307:25
+     [1m[94m|[0m
+[1m[94m2307[0m [1m[94m|[0m                         DelegationStatus::Offered
+     [1m[94m|[0m                         [1m[91m^^^^^^^^^^^^^^^^[0m [1m[91muse of undeclared type `DelegationStatus`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `DelegationStatus`[0m
+    [1m[94m--> [0msrc/commands.rs:2308:31
+     [1m[94m|[0m
+[1m[94m2308[0m [1m[94m|[0m [1m[94m...[0m                   | DelegationStatus::Active
+     [1m[94m|[0m                         [1m[91m^^^^^^^^^^^^^^^^[0m [1m[91muse of undeclared type `DelegationStatus`[0m
+
+[1m[91merror[E0433][0m[1m: failed to resolve: use of undeclared type `DelegationStatus`[0m
+    [1m[94m--> [0msrc/commands.rs:2309:31
+     [1m[94m|[0m
+[1m[94m2309[0m [1m[94m|[0m [1m[94m...[0m                   | DelegationStatus::Submitted
+     [1m[94m|[0m                         [1m[91m^^^^^^^^^^^^^^^^[0m [1m[91muse of undeclared type `DelegationStatus`[0m
+
+[1mSome errors have detailed explanations: E0061, E0282, E0308, E0422, E0425, E0432, E0433.[0m
+[1mFor more information about an error, try `rustc --explain E0061`.[0m
+[1m[91merror[0m: could not compile `trelane` (lib) due to 58 previous errors
+[1m[33mwarning[0m: build failed, waiting for other jobs to finish...
+[1m[91merror[0m: could not compile `trelane` (lib test) due to 74 previous errors

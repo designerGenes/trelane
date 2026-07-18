@@ -8,5 +8,14 @@
 //!
 //! This shim exists so external code and older scripts that referenced
 //! `trelane::prop::*` keep compiling. New code should use `crate::squire`.
+//!
+//! # Liveness boundary (hard rule, R3)
+//!
+//! **Trelane does not restart the squire itself.** Keeping the squire alive
+//! is the host supervisor's job (launchd / systemd / cron / a `while true`
+//! shell loop). Attempting it inside Trelane would create the exact
+//! recursive-restarter problem R3 exists to prevent: a dumb restarter that
+//! can also get stuck needs another dumb restarter above it, forever. The
+//! squire is deliberately the *bottom* of that stack.
 
 pub use crate::squire::*;

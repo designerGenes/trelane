@@ -198,6 +198,15 @@ pub fn wake_plan(ctx: &Context) -> Result<WakePlan> {
     let agents = store::list_agents(&ctx.conn)?;
     let reply_timeout = ctx.config.squire.reply_timeout_s;
 
+    // R23: per-agent consecutive-deferral counts, read once so the sort below
+    // can promote any candidate that has been starved past the configured
+    // threshold ahead of ordinary ordering. A promoted candidate claims one of
+    // the concurrency budget's own slots (never an extra one — that stays R7's
+    // job in `tick`); this only changes *which* candidates fill the budget, not
+    // how many.
+    let starvation_counts = store::starvation_counts(&ctx.conn)?;
+    let starvation_threshold = ctx.config.squire.starvation_ticks;
+
     // Pass 1: inbox, abandoned parks, and satisfied parks per agent.
     for agent in &agents {
         if commands::is_running(&ctx.conn, agent)? {
@@ -300,8 +309,10 @@ pub fn wake_plan(ctx: &Context) -> Result<WakePlan> {
             sorted.sort();
             let cycle_key = sorted.join(",");
             let attempt_count = store::get_cycle_attempt_count(&ctx.conn, &cycle_key)?;
-            const ESCALATION_THRESHOLD: i64 = 3;
-            let should_escalate = attempt_count > ESCALATION_THRESHOLD
+            // R24: the escalation threshold is operator-tunable, not a magic
+            // constant (`squire.breaker_escalation_count`, default 3).
+            let escalation_threshold = ctx.config.squire.breaker_escalation_count;
+            let should_escalate = attempt_count > escalation_threshold
                 && !store::is_cycle_escalated(&ctx.conn, &cycle_key)?;
             let (breaker, alt_breaker) = if should_escalate {
                 let alt = sorted[(attempt_count as usize) % sorted.len()].clone();
@@ -462,10 +473,26 @@ pub fn wake_plan(ctx: &Context) -> Result<WakePlan> {
         }
     }
 
-    // Deterministic sort: (kind rank, urgency desc, agent asc, task asc, delegation asc).
+    // Deterministic sort. R23 starvation promotion is the PRIMARY key: any
+    // candidate whose consecutive-deferral count has reached the threshold
+    // sorts ahead of everything else, so it can't be perpetually starved by a
+    // low kind-rank or a late-alphabetical name. Among promoted candidates,
+    // and among ordinary ones, the original ordering (kind rank, urgency desc,
+    // agent asc, ...) is preserved as the tie-break. The starvation flag is a
+    // pure function of the pre-read `starvation_counts`, so the sort stays
+    // deterministic within a tick.
+    let is_starved = |c: &WakeCandidate| -> bool {
+        starvation_threshold > 0
+            && starvation_counts
+                .get(&c.agent)
+                .is_some_and(|&n| n >= starvation_threshold)
+    };
     cands.sort_by(|a, b| {
-        a.kind.rank()
-            .cmp(&b.kind.rank())
+        // starved-first: true (starved) must order before false, so compare
+        // reversed (b vs a) on the boolean.
+        is_starved(b)
+            .cmp(&is_starved(a))
+            .then_with(|| a.kind.rank().cmp(&b.kind.rank()))
             .then_with(|| b.urgency_rank.cmp(&a.urgency_rank))
             .then_with(|| a.agent.cmp(&b.agent))
             .then_with(|| a.task_id.cmp(&b.task_id))
@@ -513,9 +540,47 @@ pub fn wake_candidates(ctx: &Context) -> Result<Vec<(String, String)>> {
 /// `verbose` controls chatter that is useful while debugging but noisy in a
 /// live session frame (e.g. the concurrency-budget deferral notice).
 pub fn tick(ctx: &Context, launcher_override: Option<&str>, verbose: bool) -> Result<usize> {
+    // GAP-06 / C7: record a squire.tick span for every tick, including ones
+    // that launch nothing (an idle tick is still signal). Best-effort per R16 —
+    // the tracer is built lazily and every emit is ignored on failure, so
+    // telemetry can never affect the tick's outcome. start_ns is captured before
+    // any work so the span covers the whole tick.
+    let start_ns = crate::telemetry::now_nanos();
+    let emit_tick_span = |launched: usize, running: usize, cycle: bool| {
+        if let Ok(tracer) = crate::telemetry::Tracer::ephemeral(
+            &ctx.trelane_dir(),
+            &ctx.root.display().to_string(),
+        ) {
+            let _ = tracer.record_squire_tick(
+                launched,
+                running,
+                cycle,
+                start_ns,
+                crate::telemetry::now_nanos(),
+            );
+        }
+    };
+
+    // 4D: retention sweep as the cheap first step of the tick (one restarter,
+    // not a second daemon). Best-effort per R16: a sweep failure must never
+    // fail the tick it ran inside.
+    if let Err(e) = crate::retention::sweep(ctx, false) {
+        eprintln!("retention sweep failed (non-fatal): {e}");
+    }
     reap_leases(ctx)?;
     let plan = wake_plan(ctx)?;
+    let cycle_detected = plan.cycle.is_some();
     if plan.candidates.is_empty() {
+        // Nothing to launch this tick — still record it, with the current
+        // running count so idle spans carry the concurrency picture.
+        let running_now = store::list_agents(&ctx.conn)
+            .map(|ags| {
+                ags.iter()
+                    .filter(|a| commands::is_running(&ctx.conn, a).unwrap_or(false))
+                    .count()
+            })
+            .unwrap_or(0);
+        emit_tick_span(0, running_now, cycle_detected);
         return Ok(0);
     }
 
@@ -555,6 +620,12 @@ pub fn tick(ctx: &Context, launcher_override: Option<&str>, verbose: bool) -> Re
             if verbose {
                 eprintln!("deferred wake of {} (concurrency budget reached)", cand.agent);
             }
+            // R23: this candidate was valid but deferred past the budget this
+            // tick. Bump its consecutive-deferral count so that, once it crosses
+            // squire.starvation_ticks, wake_plan's sort promotes it ahead of
+            // ordinary ordering next time. Best-effort: a bookkeeping failure
+            // must never abort the tick.
+            let _ = store::increment_starvation(&ctx.conn, &cand.agent, &now);
             continue;
         }
         eprintln!("{} waking {}: {}", crate::crypto::now_iso(), cand.agent, cand.reason);
@@ -562,6 +633,13 @@ pub fn tick(ctx: &Context, launcher_override: Option<&str>, verbose: bool) -> Re
             Ok(()) => {
                 launched += 1;
                 // Apply deferred side effects now that the agent launched.
+
+                // R23: the agent actually launched, so its starvation streak is
+                // broken — clear the counter. This is the "clear only on real
+                // launch, not on mere candidacy" discipline: the count must
+                // survive from deferral through to selection, and only a
+                // genuine wake resets it. Best-effort per the same rule.
+                let _ = store::clear_starvation(&ctx.conn, &cand.agent);
 
                 // Delete abandoned parks for this agent.
                 if let Some(park_ids) = plan.abandoned_parks.get(&cand.agent) {
@@ -650,6 +728,9 @@ pub fn tick(ctx: &Context, launcher_override: Option<&str>, verbose: bool) -> Re
         }
     }
 
+    // Record the completed tick: how many launched, how many were running at
+    // the start of the launch phase, and whether a wait-cycle was detected.
+    emit_tick_span(launched, running_count, cycle_detected);
     Ok(launched)
 }
 
@@ -745,52 +826,10 @@ mod tests {
     use crate::models::ParkedTask;
 
     fn in_memory_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
-        )
-        .unwrap();
-        conn.execute_batch(
-            "CREATE TABLE parked_tasks (
-                task TEXT PRIMARY KEY,
-                agent TEXT NOT NULL,
-                wait_type TEXT NOT NULL,
-                wait_re TEXT,
-                wait_path TEXT,
-                waiting_on TEXT NOT NULL,
-                resume_hint TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL
-            );
-            CREATE TABLE messages (
-                id TEXT PRIMARY KEY,
-                from_agent TEXT NOT NULL,
-                to_agent TEXT NOT NULL,
-                msg_type TEXT NOT NULL,
-                urgency TEXT NOT NULL DEFAULT 'normal',
-                subject TEXT NOT NULL,
-                body TEXT NOT NULL DEFAULT '',
-                re TEXT,
-                task TEXT,
-                paths_json TEXT NOT NULL DEFAULT '[]',
-                created_at TEXT NOT NULL,
-                schema_version INTEGER NOT NULL DEFAULT 1,
-                sig TEXT NOT NULL,
-                processed_at TEXT
-            );
-            CREATE TABLE claims (
-                path TEXT PRIMARY KEY,
-                holder TEXT NOT NULL,
-                task TEXT,
-                grant TEXT,
-                acquired_at TEXT NOT NULL,
-                expires_at REAL NOT NULL,
-                expires_human TEXT NOT NULL,
-                contested INTEGER NOT NULL DEFAULT 0
-            );",
-        )
-        .unwrap();
-        let _ = db::open;
-        conn
+        // Use the real, fully-migrated schema rather than a hand-rolled
+        // subset: fixtures drift silently when migrations add columns the
+        // queries under test depend on (e.g. v11's messages.archived_at).
+        db::open_in_memory().unwrap()
     }
 
     fn parked(agent: &str, waiting_on: &str) -> ParkedTask {
@@ -1239,5 +1278,83 @@ mod tests {
         store::insert_task(&ctx.conn, &task).unwrap();
         let status = agent_activity_status(&ctx, "beta").unwrap();
         assert_eq!(status.state, AgentActivityState::AvailableToHelp);
+    }
+
+    // ------------------------------------------------------- R23 starvation
+
+    #[test]
+    fn starvation_count_increments_and_clears() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = migrated_ctx(&temp);
+        let now = crate::crypto::now_iso();
+        assert_eq!(store::get_starvation_count(&ctx.conn, "alpha").unwrap(), 0);
+        store::increment_starvation(&ctx.conn, "alpha", &now).unwrap();
+        store::increment_starvation(&ctx.conn, "alpha", &now).unwrap();
+        assert_eq!(store::get_starvation_count(&ctx.conn, "alpha").unwrap(), 2);
+        // Launching clears it — the count tracks CONSECUTIVE deferrals only.
+        store::clear_starvation(&ctx.conn, "alpha").unwrap();
+        assert_eq!(store::get_starvation_count(&ctx.conn, "alpha").unwrap(), 0);
+    }
+
+    #[test]
+    fn starvation_counts_map_omits_zeroed_agents() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = migrated_ctx(&temp);
+        let now = crate::crypto::now_iso();
+        store::increment_starvation(&ctx.conn, "starved", &now).unwrap();
+        let map = store::starvation_counts(&ctx.conn).unwrap();
+        assert_eq!(map.get("starved"), Some(&1));
+        assert!(map.get("never-deferred").is_none());
+    }
+
+    #[test]
+    fn starved_candidate_sorts_ahead_of_ordinary_one() {
+        // Two agents with equally-valid inbox wakes. Without starvation, the
+        // deterministic sort would order them alphabetically (alpha before
+        // zeta). Give zeta a starvation count at the threshold and it must jump
+        // to the front, so that under a budget of 1 it is the one that launches.
+        let temp = tempfile::tempdir().unwrap();
+        let mut ctx = migrated_ctx(&temp);
+        ctx.config.squire.max_concurrent = 1;
+        ctx.config.squire.starvation_ticks = 3;
+        crate::commands::cmd_add_agent(&ctx, "alpha", &["src/a/**".to_string()], &[], None, Some("opencode")).unwrap();
+        crate::commands::cmd_add_agent(&ctx, "zeta", &["src/z/**".to_string()], &[], None, Some("opencode")).unwrap();
+        // Both have unread inbox mail -> both are Inbox candidates.
+        crate::commands::cmd_send(&ctx, "user", "alpha", "question", "normal", "for alpha", "", &None, &None, &[]).unwrap();
+        crate::commands::cmd_send(&ctx, "user", "zeta", "question", "normal", "for zeta", "", &None, &None, &[]).unwrap();
+        // zeta has been starved to the threshold.
+        let now = crate::crypto::now_iso();
+        for _ in 0..3 {
+            store::increment_starvation(&ctx.conn, "zeta", &now).unwrap();
+        }
+        let plan = wake_plan(&ctx).unwrap();
+        assert_eq!(
+            plan.candidates.first().map(|c| c.agent.as_str()),
+            Some("zeta"),
+            "starved zeta must sort ahead of alpha; got {:?}",
+            plan.candidates.iter().map(|c| &c.agent).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn below_threshold_does_not_promote() {
+        // A candidate deferred only twice (threshold 3) is NOT promoted — the
+        // normal alphabetical order still holds.
+        let temp = tempfile::tempdir().unwrap();
+        let mut ctx = migrated_ctx(&temp);
+        ctx.config.squire.starvation_ticks = 3;
+        crate::commands::cmd_add_agent(&ctx, "alpha", &["src/a/**".to_string()], &[], None, Some("opencode")).unwrap();
+        crate::commands::cmd_add_agent(&ctx, "zeta", &["src/z/**".to_string()], &[], None, Some("opencode")).unwrap();
+        crate::commands::cmd_send(&ctx, "user", "alpha", "question", "normal", "for alpha", "", &None, &None, &[]).unwrap();
+        crate::commands::cmd_send(&ctx, "user", "zeta", "question", "normal", "for zeta", "", &None, &None, &[]).unwrap();
+        let now = crate::crypto::now_iso();
+        store::increment_starvation(&ctx.conn, "zeta", &now).unwrap();
+        store::increment_starvation(&ctx.conn, "zeta", &now).unwrap(); // only 2 < 3
+        let plan = wake_plan(&ctx).unwrap();
+        assert_eq!(
+            plan.candidates.first().map(|c| c.agent.as_str()),
+            Some("alpha"),
+            "below-threshold zeta must NOT jump the queue"
+        );
     }
 }

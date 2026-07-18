@@ -214,6 +214,66 @@ pub fn setup_session_ui(session: &str, ui: &UiConfig) -> Result<()> {
         ],
     )?;
 
+    // Per-session message-history split for the focused agent pane. Unlike the
+    // inbox split (which shows only unprocessed messages), this shows the full
+    // threaded history for the focused agent, so when an agent is asleep the
+    // user can see the reply it's parked on or the exchange that led there --
+    // "press M to see why it went to sleep" from the design. Uses the
+    // `history --agent` command (which supersedes a standalone per-agent
+    // messages command); pane-aware via `#{pane_title}`, expanded by tmux at
+    // trigger time so it targets whichever agent pane is focused.
+    let messages_cmd = format!(
+        "trelane --root \\\"$(cat {root_marker} 2>/dev/null || echo $HOME)\\\" \
+         history --agent \\\"#{{pane_title}}\\\"; echo; echo '[press any key to close]'; read -n 1",
+    );
+    tmux(
+        "bind-key message-history",
+        &[
+            "bind-key",
+            "-n",
+            &ui.keys.message_history,
+            "split-window",
+            "-v",
+            "-l",
+            "40%",
+            &messages_cmd,
+        ],
+    )?;
+
+    // Per-session diagnostic toggle for the focused agent pane. This is the
+    // per-agent view (live details about THAT agent), distinct from
+    // `diagnostic_view` above which opens the whole-session Trelane TUI.
+    //
+    // Honest scope note: there is not yet a dedicated per-agent diagnostic
+    // *screen* (that would be a new `trelane agent-status <name>` command, a
+    // clean follow-up). Until then, D binds to the richest per-agent view that
+    // exists today -- the focused agent's message history via `history
+    // --agent` -- so the key is wired and useful now rather than bound to a
+    // command that doesn't exist. When the per-agent screen lands, only this
+    // one command string changes. Pane-aware via `#{pane_title}`.
+    //
+    // A true in-place "swap this pane's content" is deliberately NOT attempted:
+    // respawning the pane would kill the live agent process. A split is the
+    // safe form that never disturbs the agent.
+    let session_diag_cmd = format!(
+        "trelane --root \\\"$(cat {root_marker} 2>/dev/null || echo $HOME)\\\" \
+         history --agent \\\"#{{pane_title}}\\\"; \
+         echo; echo '[press any key to close]'; read -n 1",
+    );
+    tmux(
+        "bind-key session-diagnostic",
+        &[
+            "bind-key",
+            "-n",
+            &ui.keys.session_diagnostic,
+            "split-window",
+            "-v",
+            "-l",
+            "40%",
+            &session_diag_cmd,
+        ],
+    )?;
+
     // Verbose toggle: flip the marker file and flash a confirmation in the
     // tmux message line. The squire re-reads the marker every tick.
     let marker = verbose_marker_path(session);

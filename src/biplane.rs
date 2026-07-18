@@ -570,6 +570,11 @@ pub struct BiplaneReport {
     pub deadlock: Option<Vec<String>>,
     pub safe_pocket_features: Vec<String>,
     pub recommendations: Vec<String>,
+    /// Static deadlock-likelihood estimate derived from the domain structure
+    /// at analysis time. Displayed in the Trelane diagnostics UI. Optional so
+    /// reports produced before this field existed still deserialize.
+    #[serde(default)]
+    pub entropy: Option<crate::entropy::EntropyScore>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -716,6 +721,40 @@ pub fn generate_biplane_report(
         ));
     }
 
+    // Static deadlock-likelihood estimate from the domain structure. Built
+    // from the same agent/domain data already gathered above plus the live
+    // cycle signal, so it costs no extra analysis pass.
+    //
+    // Dependency edges (depends_on) live on the stored ProjectDescription, not
+    // on BiplaneAgentSummary, so we read them from disk when a description is
+    // present and key them by domain name. When no description exists (agents
+    // registered directly), the estimate is overlap- and count-driven only —
+    // still a meaningful signal, just missing the dependency dimension.
+    let desc_path = ctx.trelane_dir().join("biplane-description.json");
+    let depends_by_name: std::collections::HashMap<String, Vec<String>> = desc_path
+        .exists()
+        .then(|| load_project_description(&desc_path).ok())
+        .flatten()
+        .map(|desc| {
+            desc.domains
+                .into_iter()
+                .map(|d| (d.name, d.depends_on))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let domain_views: Vec<crate::entropy::DomainView> = agent_summaries
+        .iter()
+        .map(|a| crate::entropy::DomainView {
+            name: a.name.clone(),
+            writable: a.writable.clone(),
+            depends_on: depends_by_name.get(&a.name).cloned().unwrap_or_default(),
+        })
+        .collect();
+    let entropy = Some(crate::entropy::compute(
+        crate::entropy::inputs_from_domains(&domain_views, deadlock.is_some()),
+    ));
+
     let report = BiplaneReport {
         project_root: ctx.root.display().to_string(),
         analysis_at: crate::crypto::now_iso(),
@@ -725,6 +764,7 @@ pub fn generate_biplane_report(
         deadlock,
         safe_pocket_features,
         recommendations,
+        entropy,
     };
 
     Ok(report)

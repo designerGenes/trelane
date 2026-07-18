@@ -6,12 +6,14 @@ pub mod crypto;
 pub mod db;
 pub mod diagnostic;
 pub mod domain;
+pub mod entropy;
 pub mod error;
 pub mod logo;
 pub mod models;
 pub mod prompt;
 pub mod prop;
 pub mod pump;
+pub mod retention;
 pub mod splash;
 pub mod squire;
 pub mod store;
@@ -492,9 +494,33 @@ pub fn handle(cli: Cli) -> Result<()> {
                 &ctx, &from, &to, &msg_type, &urgency, &subject, &body, &re, &task, &paths,
             )
         }
-        Some(Command::Inbox { agent, json }) => {
+        Some(Command::Inbox {
+            agent,
+            json,
+            include_archived,
+        }) => {
             let ctx = Context::open(cli.root.as_deref())?;
-            commands::cmd_inbox(&ctx, &agent, json)
+            commands::cmd_inbox(&ctx, &agent, json, include_archived)
+        }
+        Some(Command::Outbox { agent, json }) => {
+            let ctx = Context::open(cli.root.as_deref())?;
+            commands::cmd_outbox(&ctx, &agent, json)
+        }
+        Some(Command::History {
+            agent,
+            include_archived,
+            json,
+        }) => {
+            let ctx = Context::open(cli.root.as_deref())?;
+            commands::cmd_history(&ctx, agent.as_deref(), include_archived, json)
+        }
+        Some(Command::Bulletin { action }) => {
+            let ctx = Context::open(cli.root.as_deref())?;
+            commands::cmd_bulletin(&ctx, &action)
+        }
+        Some(Command::Retention { action }) => {
+            let ctx = Context::open(cli.root.as_deref())?;
+            commands::cmd_retention(&ctx, &action)
         }
         Some(Command::Ack { agent, msg_id }) => {
             let ctx = Context::open(cli.root.as_deref())?;
@@ -814,6 +840,9 @@ pub fn handle(cli: Cli) -> Result<()> {
 /// use in "unknown key" errors. Keep in sync with the match arms below.
 const KNOWN_CONFIG_KEYS: &str =
     "squire.max_concurrent, squire.interval_s, squire.reply_timeout_s, \
+     squire.breaker_escalation_count, squire.starvation_ticks, \
+     di.objection_window_s, di.request_timeout_s, di.claim_contested_timeout_s, \
+     retention.hot_days, retention.dormant_days, retention.purge_days, \
      claims.default_ttl_s, workspace.mode";
 
 fn unknown_config_key(key: &str) -> TrelaneError {
@@ -830,6 +859,18 @@ fn config_get(config: &Config, key: &str) -> Result<String> {
         "squire.reply_timeout_s" => config
             .squire
             .reply_timeout_s
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        "squire.breaker_escalation_count" => config.squire.breaker_escalation_count.to_string(),
+        "squire.starvation_ticks" => config.squire.starvation_ticks.to_string(),
+        "di.objection_window_s" => config.di.objection_window_s.to_string(),
+        "di.request_timeout_s" => config.di.request_timeout_s.to_string(),
+        "di.claim_contested_timeout_s" => config.di.claim_contested_timeout_s.to_string(),
+        "retention.hot_days" => config.retention.hot_days.to_string(),
+        "retention.dormant_days" => config.retention.dormant_days.to_string(),
+        "retention.purge_days" => config
+            .retention
+            .purge_days
             .map(|v| v.to_string())
             .unwrap_or_else(|| "none".to_string()),
         "claims.default_ttl_s" => config.claims.default_ttl_s.to_string(),
@@ -861,6 +902,23 @@ fn config_set(config: &mut Config, key: &str, value: &str) -> Result<()> {
         "squire.interval_s" => config.squire.interval_s = parse_u64(value)?,
         "squire.reply_timeout_s" => {
             config.squire.reply_timeout_s = match value {
+                "none" | "off" | "" => None,
+                v => Some(parse_u64(v)?),
+            };
+        }
+        "squire.breaker_escalation_count" => {
+            config.squire.breaker_escalation_count = parse_u64(value)? as i64
+        }
+        "squire.starvation_ticks" => config.squire.starvation_ticks = parse_u64(value)? as i64,
+        "di.objection_window_s" => config.di.objection_window_s = parse_u64(value)?,
+        "di.request_timeout_s" => config.di.request_timeout_s = parse_u64(value)?,
+        "di.claim_contested_timeout_s" => {
+            config.di.claim_contested_timeout_s = parse_u64(value)?
+        }
+        "retention.hot_days" => config.retention.hot_days = parse_u64(value)?,
+        "retention.dormant_days" => config.retention.dormant_days = parse_u64(value)?,
+        "retention.purge_days" => {
+            config.retention.purge_days = match value {
                 "none" | "off" | "" => None,
                 v => Some(parse_u64(v)?),
             };
@@ -913,6 +971,42 @@ fn cmd_config_explain(key: &str) -> Result<()> {
         "squire.reply_timeout_s" => {
             "Seconds a reply-wait park may sit before the squire declares it abandoned and\n\
              wakes the waiting agent. 'none' disables timeout-based abandonment."
+        }
+        "squire.breaker_escalation_count" => {
+            "R24: how many times the same agent may be woken as designated breaker for the\n\
+             same wait-cycle before the cycle escalates (a different deterministic tie-break\n\
+             is tried, then the cycle is surfaced as needing a human). Default: 3."
+        }
+        "squire.starvation_ticks" => {
+            "R23: a wake candidate that has been valid but unchosen for this many consecutive\n\
+             ticks is guaranteed one of the next tick's capacity slots, ahead of ordinary\n\
+             ordering. Default: 10 (~3.3 minutes at the default 20s tick interval)."
+        }
+        "di.objection_window_s" => {
+            "Seconds a non-owner DI approval must stand unvetoed before the request resolves\n\
+             to Approved (R9). Gives the domain owner a real chance to see and veto it.\n\
+             Default: 300 (5 minutes)."
+        }
+        "di.request_timeout_s" => {
+            "Seconds a domain-intrusion request may sit with no approval and no veto before\n\
+             it transitions to Expired -- never silently Approved (R25). Default: 3600."
+        }
+        "di.claim_contested_timeout_s" => {
+            "Seconds a claim-contested park (an approved DI whose claim lost the lease race,\n\
+             R26) may sit before the contention is abandoned and the requester is woken.\n\
+             Default: 1800 (30 minutes)."
+        }
+        "retention.hot_days" => {
+            "Messages untouched for longer than this many days are archived: excluded from\n\
+             default queries, fully readable under --include-archived (R15). Default: 30."
+        }
+        "retention.dormant_days" => {
+            "A whole project with zero agent activity for this many days is flagged dormant\n\
+             (a marker only; no data is touched). Default: 90."
+        }
+        "retention.purge_days" => {
+            "Real deletion threshold in days. 'none' (the default) means nothing is ever\n\
+             deleted -- deletion only happens when this is explicitly configured (R15)."
         }
         "claims.default_ttl_s" => {
             "Default lease duration (in seconds) for a file claim when --ttl is not given."

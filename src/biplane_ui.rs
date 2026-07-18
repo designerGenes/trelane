@@ -25,6 +25,64 @@ pub struct DomainRow {
     pub include: bool,
 }
 
+/// The two "sub screens" the Excalidraw calls for inside the Biplane UI. These
+/// are NOT tabs in the ratatui sense — they occupy the full content area and
+/// are toggled with the `T` key. Kept as a plain enum so the render layer just
+/// matches on it; adding a third view later is a one-line change here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BiplaneView {
+    /// Domain view: the editable list of proposed domains (the default).
+    Domains,
+    /// Project view: full-project detail, itself switchable between the raw
+    /// machine-readable report and the AI-written summary.
+    Project,
+}
+
+impl BiplaneView {
+    pub fn toggle(self) -> Self {
+        match self {
+            BiplaneView::Domains => BiplaneView::Project,
+            BiplaneView::Project => BiplaneView::Domains,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BiplaneView::Domains => "Domains",
+            BiplaneView::Project => "Project",
+        }
+    }
+}
+
+/// Within the Project view, which of the two content forms is showing. The
+/// Excalidraw specifies the project view "can show either full text of the
+/// Biplane report (JSON) OR an AI summary." This is the toggle between them,
+/// driven by a separate key so it doesn't collide with the view toggle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectPane {
+    /// The AI-written natural-language summary of the project (the default —
+    /// it's the friendlier first thing to see).
+    Summary,
+    /// The full machine-readable report JSON.
+    ReportJson,
+}
+
+impl ProjectPane {
+    pub fn toggle(self) -> Self {
+        match self {
+            ProjectPane::Summary => ProjectPane::ReportJson,
+            ProjectPane::ReportJson => ProjectPane::Summary,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ProjectPane::Summary => "AI Summary",
+            ProjectPane::ReportJson => "Report JSON",
+        }
+    }
+}
+
 /// The full editor state. Every mutation goes through the pure methods below.
 #[derive(Debug, Clone)]
 pub struct BiplaneUiState {
@@ -44,6 +102,16 @@ pub struct BiplaneUiState {
     pub status: Option<String>,
     /// Source of the description ("loaded from file" vs "scaffolded").
     pub source: String,
+    /// Which sub-screen is showing. Toggled with `T`.
+    pub view: BiplaneView,
+    /// Within the Project view, which content form. Toggled with `V`.
+    pub project_pane: ProjectPane,
+    /// The pretty-printed Biplane report JSON, shown in the Project view's
+    /// ReportJson pane. None until an analysis has been attached; the render
+    /// layer shows a friendly placeholder in that case.
+    pub report_json: Option<String>,
+    /// Scroll offset for the Project view's content (both panes can be long).
+    pub project_scroll: u16,
 }
 
 impl BiplaneUiState {
@@ -69,6 +137,49 @@ impl BiplaneUiState {
             save_requested: false,
             status: None,
             source: source.into(),
+            view: BiplaneView::Domains,
+            project_pane: ProjectPane::Summary,
+            report_json: None,
+            project_scroll: 0,
+        }
+    }
+
+    /// Attach a pretty-printed report JSON for the Project view. Kept separate
+    /// from `from_description` so the state can be constructed without a report
+    /// (the common case at first launch) and enriched later once analysis runs.
+    pub fn with_report_json(mut self, json: impl Into<String>) -> Self {
+        self.report_json = Some(json.into());
+        self
+    }
+
+    /// Toggle between the Domain and Project sub-screens (`T`). Resets the
+    /// project scroll so re-entering the view starts at the top.
+    pub fn toggle_view(&mut self) {
+        self.view = self.view.toggle();
+        self.project_scroll = 0;
+    }
+
+    /// Toggle the Project view's content form between AI summary and report
+    /// JSON (`V`). No-op unless the Project view is active, so the key is inert
+    /// where it would be meaningless. Resets scroll on switch.
+    pub fn toggle_project_pane(&mut self) {
+        if self.view == BiplaneView::Project {
+            self.project_pane = self.project_pane.toggle();
+            self.project_scroll = 0;
+        }
+    }
+
+    /// Scroll the Project view content. Only meaningful in the Project view;
+    /// saturating so it never underflows past the top.
+    pub fn project_scroll_down(&mut self) {
+        if self.view == BiplaneView::Project {
+            self.project_scroll = self.project_scroll.saturating_add(1);
+        }
+    }
+
+    pub fn project_scroll_up(&mut self) {
+        if self.view == BiplaneView::Project {
+            self.project_scroll = self.project_scroll.saturating_sub(1);
         }
     }
 
@@ -221,6 +332,21 @@ pub fn run(root: &std::path::Path) -> Result<()> {
     };
 
     let mut state = BiplaneUiState::from_description(&desc, source);
+
+    // Attach the stored report JSON if an analysis has produced one, so the
+    // Project view's Report pane shows real content. Best-effort: absence just
+    // means the pane shows its placeholder.
+    let report_path = root.join(".trelane").join("biplane-report.json");
+    if let Ok(txt) = std::fs::read_to_string(&report_path) {
+        // Re-pretty-print so the displayed JSON is readable regardless of how
+        // it was written; fall back to the raw text if it doesn't parse.
+        let pretty = serde_json::from_str::<serde_json::Value>(&txt)
+            .ok()
+            .and_then(|v| serde_json::to_string_pretty(&v).ok())
+            .unwrap_or(txt);
+        state = state.with_report_json(pretty);
+    }
+
     run_loop(root, &mut state)
 }
 
@@ -255,24 +381,39 @@ fn run_loop(root: &std::path::Path, state: &mut BiplaneUiState) -> Result<()> {
                     if key.kind != KeyEventKind::Press {
                         continue;
                     }
+                    // Keys common to every view come first; view-specific keys
+                    // are dispatched by the active sub-screen. This is the one
+                    // place that knows which view is active, so the pure state
+                    // methods stay view-agnostic and individually testable.
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => state.should_quit = true,
-                        KeyCode::Up => state.cursor_up(),
-                        KeyCode::Down => state.cursor_down(),
-                        KeyCode::Char(' ') | KeyCode::Enter => state.toggle_include(),
-                        KeyCode::Left => state.adjust_agents(false),
-                        KeyCode::Right => state.adjust_agents(true),
-                        KeyCode::Char('[') => state.adjust_budget(false),
-                        KeyCode::Char(']') => state.adjust_budget(true),
-                        KeyCode::Char('K') => state.move_up(),
-                        KeyCode::Char('J') => state.move_down(),
+                        KeyCode::Char('T') | KeyCode::Tab => state.toggle_view(),
+                        KeyCode::Char('V') => state.toggle_project_pane(),
                         KeyCode::Char('s') => {
                             if let Some(desc) = state.validated() {
                                 save_description(root, &desc)?;
                                 state.mark_saved();
                             }
                         }
-                        _ => {}
+                        other => match state.view {
+                            BiplaneView::Domains => match other {
+                                KeyCode::Up => state.cursor_up(),
+                                KeyCode::Down => state.cursor_down(),
+                                KeyCode::Char(' ') | KeyCode::Enter => state.toggle_include(),
+                                KeyCode::Left => state.adjust_agents(false),
+                                KeyCode::Right => state.adjust_agents(true),
+                                KeyCode::Char('[') => state.adjust_budget(false),
+                                KeyCode::Char(']') => state.adjust_budget(true),
+                                KeyCode::Char('K') => state.move_up(),
+                                KeyCode::Char('J') => state.move_down(),
+                                _ => {}
+                            },
+                            BiplaneView::Project => match other {
+                                KeyCode::Up => state.project_scroll_up(),
+                                KeyCode::Down => state.project_scroll_down(),
+                                _ => {}
+                            },
+                        },
                     }
                 }
             }
@@ -399,18 +540,58 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
             ]))
         })
         .collect();
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Domains ")
-            .border_style(Style::default().fg(accent)),
-    );
-    f.render_widget(list, chunks[1]);
+    // Content area (chunks[1]) depends on the active sub-screen.
+    match state.view {
+        BiplaneView::Domains => {
+            let list = List::new(items).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Domains ")
+                    .border_style(Style::default().fg(accent)),
+            );
+            f.render_widget(list, chunks[1]);
+        }
+        BiplaneView::Project => {
+            let (title, body): (&str, String) = match state.project_pane {
+                ProjectPane::Summary => (
+                    " Project — AI Summary  (V: report JSON) ",
+                    if state.project_summary.trim().is_empty() {
+                        "(no AI summary available — run analysis with G)".to_string()
+                    } else {
+                        state.project_summary.clone()
+                    },
+                ),
+                ProjectPane::ReportJson => (
+                    " Project — Report JSON  (V: AI summary) ",
+                    state.report_json.clone().unwrap_or_else(|| {
+                        "(no analysis report yet — run analysis with G)".to_string()
+                    }),
+                ),
+            };
+            let para = Paragraph::new(body)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(title)
+                        .border_style(Style::default().fg(accent)),
+                )
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .scroll((state.project_scroll, 0));
+            f.render_widget(para, chunks[1]);
+        }
+    }
 
-    // Footer
-    let hint = state.status.clone().unwrap_or_else(|| {
-        "↑↓ move  space include  ←→ agents  [ ] budget  K/J reorder  s save  q quit".to_string()
-    });
+    // Footer — hint depends on the active view so keys shown are the live ones.
+    let default_hint = match state.view {
+        BiplaneView::Domains => {
+            "↑↓ move  space include  ←→ agents  [ ] budget  K/J reorder  T project  s save  q quit"
+        }
+        BiplaneView::Project => "↑↓ scroll  V switch pane  T domains  s save  q quit",
+    };
+    let hint = state
+        .status
+        .clone()
+        .unwrap_or_else(|| default_hint.to_string());
     let footer = Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(dim)))).block(
         Block::default()
             .borders(Borders::ALL)
@@ -582,5 +763,76 @@ mod tests {
         assert!(s.dirty);
         s.mark_saved();
         assert!(!s.dirty);
+    }
+
+    // ------------------------------------------------------ view/pane tests
+
+    #[test]
+    fn defaults_to_domain_view_and_summary_pane() {
+        let s = state();
+        assert_eq!(s.view, BiplaneView::Domains);
+        assert_eq!(s.project_pane, ProjectPane::Summary);
+    }
+
+    #[test]
+    fn toggle_view_flips_and_resets_scroll() {
+        let mut s = state();
+        s.view = BiplaneView::Project;
+        s.project_scroll = 5;
+        s.toggle_view();
+        assert_eq!(s.view, BiplaneView::Domains);
+        assert_eq!(s.project_scroll, 0, "scroll resets on view switch");
+        s.toggle_view();
+        assert_eq!(s.view, BiplaneView::Project);
+    }
+
+    #[test]
+    fn project_pane_toggle_is_inert_outside_project_view() {
+        let mut s = state();
+        assert_eq!(s.view, BiplaneView::Domains);
+        s.toggle_project_pane();
+        assert_eq!(
+            s.project_pane,
+            ProjectPane::Summary,
+            "V does nothing in Domains view"
+        );
+    }
+
+    #[test]
+    fn project_pane_toggles_inside_project_view() {
+        let mut s = state();
+        s.toggle_view(); // -> Project
+        s.toggle_project_pane();
+        assert_eq!(s.project_pane, ProjectPane::ReportJson);
+        s.toggle_project_pane();
+        assert_eq!(s.project_pane, ProjectPane::Summary);
+    }
+
+    #[test]
+    fn project_scroll_only_moves_in_project_view_and_saturates() {
+        let mut s = state();
+        // In Domains view, scroll is inert.
+        s.project_scroll_down();
+        assert_eq!(s.project_scroll, 0);
+        // In Project view it moves, and never underflows past 0.
+        s.toggle_view();
+        s.project_scroll_up();
+        assert_eq!(s.project_scroll, 0, "saturates at top");
+        s.project_scroll_down();
+        s.project_scroll_down();
+        assert_eq!(s.project_scroll, 2);
+        s.project_scroll_up();
+        assert_eq!(s.project_scroll, 1);
+    }
+
+    #[test]
+    fn with_report_json_attaches_content() {
+        let s = state().with_report_json("{\"k\":1}");
+        assert_eq!(s.report_json.as_deref(), Some("{\"k\":1}"));
+    }
+
+    #[test]
+    fn report_json_absent_by_default() {
+        assert!(state().report_json.is_none());
     }
 }

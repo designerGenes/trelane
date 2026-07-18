@@ -17,7 +17,28 @@ pub const MSG_TYPES: &[&str] = &[
     "review-result",
     "handoff",
     "system",
+    // TMP v1.0 structured types (src/rules/trelane-message-protocol.schema.json).
+    // The Squire must be able to decode every type an agent can send (R4).
+    "park",
+    "wake",
+    "di_request",
+    "di_approve",
+    "di_deny",
+    "claim",
+    "bulletin",
+    "domain_change_notice",
+    "split_proposal_notice",
+    "quiescence_notice",
+    "custom",
 ];
+
+/// TMP v1.0 protocol version stamped on every message (GAP-03).
+pub const TMP_VERSION: &str = "1.0";
+
+/// Message channels (TMP envelope). `direct` = inbox-addressed; `bulletin` =
+/// domain-scoped board that never wakes anyone (R13).
+pub const CHANNEL_DIRECT: &str = "direct";
+pub const CHANNEL_BULLETIN: &str = "bulletin";
 
 pub const URGENCIES: &[&str] = &["low", "normal", "high", "critical"];
 
@@ -34,6 +55,10 @@ pub struct Config {
     #[serde(alias = "pump", alias = "prop")]
     pub squire: SquireConfig,
     pub claims: ClaimsConfig,
+    #[serde(default)]
+    pub di: DiConfig,
+    #[serde(default)]
+    pub retention: RetentionConfig,
     #[serde(default)]
     pub ui: UiConfig,
     #[serde(default)]
@@ -81,10 +106,14 @@ impl Default for Config {
                 // so aggressive that a legitimately slow agent gets
                 // force-expired in normal operation.
                 reply_timeout_s: Some(3600),
+                breaker_escalation_count: default_breaker_escalation_count(),
+                starvation_ticks: default_starvation_ticks(),
             },
             claims: ClaimsConfig {
                 default_ttl_s: 900,
             },
+            di: DiConfig::default(),
+            retention: RetentionConfig::default(),
             ui: UiConfig::default(),
             biplane: BiplaneConfig::default(),
             workspace: WorkspaceConfig::default(),
@@ -128,6 +157,81 @@ pub struct SquireConfig {
     /// triggers abandonment in that case.
     #[serde(default)]
     pub reply_timeout_s: Option<u64>,
+    /// R24: how many times the same agent may be woken as designated breaker
+    /// for the same wait-cycle before the cycle escalates (a different
+    /// tie-break is tried, then the cycle is surfaced as needing a human).
+    /// Default 3.
+    #[serde(default = "default_breaker_escalation_count")]
+    pub breaker_escalation_count: i64,
+    /// R23: a candidate that has been valid but unchosen for this many
+    /// consecutive ticks is guaranteed one of the next tick's capacity slots,
+    /// ahead of ordinary ordering. Default 10 (at the default 20s interval,
+    /// an agent waits at most ~3.3 minutes before its slot is guaranteed).
+    #[serde(default = "default_starvation_ticks")]
+    pub starvation_ticks: i64,
+}
+
+fn default_breaker_escalation_count() -> i64 {
+    3
+}
+
+fn default_starvation_ticks() -> i64 {
+    10
+}
+
+/// Slice 4A: domain-intrusion (DI) timing configuration. See R9, R25, R26.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiConfig {
+    /// Seconds a non-owner approval must stand, unvetoed, before the request
+    /// resolves to Approved (R9). Long enough for the owner to see the
+    /// request on their next wake; short enough that a non-responsive owner
+    /// doesn't block work for a full squire cycle. Default 300 (5 minutes).
+    pub objection_window_s: u64,
+    /// Seconds a DI request may sit with no approval and no veto before it
+    /// transitions to Expired -- never silently Approved (R25). Default 3600.
+    pub request_timeout_s: u64,
+    /// Seconds a `claim-contested` park (an approved DI whose claim lost the
+    /// lease race, R26) may sit before the contention is abandoned and the
+    /// requester is woken. Default 1800 (30 minutes).
+    pub claim_contested_timeout_s: u64,
+}
+
+impl Default for DiConfig {
+    fn default() -> Self {
+        Self {
+            objection_window_s: 300,
+            request_timeout_s: 3600,
+            claim_contested_timeout_s: 1800,
+        }
+    }
+}
+
+/// Slice 4D: retention configuration (R15). Staleness demotes to a colder
+/// tier; nothing is ever deleted unless `purge_days` is explicitly set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetentionConfig {
+    /// Messages untouched for longer than this many days are archived:
+    /// excluded from default queries, fully readable under
+    /// `--include-archived`. Default 30.
+    pub hot_days: u64,
+    /// A whole project with zero agent activity for this many days is
+    /// flagged dormant (a marker only; no data is touched). Default 90.
+    pub dormant_days: u64,
+    /// Real deletion threshold in days. UNSET by default -- deletion only
+    /// ever happens when this is explicitly configured (R15).
+    pub purge_days: Option<u64>,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            hot_days: 30,
+            dormant_days: 90,
+            purge_days: None,
+        }
+    }
 }
 
 /// Deprecated name for [`SquireConfig`], kept so external code compiles.
@@ -188,6 +292,17 @@ pub struct UiKeys {
     pub pane_right: String,
     pub pane_up: String,
     pub pane_down: String,
+    /// Per-session toggle: swap the focused agent pane between its live session
+    /// view and a diagnostic view of that one agent (NOT the whole Trelane
+    /// session -- that's `diagnostic_view`). Defaults to a function key for the
+    /// same reason as the others: a global tmux root-table binding on a letter
+    /// like `D` would swallow every `D` the user types into an agent's own
+    /// terminal. Set it to `"D"` in config if you accept that tradeoff.
+    pub session_diagnostic: String,
+    /// Per-session key: show the focused (usually asleep) agent's message
+    /// history, so the user can see why it parked. Same letter-vs-function-key
+    /// tradeoff as `session_diagnostic`; set to `"M"` to match the design.
+    pub message_history: String,
 }
 
 impl Default for UiKeys {
@@ -201,6 +316,8 @@ impl Default for UiKeys {
             pane_right: "F7".to_string(),
             pane_up: "F8".to_string(),
             pane_down: "F9".to_string(),
+            session_diagnostic: "F10".to_string(),
+            message_history: "F11".to_string(),
         }
     }
 }
@@ -352,6 +469,34 @@ pub struct Message {
     pub sig: String,
     #[serde(skip)]
     pub processed_at: Option<String>,
+    /// TMP envelope: `direct` (default) or `bulletin` (R12/R13).
+    #[serde(default = "default_channel")]
+    pub channel: String,
+    /// Bulletin scope: the domain this message is posted to. `None` for
+    /// direct messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Id of the message this one replaces (bulletin updates, R12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    /// TMP protocol version.
+    #[serde(default = "default_tmp_version")]
+    pub tmp_version: String,
+    /// R15/4D: last time this message was created, replied to, superseded,
+    /// or otherwise touched. Drives retention archival.
+    #[serde(default)]
+    pub last_touched_at: String,
+    /// R15: set when retention archives the message. `None` = hot tier.
+    #[serde(skip)]
+    pub archived_at: Option<String>,
+}
+
+fn default_channel() -> String {
+    CHANNEL_DIRECT.to_string()
+}
+
+fn default_tmp_version() -> String {
+    TMP_VERSION.to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -369,7 +514,7 @@ impl Message {
         paths: Vec<String>,
         created_at: String,
     ) -> Self {
-        Self {
+        let mut msg = Self {
             id,
             from,
             to,
@@ -384,7 +529,16 @@ impl Message {
             schema: 1,
             sig: String::new(),
             processed_at: None,
-        }
+            channel: default_channel(),
+            scope: None,
+            supersedes: None,
+            tmp_version: default_tmp_version(),
+            last_touched_at: String::new(),
+            archived_at: None,
+        };
+        // last_touched_at defaults to created_at (R15: creation is a touch).
+        msg.last_touched_at = msg.created_at.clone();
+        msg
     }
 }
 

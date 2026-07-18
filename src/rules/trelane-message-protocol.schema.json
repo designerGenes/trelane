@@ -1,0 +1,280 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://trelane.dev/schemas/tmp/1.0.json",
+  "title": "Trelane Message Protocol (TMP) v1.0",
+  "description": "The fixed set of structured messages exchanged between agents and the Squire. A non-AI consumer decodes any message by reading `type`, then reading exactly the fields documented for that type. Agents read the same fields plus the optional human-readable `body`. The `custom` type is the sole free-text carrier; its content is opaque to the Squire.",
+
+  "$comment": "Decode algorithm for a non-AI consumer (the Squire): 1) parse JSON; 2) read the `type` discriminator; 3) dispatch to the handler for that type; 4) read the typed fields listed under that type's variant. Unknown `type` values MUST be rejected, not guessed. The Squire may safely skip any message whose `type` it does not act on (notably `custom`).",
+
+  "type": "object",
+
+  "properties": {
+    "tmp_version": {
+      "type": "string",
+      "const": "1.0",
+      "description": "Protocol version. Consumers reject a message whose version they do not implement rather than partially decoding it."
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^msg-[A-Za-z0-9_-]+$",
+      "description": "Globally unique message id."
+    },
+    "type": {
+      "type": "string",
+      "description": "The discriminator. Selects which variant's fields are present and how the message is decoded.",
+      "enum": [
+        "park",
+        "wake",
+        "di_request",
+        "di_approve",
+        "di_deny",
+        "claim",
+        "bulletin",
+        "domain_change_notice",
+        "split_proposal_notice",
+        "quiescence_notice",
+        "custom"
+      ]
+    },
+    "from": {
+      "type": "string",
+      "description": "Sender identity: an agent id, or the literal \"squire\" for Squire-authored messages.",
+      "minLength": 1
+    },
+    "to": {
+      "type": ["string", "null"],
+      "description": "Recipient agent id. null means the message is not addressed to one agent: a bulletin, a broadcast, or a system-wide notice."
+    },
+    "channel": {
+      "type": "string",
+      "enum": ["direct", "bulletin"],
+      "description": "direct = addressed to `to` and surfaced in that agent's inbox. bulletin = domain-scoped board, pulled on demand, never wakes anyone."
+    },
+    "created_tick": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "The Squire tick at which this message was created. All timeouts and ages in Trelane are counted in ticks, not wall-clock time."
+    },
+    "re": {
+      "type": ["string", "null"],
+      "description": "Id of the message this one replies to, or null. Threads a reply back to what it answers."
+    },
+    "supersedes": {
+      "type": ["string", "null"],
+      "description": "Id of a message this one replaces (e.g. a bulletin update superseding a prior bulletin), or null. Walking the supersedes chain reconstructs how a working set drifted over time."
+    },
+    "body": {
+      "type": ["string", "null"],
+      "description": "Optional human-readable text. Agents read it; the Squire ignores it for every structured type. For the `custom` type it is the entire payload and is REQUIRED."
+    }
+  },
+
+  "required": ["tmp_version", "id", "type", "from", "channel", "created_tick"],
+
+  "allOf": [
+    {
+      "if": { "properties": { "type": { "const": "park" } } },
+      "then": {
+        "properties": {
+          "condition_kind": {
+            "type": "string",
+            "enum": ["reply", "di_request", "cycle_break", "domain_exhausted", "claim_contested"],
+            "description": "What the parked agent is waiting on. The Squire watches for this condition to become true and wakes the agent when it does."
+          },
+          "condition_ref": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The specific thing being awaited: a message id (reply), a DI request id, a claim path, etc. Must be specific enough that the Squire can detect satisfaction — never a vague state."
+          },
+          "parked_since_tick": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Tick the park was recorded. Feeds the abandon-if-too-old backstop and the starvation guarantee."
+          }
+        },
+        "required": ["condition_kind", "condition_ref", "parked_since_tick"]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "wake" } } },
+      "then": {
+        "properties": {
+          "wake_kind": {
+            "type": "string",
+            "enum": ["inbox", "reply_satisfied", "abandoned", "cycle_break", "di_approved", "di_vetoed", "claim_freed", "domain_exhausted"],
+            "description": "The single recorded reason this agent is being woken. Exactly one, never zero, never several."
+          },
+          "reason_ref": {
+            "type": ["string", "null"],
+            "description": "The id the wake refers to (the satisfied message, the resolved DI request, the freed claim), or null for reasons that carry no ref (e.g. plain inbox)."
+          },
+          "domain_change_paths": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Optional. Paths in the woken agent's own domain that changed since it last saw them — attached so the agent can reconcile per the domain-change rule. Empty or absent means no change detected."
+          }
+        },
+        "required": ["wake_kind"]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "di_request" } } },
+      "then": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Id of the domain-intrusion request this message opens. Approvals, vetoes, and the eventual resolution all reference it."
+          },
+          "target_domain": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The domain being intruded upon."
+          },
+          "path_glob": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The path or glob the requester wants to write."
+          },
+          "purpose": {
+            "type": "string",
+            "minLength": 1,
+            "description": "REQUIRED and non-empty. Specific statement of what the requester intends to do and why. A vague purpose is grounds for rejection."
+          },
+          "objection_deadline_tick": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Tick after which a standing non-owner approval resolves to Approved if no veto has arrived. Bounds the owner's veto window."
+          }
+        },
+        "required": ["request_id", "target_domain", "path_glob", "purpose", "objection_deadline_tick"]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "di_approve" } } },
+      "then": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The DI request being approved. Any enabled agent other than the requester may send this."
+          }
+        },
+        "required": ["request_id"]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "di_deny" } } },
+      "then": {
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The DI request being vetoed. Only the registered owner of the target domain may send this."
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "description": "REQUIRED. Why the owner is vetoing. A veto overrides any number of approvals regardless of arrival order."
+          }
+        },
+        "required": ["request_id", "reason"]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "claim" } } },
+      "then": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The path being leased. A claim reserves the file; it is a separate gate from DI permission. Never valid for .trelane/** or .git/**."
+          },
+          "ttl_s": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "Lease duration in seconds. The claim frees automatically when it expires if not renewed."
+          }
+        },
+        "required": ["path", "ttl_s"]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "bulletin" } } },
+      "then": {
+        "properties": {
+          "scope": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The domain this bulletin is scoped to. Agents interested in this domain pull it; it never wakes anyone."
+          },
+          "paths": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Optional. The files the posting agent is working in or intends to touch. Best-effort; may be absent when only intent is being announced."
+          }
+        },
+        "required": ["scope"],
+        "$comment": "channel MUST be \"bulletin\" for this type. Enforced by the channel enum plus consumer convention."
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "domain_change_notice" } } },
+      "then": {
+        "properties": {
+          "changed_paths": {
+            "type": "array",
+            "items": { "type": "string" },
+            "minItems": 1,
+            "description": "Paths in the recipient's own domain that changed without the recipient's action. The agent reconciles these against history before reacting."
+          }
+        },
+        "required": ["changed_paths"]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "split_proposal_notice" } } },
+      "then": {
+        "properties": {
+          "domain": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The owned domain a Biplane pass has proposed splitting."
+          },
+          "proposal_ref": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Id of the pending reconciliation proposal the owner can review. Informational; does not block the owner's current work."
+          }
+        },
+        "required": ["domain", "proposal_ref"]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "quiescence_notice" } } },
+      "then": {
+        "properties": {
+          "tick": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The tick at which total quiescence (zero ready work across every domain at every granularity) was first observed. Informational only — never triggers a wake or an automatic Biplane pass."
+          }
+        },
+        "required": ["tick"]
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "custom" } } },
+      "then": {
+        "properties": {
+          "body": {
+            "type": "string",
+            "minLength": 1,
+            "description": "REQUIRED for custom messages. Free text from one agent to another. The Squire never decodes or acts on this content."
+          }
+        },
+        "required": ["body"]
+      }
+    }
+  ]
+}

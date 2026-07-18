@@ -122,6 +122,22 @@ pub fn bootstrap_template() -> &'static str {
     BOOTSTRAP_TEMPLATE
 }
 
+/// The full protocol ruleset, embedded at compile time from the canonical
+/// sources in `src/rules/for_agents/`. Embedded (not copied at runtime) so
+/// the prompt is self-contained and the rules agents receive can never drift
+/// out of sync with the binary they are running (GAP-02).
+const PROTOCOL_DOC: &str = include_str!("rules/for_agents/TRELANE-PROTOCOL.md");
+const TMP_DOC: &str = include_str!("rules/for_agents/TRELANE-MESSAGE-PROTOCOL.md");
+
+/// The complete agent-facing document: the bootstrap template followed by the
+/// full Trelane Protocol rules and the TMP v1.0 reference. This is what
+/// agents actually receive at wake (via [`compose_prompt`]) and what
+/// `cmd_init` writes to `.trelane/prompts/bootstrap.md` as a readable
+/// reference copy.
+pub fn full_bootstrap() -> String {
+    format!("{BOOTSTRAP_TEMPLATE}\n\n---\n\n{PROTOCOL_DOC}\n\n---\n\n{TMP_DOC}")
+}
+
 pub fn compose_prompt(conn: &Connection, root: &Path, agent: &str, reason: &str) -> Result<String> {
     let domain = store::get_domain(conn, agent)?
         .ok_or_else(|| crate::error::TrelaneError::msg(format!("agent '{agent}' not found")))?;
@@ -167,7 +183,7 @@ pub fn compose_prompt(conn: &Connection, root: &Path, agent: &str, reason: &str)
             .join("\n")
     };
 
-    let mut tpl = BOOTSTRAP_TEMPLATE.to_string();
+    let mut tpl = full_bootstrap();
     let subs: HashMap<&str, String> = [
         ("[[AGENT_ID]]", agent.to_string()),
         ("[[PROJECT_ROOT]]", root.display().to_string()),
@@ -200,7 +216,12 @@ pub fn park_satisfied(conn: &Connection, entry: &crate::models::ParkedTask) -> R
                 None => return Ok(false),
             };
             let msgs = store::get_unprocessed_messages(conn, &entry.agent)?;
-            Ok(msgs.iter().any(|m| m.re.as_deref() == Some(re)))
+            if msgs.iter().any(|m| m.re.as_deref() == Some(re)) {
+                return Ok(true);
+            }
+            // R27: archived or already-processed replies still satisfy the
+            // park -- retention must never outpace resolution.
+            store::any_reply_exists(conn, &entry.agent, re)
         }
         "claim" => {
             let path = match &entry.wait_path {
@@ -371,5 +392,29 @@ mod tests {
         let tpl = bootstrap_template();
         assert!(tpl.contains("squire"));
         assert!(!tpl.contains("the prop"));
+    }
+
+    // ------------------------------------------------------- GAP-02 tests
+
+    #[test]
+    fn full_bootstrap_embeds_protocol_doc() {
+        let full = full_bootstrap();
+        // TRELANE-PROTOCOL.md headline sections must reach the agent.
+        assert!(full.contains("# The Trelane Protocol"));
+        assert!(full.contains("## 4. Domain Intrusion"));
+        assert!(full.contains("## 1. Inbox before anything else"));
+    }
+
+    #[test]
+    fn full_bootstrap_embeds_tmp_reference() {
+        let full = full_bootstrap();
+        assert!(full.contains("Trelane Message Protocol (TMP) v1.0"));
+        assert!(full.contains("di_request"));
+        assert!(full.contains("quiescence_notice"));
+    }
+
+    #[test]
+    fn full_bootstrap_starts_with_bootstrap_template() {
+        assert!(full_bootstrap().starts_with(&BOOTSTRAP_TEMPLATE[..100]));
     }
 }

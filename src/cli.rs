@@ -155,6 +155,41 @@ pub enum Command {
         agent: String,
         #[arg(long = "json")]
         json: bool,
+        #[arg(
+            long = "include-archived",
+            help = "include archived messages (retention-demoted, R15)"
+        )]
+        include_archived: bool,
+    },
+
+    /// Show an agent's outbox: sent but still-unresolved messages.
+    /// Any agent may read any agent's outbox -- visibility, not privacy.
+    Outbox {
+        agent: String,
+        #[arg(long = "json")]
+        json: bool,
+    },
+
+    /// The full permanent message log, threaded via re/supersedes
+    History {
+        #[arg(long = "agent", help = "only messages to/from this agent")]
+        agent: Option<String>,
+        #[arg(long = "include-archived")]
+        include_archived: bool,
+        #[arg(long = "json")]
+        json: bool,
+    },
+
+    /// Post to or read a domain bulletin board (R12; never wakes anyone, R13)
+    Bulletin {
+        #[command(subcommand)]
+        action: BulletinAction,
+    },
+
+    /// Retention maintenance (4D): archival, dormancy, optional purge
+    Retention {
+        #[command(subcommand)]
+        action: RetentionAction,
     },
 
     /// Mark a message as processed
@@ -240,7 +275,11 @@ pub enum Command {
     Done { agent: String },
 
     /// The dutiful squire -- relaunches agents that have a reason to wake
-    /// (`prop` and `pump` still work as aliases)
+    /// (`prop` and `pump` still work as aliases).
+    ///
+    /// Liveness boundary: Trelane never restarts the squire itself. If you
+    /// want the squire kept alive, supervise it from OUTSIDE Trelane --
+    /// launchd, systemd, cron (`--once`), or a `while true` shell loop.
     #[command(alias = "pump", alias = "prop")]
     Squire {
         #[arg(long = "once")]
@@ -347,6 +386,41 @@ pub enum Command {
 
     /// Kill all trelane tmux sessions and stop all running agents
     Kill,
+}
+
+#[derive(Subcommand)]
+pub enum BulletinAction {
+    /// Announce working intent for a domain ahead of the first claim, or
+    /// update a current announcement. Supersedes your previous active entry
+    /// for that domain. Never wakes anyone (R13).
+    Post {
+        #[arg(long = "from")]
+        from: String,
+        #[arg(long = "domain")]
+        domain: String,
+        #[arg(long = "files", default_value = "", help = "comma-separated paths")]
+        files: String,
+        #[arg(long = "body", default_value = "")]
+        body: String,
+    },
+    /// Read a domain's bulletin board, newest first
+    List {
+        #[arg(long = "domain")]
+        domain: String,
+        #[arg(long = "include-archived")]
+        include_archived: bool,
+        #[arg(long = "json")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RetentionAction {
+    /// Run the retention sweep. `--now` bypasses the once-a-day gate.
+    Sweep {
+        #[arg(long = "now")]
+        now: bool,
+    },
 }
 
 #[derive(Subcommand)]

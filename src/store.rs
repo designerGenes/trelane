@@ -110,8 +110,10 @@ pub fn insert_message(conn: &Connection, msg: &Message) -> Result<()> {
     conn.execute(
         "INSERT INTO messages
             (id, from_agent, to_agent, msg_type, urgency, subject, body,
-             re, task, paths_json, created_at, schema_version, sig, processed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL)",
+             re, task, paths_json, created_at, schema_version, sig, processed_at,
+             channel, scope, supersedes, tmp_version, last_touched_at, archived_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, NULL,
+                 ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             msg.id,
             msg.from,
@@ -126,14 +128,30 @@ pub fn insert_message(conn: &Connection, msg: &Message) -> Result<()> {
             msg.created_at,
             msg.schema,
             msg.sig,
+            msg.channel,
+            msg.scope,
+            msg.supersedes,
+            msg.tmp_version,
+            msg.last_touched_at,
+            msg.archived_at,
         ],
     )?;
+    // R15/4D: replying to or superseding a message touches it, keeping it hot
+    // while it is still part of a live conversation. Best-effort: a missing
+    // target row is fine.
+    for target in [msg.re.as_ref(), msg.supersedes.as_ref()].into_iter().flatten() {
+        let _ = conn.execute(
+            "UPDATE messages SET last_touched_at = ?2 WHERE id = ?1",
+            params![target, msg.created_at],
+        );
+    }
     Ok(())
 }
 
 fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
     let paths_json: String = row.get("paths_json")?;
     let paths: Vec<String> = serde_json::from_str(&paths_json).unwrap_or_default();
+    let created_at: String = row.get("created_at")?;
     Ok(Message {
         id: row.get("id")?,
         from: row.get("from_agent")?,
@@ -145,10 +163,18 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
         re: row.get("re")?,
         task: row.get("task")?,
         paths,
-        created_at: row.get("created_at")?,
+        created_at: created_at.clone(),
         schema: row.get("schema_version")?,
         sig: row.get("sig")?,
         processed_at: row.get("processed_at")?,
+        channel: row.get("channel")?,
+        scope: row.get("scope")?,
+        supersedes: row.get("supersedes")?,
+        tmp_version: row.get("tmp_version")?,
+        last_touched_at: row
+            .get::<_, Option<String>>("last_touched_at")?
+            .unwrap_or(created_at),
+        archived_at: row.get("archived_at")?,
     })
 }
 
@@ -164,9 +190,24 @@ pub fn get_message(conn: &Connection, id: &str) -> Result<Option<Message>> {
 }
 
 pub fn get_unprocessed_messages(conn: &Connection, agent: &str) -> Result<Vec<Message>> {
-    let mut stmt = conn.prepare(
-        "SELECT * FROM messages WHERE to_agent = ?1 AND processed_at IS NULL ORDER BY created_at",
-    )?;
+    get_unprocessed_messages_opts(conn, agent, false)
+}
+
+pub fn get_unprocessed_messages_opts(
+    conn: &Connection,
+    agent: &str,
+    include_archived: bool,
+) -> Result<Vec<Message>> {
+    let sql = if include_archived {
+        "SELECT * FROM messages
+         WHERE to_agent = ?1 AND processed_at IS NULL
+         ORDER BY created_at"
+    } else {
+        "SELECT * FROM messages
+         WHERE to_agent = ?1 AND processed_at IS NULL AND archived_at IS NULL
+         ORDER BY created_at"
+    };
+    let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map(params![agent], row_to_message)?;
     let mut out = Vec::new();
     for row in rows {
@@ -176,14 +217,140 @@ pub fn get_unprocessed_messages(conn: &Connection, agent: &str) -> Result<Vec<Me
 }
 
 pub fn get_all_messages_for_agent(conn: &Connection, agent: &str) -> Result<Vec<Message>> {
-    let mut stmt =
-        conn.prepare("SELECT * FROM messages WHERE to_agent = ?1 ORDER BY created_at")?;
+    get_all_messages_for_agent_opts(conn, agent, false)
+}
+
+pub fn get_all_messages_for_agent_opts(
+    conn: &Connection,
+    agent: &str,
+    include_archived: bool,
+) -> Result<Vec<Message>> {
+    let sql = if include_archived {
+        "SELECT * FROM messages WHERE to_agent = ?1 ORDER BY created_at"
+    } else {
+        "SELECT * FROM messages WHERE to_agent = ?1 AND archived_at IS NULL ORDER BY created_at"
+    };
+    let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map(params![agent], row_to_message)?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);
     }
     Ok(out)
+}
+
+// ------------------------------------------------------- four surfaces (4B)
+
+/// Bulletin surface: entries posted to a domain board. Pulled on demand;
+/// never wakes anyone (R13). Newest first.
+pub fn get_bulletin(
+    conn: &Connection,
+    scope: &str,
+    include_archived: bool,
+) -> Result<Vec<Message>> {
+    let sql = if include_archived {
+        "SELECT * FROM messages WHERE channel = 'bulletin' AND scope = ?1
+         ORDER BY created_at DESC"
+    } else {
+        "SELECT * FROM messages WHERE channel = 'bulletin' AND scope = ?1
+         AND archived_at IS NULL ORDER BY created_at DESC"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params![scope], row_to_message)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// The posting agent's currently-active bulletin entry for a scope, if any
+/// (used so a new post can supersede it, and so claim auto-posts update
+/// rather than pile up).
+pub fn get_active_bulletin_entry(
+    conn: &Connection,
+    scope: &str,
+    agent: &str,
+) -> Result<Option<Message>> {
+    let result = conn
+        .query_row(
+            "SELECT * FROM messages
+             WHERE channel = 'bulletin' AND scope = ?1 AND from_agent = ?2
+               AND archived_at IS NULL
+             ORDER BY created_at DESC LIMIT 1",
+            params![scope, agent],
+            row_to_message,
+        )
+        .optional()?;
+    Ok(result)
+}
+
+/// Outbox surface (OQ4): messages an agent has sent that are still
+/// unresolved -- nothing has replied to or superseded them. Queryable by
+/// anyone: the swarm seeing what an agent is waiting on is a feature.
+pub fn get_outbox(conn: &Connection, agent: &str) -> Result<Vec<Message>> {
+    let mut stmt = conn.prepare(
+        "SELECT * FROM messages m
+         WHERE m.from_agent = ?1 AND m.channel = 'direct' AND m.archived_at IS NULL
+           AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.re = m.id)
+           AND NOT EXISTS (SELECT 1 FROM messages s WHERE s.supersedes = m.id)
+         ORDER BY m.created_at DESC",
+    )?;
+    let rows = stmt.query_map(params![agent], row_to_message)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// History surface: the full permanent log, threaded via `re` and
+/// `supersedes`. Optionally filtered to messages to/from one agent.
+pub fn get_history(
+    conn: &Connection,
+    agent: Option<&str>,
+    include_archived: bool,
+) -> Result<Vec<Message>> {
+    let mut sql = String::from("SELECT * FROM messages WHERE 1=1");
+    if agent.is_some() {
+        sql.push_str(" AND (from_agent = ?1 OR to_agent = ?1)");
+    }
+    if !include_archived {
+        sql.push_str(" AND archived_at IS NULL");
+    }
+    sql.push_str(" ORDER BY created_at");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = match agent {
+        Some(a) => stmt.query_map(params![a], row_to_message)?,
+        None => stmt.query_map([], row_to_message)?,
+    };
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// R27: resolution checks look at archived history as a fallback -- an
+/// archived (or already-processed) reply still satisfies the park it
+/// answered.
+pub fn any_reply_exists(conn: &Connection, agent: &str, re_id: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE to_agent = ?1 AND re = ?2",
+        params![agent, re_id],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Archive one message by id (used by retention sweep and bulletin
+/// auto-archival). Best-effort: unknown ids are ignored.
+pub fn archive_message(conn: &Connection, id: &str, at: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE messages SET archived_at = ?2 WHERE id = ?1 AND archived_at IS NULL",
+        params![id, at],
+    )?;
+    Ok(())
 }
 
 pub fn mark_processed(conn: &Connection, agent: &str, msg_id: &str, at: &str) -> Result<()> {
@@ -677,6 +844,66 @@ pub fn list_cycle_break_attempts(conn: &Connection) -> Result<Vec<CycleBreakAtte
         out.push(row?);
     }
     Ok(out)
+}
+
+// --------------------------------------------------------------- starvation
+//
+// R23: per-agent consecutive-deferral tracking. `deferred_ticks` is the number
+// of consecutive squire ticks on which the agent was a valid wake candidate but
+// was pushed past the concurrency budget. It is incremented for every deferred
+// candidate and cleared the moment the agent actually launches, so the count
+// measures *consecutive* starvation, not lifetime deferrals.
+
+/// Current consecutive-deferral count for an agent (0 if never deferred).
+pub fn get_starvation_count(conn: &Connection, agent: &str) -> Result<i64> {
+    let result: Option<i64> = conn
+        .query_row(
+            "SELECT deferred_ticks FROM agent_starvation WHERE agent = ?1",
+            params![agent],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(result.unwrap_or(0))
+}
+
+/// All agents with a non-zero starvation count, as a map. Read once per tick in
+/// `wake_plan` so the sort can consult it without a per-candidate query.
+pub fn starvation_counts(conn: &Connection) -> Result<std::collections::HashMap<String, i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT agent, deferred_ticks FROM agent_starvation WHERE deferred_ticks > 0",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+    let mut out = std::collections::HashMap::new();
+    for row in rows {
+        let (agent, n) = row?;
+        out.insert(agent, n);
+    }
+    Ok(out)
+}
+
+/// Record that an agent was deferred this tick: increment its consecutive
+/// count. Upserts so the first deferral creates the row.
+pub fn increment_starvation(conn: &Connection, agent: &str, now: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO agent_starvation (agent, deferred_ticks, last_deferred_at)
+         VALUES (?1, 1, ?2)
+         ON CONFLICT(agent) DO UPDATE SET
+             deferred_ticks = deferred_ticks + 1,
+             last_deferred_at = ?2",
+        params![agent, now],
+    )?;
+    Ok(())
+}
+
+/// Clear an agent's starvation count — called the moment it launches, so the
+/// count only ever reflects an unbroken run of deferrals. A no-op if the agent
+/// has no row.
+pub fn clear_starvation(conn: &Connection, agent: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM agent_starvation WHERE agent = ?1",
+        params![agent],
+    )?;
+    Ok(())
 }
 
 // --------------------------------------------------------------------- tasks
