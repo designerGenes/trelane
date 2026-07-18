@@ -165,7 +165,7 @@ pub enum ScenarioStep {
     },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScenarioReport {
     pub run: u32,
     pub scenario: String,

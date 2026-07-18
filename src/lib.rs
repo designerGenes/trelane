@@ -874,6 +874,37 @@ pub fn handle(cli: Cli) -> Result<()> {
                 free_models_only,
                 ui,
             ),
+            cli::BenchAction::Suite {
+                dir,
+                runs,
+                max_turns,
+                model,
+                sandbox_root,
+                free_models_only,
+                save_baseline,
+                output,
+            } => bench::run_suite(
+                &dir,
+                runs,
+                max_turns,
+                model.as_deref(),
+                sandbox_root.as_deref(),
+                free_models_only,
+                output.as_deref(),
+                save_baseline.as_deref(),
+            ),
+            cli::BenchAction::Compare {
+                baseline,
+                candidate,
+                threshold_ms,
+                json,
+            } => {
+                let regressed = bench::compare_reports(&baseline, &candidate, threshold_ms, json)?;
+                if regressed {
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
         },
         Some(Command::Help { action }) => {
             let ctx = Context::open(cli.root.as_deref())?;

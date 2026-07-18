@@ -721,4 +721,50 @@ pub enum BenchAction {
         #[arg(long = "ui")]
         ui: bool,
     },
+
+    /// Run every *.scenario.json in a directory and produce a suite report.
+    /// The suite report is the JSON artifact `bench compare` diffs against
+    /// a baseline.
+    Suite {
+        /// Directory containing *.scenario.json files.
+        dir: PathBuf,
+        /// Number of runs per scenario (default 1).
+        #[arg(long = "runs", default_value = "1")]
+        runs: u32,
+        /// Max turns per agent slice.
+        #[arg(long = "max-turns")]
+        max_turns: Option<u32>,
+        /// Model id to launch all agents with.
+        #[arg(long = "model")]
+        model: Option<String>,
+        /// Sandbox root directory.
+        #[arg(long = "sandbox-root")]
+        sandbox_root: Option<PathBuf>,
+        /// Reject any model not in bench.free_models.
+        #[arg(long = "free-models-only")]
+        free_models_only: bool,
+        /// Save the suite report as a baseline at this path (for later
+        /// comparison). If omitted, the report is printed to stdout.
+        #[arg(long = "save-baseline")]
+        save_baseline: Option<PathBuf>,
+        /// Path to write the suite report JSON. If omitted, printed to stdout.
+        #[arg(long = "output")]
+        output: Option<PathBuf>,
+    },
+
+    /// Compare two suite reports and print per-scenario deltas. Exits non-zero
+    /// if any scenario regressed beyond the threshold.
+    Compare {
+        /// Baseline suite report JSON.
+        baseline: PathBuf,
+        /// Candidate suite report JSON.
+        candidate: PathBuf,
+        /// Regression threshold in milliseconds: a scenario whose candidate
+        /// duration exceeds baseline by more than this is a regression.
+        #[arg(long = "threshold-ms", default_value = "0")]
+        threshold_ms: i64,
+        /// Print the comparison as JSON instead of a table.
+        #[arg(long = "json")]
+        json: bool,
+    },
 }
