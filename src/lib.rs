@@ -71,7 +71,13 @@ pub fn load_config() -> Result<Config> {
     let path = ensure_config()?;
     let text = std::fs::read_to_string(&path)
         .map_err(|e| TrelaneError::msg(format!("cannot read config at {}: {e}", path.display())))?;
-    Ok(serde_json::from_str(&text)?)
+    let config: Config = serde_json::from_str(&text)?;
+    // 4A config-inversion guard: a hand-edited config can invert the DI
+    // temporal relationships (objection window longer than the request
+    // lifetime, etc.). Catch it at load so every downstream path sees a
+    // sane config rather than failing cryptically inside di::resolve_pending.
+    config.di.validate()?;
+    Ok(config)
 }
 
 /// Persist a config to the global config file as pretty JSON, creating the
@@ -955,6 +961,13 @@ fn config_set(config: &mut Config, key: &str, value: &str) -> Result<()> {
                 )))?;
         }
         _ => return Err(unknown_config_key(key)),
+    }
+    // 4A config-inversion guard: any change to a di.* key re-validates the
+    // full DiConfig so a `config set` that creates an impossible combination
+    // (e.g. objection_window_s > request_timeout_s) is rejected before it
+    // is persisted, with an error naming the offending relationship.
+    if key.starts_with("di.") {
+        config.di.validate()?;
     }
     Ok(())
 }

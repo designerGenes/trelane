@@ -207,6 +207,42 @@ impl Default for DiConfig {
     }
 }
 
+impl DiConfig {
+    /// 4A config-inversion guard. The DI lifecycle depends on two temporal
+    /// relationships: the objection window must fit inside the request
+    /// lifetime (a non-owner approval that clears the window must still be
+    /// alive to resolve; if `request_timeout_s` fires first, every pending
+    /// non-owner approval silently expires instead of resolving -- an
+    /// operator footgun, not a meaningful mode), and the claim-contested
+    /// park timeout should not outlive the request it is contesting (a
+    /// contention parked on an already-expired request is dead weight).
+    /// Defaults satisfy both; this catches hand-edited configs that do not.
+    /// One canonical site, invoked from every persistence path so file
+    /// edits, `trelane config set`, and the diagnostic editor all enforce it.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        use crate::error::TrelaneError;
+        if self.objection_window_s > self.request_timeout_s {
+            return Err(TrelaneError::msg(format!(
+                "di.objection_window_s ({}) must be <= di.request_timeout_s ({}): \
+                 a non-owner approval that clears the objection window must still be \
+                 alive to resolve. If the request times out first, every pending \
+                 non-owner approval silently expires instead of resolving.",
+                self.objection_window_s, self.request_timeout_s
+            )));
+        }
+        if self.claim_contested_timeout_s > self.request_timeout_s {
+            return Err(TrelaneError::msg(format!(
+                "di.claim_contested_timeout_s ({}) must be <= di.request_timeout_s ({}): \
+                 a claim-contested park (R26) on a request that has already expired \
+                 (R25) is dead weight -- the contention cannot resolve to an approval \
+                 the request no longer has time to grant.",
+                self.claim_contested_timeout_s, self.request_timeout_s
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Slice 4D: retention configuration (R15). Staleness demotes to a colder
 /// tier; nothing is ever deleted unless `purge_days` is explicitly set.
 #[derive(Debug, Clone, Serialize, Deserialize)]

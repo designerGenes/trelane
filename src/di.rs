@@ -606,4 +606,75 @@ mod tests {
         assert!(!has_approved_covering(&ctx, "helper", "src/other.rs").unwrap());
         assert!(!has_approved_covering(&ctx, "third", "src/enemy.rs").unwrap());
     }
+
+    // -------------------------------------------------- 4A config-inversion guard
+
+    #[test]
+    fn di_config_defaults_validate() {
+        // The shipped defaults (300 / 3600 / 1800) are a sane configuration:
+        // the objection window fits well inside the request lifetime, and the
+        // claim-contested timeout does not outlive the request it contests.
+        assert!(crate::models::DiConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn di_config_rejects_objection_window_longer_than_request_timeout() {
+        let mut di = crate::models::DiConfig::default();
+        di.objection_window_s = 7200;
+        di.request_timeout_s = 3600;
+        let err = di.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("di.objection_window_s"),
+            "names the offending key: {err}"
+        );
+        assert!(
+            err.contains("di.request_timeout_s"),
+            "names the compared key: {err}"
+        );
+        assert!(err.contains("7200"), "shows the offending value: {err}");
+        assert!(err.contains("3600"), "shows the bound value: {err}");
+    }
+
+    #[test]
+    fn di_config_rejects_claim_contested_longer_than_request_timeout() {
+        let mut di = crate::models::DiConfig::default();
+        di.claim_contested_timeout_s = 5400;
+        di.request_timeout_s = 3600;
+        let err = di.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("di.claim_contested_timeout_s"),
+            "names the offending key: {err}"
+        );
+        assert!(
+            err.contains("di.request_timeout_s"),
+            "names the compared key: {err}"
+        );
+        assert!(err.contains("5400"), "shows the offending value: {err}");
+    }
+
+    #[test]
+    fn di_config_accepts_boundary_equality() {
+        // Equality is not an inversion: an approval that clears the window at
+        // the exact moment the request would expire still resolves (the
+        // objection-window check is <=, and resolution is evaluated fresh each
+        // tick, so the approval wins the tie).
+        let mut di = crate::models::DiConfig::default();
+        di.objection_window_s = 3600;
+        di.request_timeout_s = 3600;
+        di.claim_contested_timeout_s = 3600;
+        assert!(di.validate().is_ok());
+    }
+
+    #[test]
+    fn di_config_rejects_both_inversions_in_one_config() {
+        // If both relationships are inverted, the objection-window check fires
+        // first (it is checked first in validate()). The error names that
+        // relationship; a second set+save would then surface the second one.
+        let mut di = crate::models::DiConfig::default();
+        di.objection_window_s = 10_000;
+        di.claim_contested_timeout_s = 9_000;
+        di.request_timeout_s = 5_000;
+        let err = di.validate().unwrap_err().to_string();
+        assert!(err.contains("di.objection_window_s"));
+    }
 }

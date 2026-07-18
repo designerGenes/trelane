@@ -825,6 +825,10 @@ fn save_config(state: &DiagnosticState) -> Result<()> {
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let mut config: Config = serde_json::from_str(&text).unwrap_or_default();
     state.apply_to_config(&mut config);
+    // 4A config-inversion guard: the editor can set any di.* field to any
+    // value, including an impossible combination. Validate before persisting
+    // so the editor cannot write a config that load_config would then reject.
+    config.di.validate()?;
     std::fs::write(&path, serde_json::to_string_pretty(&config)?)?;
     Ok(())
 }
