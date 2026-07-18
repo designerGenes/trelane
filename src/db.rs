@@ -502,6 +502,16 @@ fn migrate(conn: &Connection) -> Result<()> {
         "message_id",
         "message_id TEXT NOT NULL DEFAULT ''",
     )?;
+    // Session pause control: a durable flag the squire's tick reads to decide
+    // whether to launch agents. Added via ensure_column (not a version bump)
+    // so it lands on any existing DB idempotently. The monitor sets/clears it;
+    // the separate squire process honors it on its next tick.
+    ensure_column(
+        conn,
+        "project_state",
+        "paused",
+        "paused INTEGER NOT NULL DEFAULT 0",
+    )?;
     Ok(())
 }
 
@@ -564,6 +574,18 @@ mod tests {
         ));
         assert!(has_column(&conn, "validation_checks", "status"));
         assert!(has_column(&conn, "project_roles", "role"));
+        assert!(has_column(&conn, "project_state", "paused"));
+    }
+
+    #[test]
+    fn session_pause_flag_round_trips() {
+        use crate::store;
+        let conn = open_in_memory().unwrap();
+        assert!(!store::is_session_paused(&conn).unwrap());
+        store::set_session_paused(&conn, true).unwrap();
+        assert!(store::is_session_paused(&conn).unwrap());
+        store::set_session_paused(&conn, false).unwrap();
+        assert!(!store::is_session_paused(&conn).unwrap());
     }
 
     #[test]

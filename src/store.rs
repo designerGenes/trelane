@@ -623,6 +623,25 @@ pub fn get_running_lock(conn: &Connection, agent: &str) -> Result<Option<Running
     Ok(result)
 }
 
+/// Every current running-lock. Used by the monitor's kill action to terminate
+/// all live agent subprocesses by PID.
+pub fn list_running_locks(conn: &Connection) -> Result<Vec<RunningLock>> {
+    let mut stmt = conn.prepare("SELECT * FROM running_locks")?;
+    let rows = stmt.query_map([], |row| {
+        Ok(RunningLock {
+            agent: row.get("agent")?,
+            pid: row.get("pid")?,
+            started_at: row.get("started_at")?,
+            reason: row.get("reason")?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
 // ------------------------------------------------------------- violations
 
 pub fn insert_violation(conn: &Connection, v: &Violation) -> Result<()> {
@@ -1068,6 +1087,29 @@ pub fn next_refinement_pass(conn: &Connection) -> Result<i64> {
         |r| r.get(0),
     )?;
     Ok(pass)
+}
+
+/// Session pause control (project_state singleton). When paused, the squire's
+/// tick skips launching agents. The monitor writes this; the separate squire
+/// process reads it each tick, so pause/resume propagate across processes via
+/// the DB with no direct handle between them.
+pub fn set_session_paused(conn: &Connection, paused: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE project_state SET paused = ?1 WHERE id = 1",
+        [if paused { 1 } else { 0 }],
+    )?;
+    Ok(())
+}
+
+pub fn is_session_paused(conn: &Connection) -> Result<bool> {
+    // Default to not-paused if the row or column is somehow absent, so a
+    // read can never wedge the squire into a permanently-paused state.
+    let paused: i64 = conn
+        .query_row("SELECT paused FROM project_state WHERE id = 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap_or(0);
+    Ok(paused != 0)
 }
 
 // --------------------------------------------------------------- starvation

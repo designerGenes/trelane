@@ -1,3 +1,8 @@
+       ▗▟██▙▖
+       ▝▀██▀▘
+    ▗▟██▙▖  ▗▟██▙▖    trelane
+    ▝▀██▀▘  ▝▀██▀▘
+
 # trelane -- park-and-squire multi-agent coordination
 
 A coordination protocol for running multiple single-shot AI agents (Claude

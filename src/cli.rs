@@ -80,6 +80,43 @@ pub struct Cli {
     pub no_agents: Option<String>,
 
     #[arg(
+        long = "headless",
+        global = true,
+        help = "run the session without the monitor UI (squire tick-loop only). \
+                The default `trelane` launches the tabbed monitor UI."
+    )]
+    pub headless: bool,
+
+    #[arg(
+        long = "launcher",
+        global = true,
+        help = "launcher template/profile override for this session's agents"
+    )]
+    pub launcher: Option<String>,
+
+    #[arg(
+        long = "interval",
+        global = true,
+        help = "squire tick interval in seconds (default: config squire.interval_s)"
+    )]
+    pub interval: Option<u64>,
+
+    #[arg(
+        long = "verbose",
+        short = 'v',
+        global = true,
+        help = "narrate normally-quiet session events"
+    )]
+    pub verbose: bool,
+
+    #[arg(
+        long = "bench-sandbox",
+        global = true,
+        help = "watch a `trelane bench run` sandbox instead of the current project"
+    )]
+    pub bench_sandbox: Option<PathBuf>,
+
+    #[arg(
         value_name = "PROJECT",
         help = "attach/init a trelane session for an existing project"
     )]
@@ -286,35 +323,6 @@ pub enum Command {
     /// Mark an agent as done (release running lock)
     Done { agent: String },
 
-    /// The dutiful squire -- relaunches agents that have a reason to wake
-    /// (`prop` and `pump` still work as aliases).
-    ///
-    /// Liveness boundary: Trelane never restarts the squire itself. If you
-    /// want the squire kept alive, supervise it from OUTSIDE Trelane --
-    /// launchd, systemd, cron (`--once`), or a `while true` shell loop.
-    #[command(alias = "pump", alias = "prop")]
-    Squire {
-        #[arg(long = "once")]
-        once: bool,
-        #[arg(long = "watch")]
-        watch: bool,
-        #[arg(long = "interval")]
-        interval: Option<u64>,
-        #[arg(long = "launcher")]
-        launcher: Option<String>,
-        #[arg(
-            long = "verbose",
-            short = 'v',
-            help = "narrate normally-quiet events (e.g. concurrency-budget deferrals)"
-        )]
-        verbose: bool,
-        #[arg(
-            long = "max-concurrent",
-            help = "override squire.max_concurrent for this run (simultaneous agent ceiling)"
-        )]
-        max_concurrent: Option<usize>,
-    },
-
     /// Token-free scripted agent for demos and testing
     Stub { agent: String },
 
@@ -402,20 +410,6 @@ pub enum Command {
 
     /// Interactive diagnostic view for the main Trelane session (TUI)
     Diagnostic,
-
-    /// Native tabbed session monitor: one tab per agent plus a Trelane
-    /// summary tab. Each agent tab tails that agent's run log and shows its
-    /// live thoughts, tool calls, and output (richest with a streaming
-    /// launcher profile such as `opencode-stream` or `claude-code-stream`).
-    Monitor {
-        /// Watch a `trelane bench run` sandbox instead of the current project.
-        /// Pass the sandbox root used by the bench (the `--sandbox-root` you
-        /// gave `bench run`, or the default temp dir); the monitor resolves
-        /// the active `scenario-run-1` session under it. Without this flag the
-        /// monitor watches the project resolved from `--root`/cwd as usual.
-        #[arg(long = "bench-sandbox")]
-        bench_sandbox: Option<PathBuf>,
-    },
 
     /// Inspect or change Trelane configuration values
     Config {

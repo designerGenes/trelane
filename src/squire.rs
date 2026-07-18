@@ -630,6 +630,32 @@ pub fn tick(ctx: &Context, launcher_override: Option<&str>, verbose: bool) -> Re
         }
     };
 
+    // Session pause (monitor-controlled, via the project_state.paused flag).
+    // When paused, this tick does no planning and launches nothing -- but it
+    // still records an idle span and returns Ok(0), so the squire keeps
+    // ticking and resumes immediately once the flag is cleared. Checked first,
+    // before the retention sweep and planning, so a paused session is fully
+    // inert. Best-effort read: a failure defaults to not-paused (see
+    // store::is_session_paused) so an error can never wedge the squire paused.
+    if store::is_session_paused(&ctx.conn).unwrap_or(false) {
+        let running_now = store::list_agents(&ctx.conn)
+            .map(|ags| {
+                ags.iter()
+                    .filter(|a| commands::is_running(&ctx.conn, a).unwrap_or(false))
+                    .count()
+            })
+            .unwrap_or(0);
+        if verbose {
+            eprintln!(
+                "{} session paused -- skipping launch ({} still running)",
+                crate::crypto::now_iso(),
+                running_now
+            );
+        }
+        emit_tick_span(0, running_now, false);
+        return Ok(0);
+    }
+
     // 4D: retention sweep as the cheap first step of the tick (one restarter,
     // not a second daemon). Best-effort per R16: a sweep failure must never
     // fail the tick it ran inside.

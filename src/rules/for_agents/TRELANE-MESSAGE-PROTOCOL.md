@@ -1,3 +1,8 @@
+       ▗▟██▙▖
+       ▝▀██▀▘
+    ▗▟██▙▖  ▗▟██▙▖    trelane
+    ▝▀██▀▘  ▝▀██▀▘
+
 # Trelane Message Protocol (TMP) v1.0 — Reference
 
 This is the human- and agent-readable companion to

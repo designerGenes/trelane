@@ -842,6 +842,7 @@ pub fn has_existing_biplane_report(project_root: &Path) -> Option<PathBuf> {
     }
 }
 
+#[allow(dead_code)]
 pub fn cmd_welcome(project: Option<PathBuf>) -> Result<()> {
     let root = match project {
         Some(p) => p.canonicalize()?,

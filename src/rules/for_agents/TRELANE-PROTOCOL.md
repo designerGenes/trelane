@@ -1,3 +1,8 @@
+       ▗▟██▙▖
+       ▝▀██▀▘
+    ▗▟██▙▖  ▗▟██▙▖    trelane
+    ▝▀██▀▘  ▝▀██▀▘
+
 # The Trelane Protocol
 
 **You are an agent in a Trelane session.** You share a codebase with other
