@@ -254,8 +254,44 @@ impl Tracer {
         Ok(span_id)
     }
 
-    fn resource(&self) -> OtlpResource {
-        OtlpResource {
+    /// Record a flat INTERNAL span with a caller-provided name and string
+    /// attributes. Used for `squire.wake_candidate` ("why didn't X wake") and
+    /// the `di.request/approve/veto/resolve` audit trail (4A/4C). As with
+    /// every emitter here, callers ignore the Result (R16).
+    pub fn record_event(
+        &self,
+        name: &str,
+        attributes: &[(&str, &str)],
+        start_ns: u64,
+        end_ns: u64,
+    ) -> Result<SpanId> {
+        let span_id = generate_span_id();
+        let mut attrs: Vec<OtlpAttribute> = attributes
+            .iter()
+            .map(|(k, v)| attr_str(k, v))
+            .collect();
+        attrs.push(attr_str("project.root", &self.project_root));
+        attrs.push(attr_str("session.name", &self.session_name));
+        let span = OtlpSpan {
+            trace_id: self.trace_id.clone(),
+            span_id: span_id.clone(),
+            parent_span_id: None,
+            name: name.to_string(),
+            kind: 1, // INTERNAL
+            start_time_unix_nano: start_ns,
+            end_time_unix_nano: end_ns,
+            attributes: attrs,
+            status: OtlpStatus {
+                code: 1,
+                message: String::new(),
+            },
+            resource: self.resource(),
+        };
+        self.write_span(&span)?;
+        Ok(span_id)
+    }
+
+    fn resource(&self) -> OtlpResource {        OtlpResource {
             attributes: vec![
                 attr_str("service.name", "trelane"),
                 attr_str("service.version", env!("CARGO_PKG_VERSION")),

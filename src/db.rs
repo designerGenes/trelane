@@ -315,6 +315,44 @@ CREATE TABLE IF NOT EXISTS project_state (
 INSERT OR IGNORE INTO project_state (id) VALUES (1);
 "#;
 
+/// Slice 5 (GAP-10): Biplane progressive refinement and domain adjacency.
+/// The `agents` table is the de-facto domain registry, so the refinement
+/// lineage columns live there. NOTE: v12 was already taken by R23's
+/// agent_starvation table, so Slice 5 lands as v13 (not v12 as the original
+/// spec text proposed).
+const SCHEMA_V13: &str = r#"
+ALTER TABLE agents ADD COLUMN granularity_tier TEXT NOT NULL DEFAULT 'coarse';
+ALTER TABLE agents ADD COLUMN parent_domain TEXT;
+ALTER TABLE agents ADD COLUMN created_in_pass INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE agents ADD COLUMN owner_at_split_time TEXT;
+ALTER TABLE agents ADD COLUMN tier_set_at TEXT;
+
+CREATE TABLE IF NOT EXISTS domain_adjacency (
+    from_domain TEXT NOT NULL,
+    to_domain   TEXT NOT NULL,
+    rank        INTEGER NOT NULL,
+    rationale   TEXT NOT NULL DEFAULT '',
+    source      TEXT NOT NULL DEFAULT 'sibling',
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (from_domain, to_domain)
+);
+CREATE INDEX IF NOT EXISTS idx_adjacency_from ON domain_adjacency(from_domain, rank);
+
+CREATE TABLE IF NOT EXISTS split_proposals (
+    id                  TEXT PRIMARY KEY,
+    domain              TEXT NOT NULL,
+    owner_at_split_time TEXT,
+    proposal_json       TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'pending',
+    created_at          TEXT NOT NULL,
+    resolved_at         TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_split_proposals_owner
+    ON split_proposals(owner_at_split_time, status);
+
+ALTER TABLE project_state ADD COLUMN refinement_pass INTEGER NOT NULL DEFAULT 0;
+"#;
+
 pub fn open(db_path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
     conn.execute_batch(
@@ -445,6 +483,14 @@ fn migrate(conn: &Connection) -> Result<()> {
             );",
         )?;
         conn.execute_batch("PRAGMA user_version = 12;")?;
+        version = 12;
+    }
+    if version < 13 {
+        // Slice 5 (R17-R22, R29): domain refinement lineage on agents (the
+        // de-facto domain registry), the adjacency table, and split
+        // proposals for owned-domain refinement (R20).
+        conn.execute_batch(SCHEMA_V13)?;
+        conn.execute_batch("PRAGMA user_version = 13;")?;
     }
 
     // Repair: task_submissions.message_id is referenced by the C2 code path
@@ -496,7 +542,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         assert!(has_column(&conn, "claims", "delegation_id"));
         assert!(has_column(&conn, "delegations", "offer_message"));
         assert!(has_column(&conn, "task_submissions", "message_id"));
@@ -532,7 +578,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
     }
 
     #[test]
@@ -556,7 +602,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
     }
 
     #[test]
@@ -589,7 +635,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
     }
 
     #[test]

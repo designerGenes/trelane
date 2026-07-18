@@ -42,12 +42,28 @@ All coordination goes through the control tool (run from the project root):
 
 [[INBOX_SUMMARY]]
 
+## Bulletin: your domain's working-set board (R12)
+
+[[BULLETIN_SUMMARY]]
+
 ## Your parked tasks
 
 [[PARKED_SUMMARY]]
 
 Any task marked `DEPENDENCY SATISFIED` should be resumed now: do the work,
 then `unpark <task>`.
+
+## Domain-change check (R14)
+
+[[DOMAIN_CHANGE]]
+
+## Out of ready work? Adjacent domains (R21/R22)
+
+[[ADJACENCY_SUMMARY]]
+
+## Split proposals against your domain (R29)
+
+[[SPLIT_PROPOSAL_SUMMARY]]
 
 ## Cross-domain assistance
 
@@ -138,7 +154,13 @@ pub fn full_bootstrap() -> String {
     format!("{BOOTSTRAP_TEMPLATE}\n\n---\n\n{PROTOCOL_DOC}\n\n---\n\n{TMP_DOC}")
 }
 
-pub fn compose_prompt(conn: &Connection, root: &Path, agent: &str, reason: &str) -> Result<String> {
+pub fn compose_prompt(
+    conn: &Connection,
+    root: &Path,
+    agent: &str,
+    reason: &str,
+    domain_change_paths: &[String],
+) -> Result<String> {
     let domain = store::get_domain(conn, agent)?
         .ok_or_else(|| crate::error::TrelaneError::msg(format!("agent '{agent}' not found")))?;
     let domain_json = serde_json::to_string_pretty(&domain)?;
@@ -183,6 +205,58 @@ pub fn compose_prompt(conn: &Connection, root: &Path, agent: &str, reason: &str)
             .join("\n")
     };
 
+    // 4B: the wake-time inbox drain widens to also scan bulletin entries
+    // scoped to the agent's own domain -- what others have announced they are
+    // (or were recently) working in. Pulled, never pushed (R13).
+    let bulletin = store::get_bulletin(conn, agent, false).unwrap_or_default();
+    let bulletin_summary = if bulletin.is_empty() {
+        "(empty)".to_string()
+    } else {
+        bulletin
+            .iter()
+            .take(10)
+            .map(|m| {
+                let files = if m.paths.is_empty() {
+                    "(whole domain)".to_string()
+                } else {
+                    m.paths.join(", ")
+                };
+                format!("- {} [{}] {}: {}", m.id, m.from, files, m.body.lines().next().unwrap_or(""))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    // 4E: a non-empty domain-change notice gets checked, not assumed (R14).
+    // The full reconciliation procedure is §5 of the Protocol below.
+    let domain_change = if domain_change_paths.is_empty() {
+        "(none -- your domain matches the snapshot from your last run.)".to_string()
+    } else {
+        format!(
+            "These files in YOUR domain changed while you were away, and not by you:\n{}\n\n\
+             Per §5 of the Trelane Protocol (below): check `trelane history --include-archived` \
+             and `trelane bulletin list --domain <your-domain> --include-archived` for a resolved \
+             intrusion or an announced working-file overlap that explains them.\n\
+             Explained -> proceed as normal.\n\
+             Unexplained -> do NOT silently revert and do NOT silently continue: post a message \
+             naming the specific unexplained paths, then keep working. Never park on this -- it \
+             is a flag, not a blocking wait.",
+            domain_change_paths
+                .iter()
+                .map(|p| format!("- {p}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+
+    // 5B/R21: when the agent's domain is exhausted, its ranked adjacency
+    // list is attached -- detection is mechanical, acting is the agent's
+    // call. R29: unreviewed split proposals surface the same way.
+    let adjacency_summary = crate::refine::exhaustion_adjacency_summary(conn, agent)
+        .unwrap_or_else(|| "(no adjacency list yet -- none computed, or you still have ready work.)".to_string());
+    let split_proposal_summary = crate::refine::pending_split_summary(conn, agent)
+        .unwrap_or_else(|| "(none)".to_string());
+
     let mut tpl = full_bootstrap();
     let subs: HashMap<&str, String> = [
         ("[[AGENT_ID]]", agent.to_string()),
@@ -190,7 +264,11 @@ pub fn compose_prompt(conn: &Connection, root: &Path, agent: &str, reason: &str)
         ("[[WAKE_REASON]]", reason.to_string()),
         ("[[DOMAIN_JSON]]", domain_json),
         ("[[INBOX_SUMMARY]]", inbox_summary),
+        ("[[BULLETIN_SUMMARY]]", bulletin_summary),
         ("[[PARKED_SUMMARY]]", parked_summary),
+        ("[[DOMAIN_CHANGE]]", domain_change),
+        ("[[ADJACENCY_SUMMARY]]", adjacency_summary),
+        ("[[SPLIT_PROPOSAL_SUMMARY]]", split_proposal_summary),
     ]
     .into_iter()
     .collect();
@@ -204,6 +282,11 @@ fn wait_display(e: &crate::models::ParkedTask) -> String {
     match e.wait_type.as_str() {
         "reply" => format!("reply to {}", e.wait_re.as_deref().unwrap_or("?")),
         "claim" => format!("claim on {}", e.wait_path.as_deref().unwrap_or("?")),
+        "claim-contested" => format!(
+            "contested claim on {} (R26)",
+            e.wait_path.as_deref().unwrap_or("?")
+        ),
+        "di_request" => format!("DI request {}", e.wait_re.as_deref().unwrap_or("?")),
         _ => e.wait_type.clone(),
     }
 }
@@ -223,7 +306,9 @@ pub fn park_satisfied(conn: &Connection, entry: &crate::models::ParkedTask) -> R
             // park -- retention must never outpace resolution.
             store::any_reply_exists(conn, &entry.agent, re)
         }
-        "claim" => {
+        "claim" | "claim-contested" => {
+            // claim-contested (R26) resolves exactly like any other lease
+            // wait: the agent is woken when the lease frees.
             let path = match &entry.wait_path {
                 Some(p) => p,
                 None => return Ok(false),
@@ -234,6 +319,20 @@ pub fn park_satisfied(conn: &Connection, entry: &crate::models::ParkedTask) -> R
                     let now = chrono::Utc::now().timestamp() as f64;
                     Ok(lease.expires_at < now || lease.holder == entry.agent)
                 }
+            }
+        }
+        "di_request" => {
+            // Satisfied once the request is resolved in any direction --
+            // the wake reason (approved/vetoed/expired) carries the outcome.
+            let id = match &entry.wait_re {
+                Some(r) => r,
+                None => return Ok(false),
+            };
+            match crate::di::get_request(conn, id)? {
+                Some(req) => Ok(req.status != crate::di::STATUS_PENDING),
+                // A vanished request can never resolve; treat as satisfied so
+                // the abandon path can wake the agent rather than strand it.
+                None => Ok(true),
             }
         }
         _ => Ok(false),

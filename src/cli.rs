@@ -192,6 +192,13 @@ pub enum Command {
         action: RetentionAction,
     },
 
+    /// Domain intrusion (4A): request, approve, veto, and inspect narrow
+    /// cross-domain write access (R9-R11, R25, R26)
+    Di {
+        #[command(subcommand)]
+        action: DiAction,
+    },
+
     /// Mark a message as processed
     Ack { agent: String, msg_id: String },
 
@@ -226,6 +233,11 @@ pub enum Command {
         wait_reply: Option<String>,
         #[arg(long = "wait-claim")]
         wait_claim: Option<String>,
+        #[arg(
+            long = "wait-contested-claim",
+            help = "park on a lease lost to another holder after DI approval (R26)"
+        )]
+        wait_contested_claim: Option<String>,
         #[arg(long = "waiting-on", required = true)]
         waiting_on: String,
         #[arg(long = "resume-hint", default_value = "")]
@@ -345,6 +357,22 @@ pub enum Command {
         accept_defaults: bool,
         #[arg(long)]
         json: bool,
+        #[arg(
+            long = "refine",
+            help = "run one progressive-refinement pass over leaf domains (Slice 5; calls a model; R19)"
+        )]
+        refine: bool,
+        #[arg(
+            long = "refine-model",
+            help = "model/launcher profile for --refine decisions (default: config launcher default)"
+        )]
+        refine_model: Option<String>,
+    },
+
+    /// Review Biplane split proposals for owned domains (R20/R29)
+    Split {
+        #[command(subcommand)]
+        action: SplitAction,
     },
 
     /// Show aggregate metrics from OpenTelemetry traces
@@ -389,6 +417,28 @@ pub enum Command {
 }
 
 #[derive(Subcommand)]
+pub enum SplitAction {
+    /// List split proposals, optionally filtered by status
+    List {
+        #[arg(long = "status", help = "pending|accepted|rejected")]
+        status: Option<String>,
+        #[arg(long = "json")]
+        json: bool,
+    },
+    /// Show one proposal's children and rationale
+    Show {
+        id: String,
+        #[arg(long = "json")]
+        json: bool,
+    },
+    /// Accept a proposal: children are registered at the next tier (your
+    /// own scope stays untouched until you finish or redomain, R20)
+    Accept { id: String },
+    /// Reject a proposal
+    Reject { id: String },
+}
+
+#[derive(Subcommand)]
 pub enum BulletinAction {
     /// Announce working intent for a domain ahead of the first claim, or
     /// update a current announcement. Supersedes your previous active entry
@@ -409,6 +459,52 @@ pub enum BulletinAction {
         domain: String,
         #[arg(long = "include-archived")]
         include_archived: bool,
+        #[arg(long = "json")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DiAction {
+    /// Request write access to a path glob in another agent's domain.
+    /// Broadcasts to all enabled agents and parks you on the outcome.
+    Request {
+        #[arg(long = "from")]
+        from: String,
+        #[arg(long = "domain", help = "target domain (named by its owning agent)")]
+        domain: String,
+        #[arg(long = "path", help = "path or glob you intend to write")]
+        path: String,
+        #[arg(
+            long = "purpose",
+            help = "REQUIRED, specific: exactly what you will do and why"
+        )]
+        purpose: String,
+    },
+    /// Approve a pending request (any enabled agent except the requester, R9)
+    Approve {
+        id: String,
+        #[arg(long = "from")]
+        from: String,
+    },
+    /// Veto a pending request (only the target domain's owner; always wins)
+    Deny {
+        id: String,
+        #[arg(long = "from")]
+        from: String,
+        #[arg(long = "reason")]
+        reason: String,
+    },
+    /// Show one request, its approvals, and bulletin overlap warnings
+    Show {
+        id: String,
+        #[arg(long = "json")]
+        json: bool,
+    },
+    /// List requests, optionally filtered by status
+    List {
+        #[arg(long = "status", help = "pending|approved|vetoed|expired")]
+        status: Option<String>,
         #[arg(long = "json")]
         json: bool,
     },

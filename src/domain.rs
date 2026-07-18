@@ -1,5 +1,5 @@
 use crate::error::{Result, TrelaneError};
-use crate::models::{Domain, TRELANE_DIR};
+use crate::models::{default_granularity_tier, Domain, TRELANE_DIR};
 use globset::Glob;
 use std::path::{Path, PathBuf};
 
@@ -156,6 +156,13 @@ pub fn default_domain(agent: &str) -> Domain {
         writable: vec![],
         launcher_agent: None,
         forbidden_write: vec![format!("{TRELANE_DIR}/**"), ".git/**".to_string()],
+        // v13 (Slice 5): a freshly-created domain starts at the coarsest tier
+        // with no lineage and no split metadata; refinement fills these in.
+        granularity_tier: default_granularity_tier(),
+        parent_domain: None,
+        created_in_pass: 0,
+        owner_at_split_time: None,
+        tier_set_at: None,
     }
 }
 
@@ -227,6 +234,11 @@ mod tests {
             writable: writable.iter().map(|s| s.to_string()).collect(),
             launcher_agent: None,
             forbidden_write: forbidden.iter().map(|s| s.to_string()).collect(),
+            granularity_tier: default_granularity_tier(),
+            parent_domain: None,
+            created_in_pass: 0,
+            owner_at_split_time: None,
+            tier_set_at: None,
         }
     }
 

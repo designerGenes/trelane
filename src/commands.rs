@@ -1079,6 +1079,165 @@ pub fn cmd_retention(ctx: &Context, action: &crate::cli::RetentionAction) -> Res
     }
 }
 
+// ---------------------------------------------------------------------- di
+
+/// Slice 4A: domain intrusion. See src/di.rs for the rules (R9/R10/R11/R25/R26).
+pub fn cmd_di(ctx: &Context, action: &crate::cli::DiAction) -> Result<()> {
+    match action {
+        crate::cli::DiAction::Request {
+            from,
+            domain,
+            path,
+            purpose,
+        } => {
+            let id = crate::di::create_request(ctx, from, domain, path, purpose)?;
+            println!("{id}");
+            println!("parked on the outcome; you will be woken when it resolves");
+            Ok(())
+        }
+        crate::cli::DiAction::Approve { id, from } => {
+            crate::di::approve(ctx, id, from)?;
+            println!("approved {id} (resolves at the next squire tick)");
+            Ok(())
+        }
+        crate::cli::DiAction::Deny { id, from, reason } => {
+            crate::di::deny(ctx, id, from, reason)?;
+            println!("vetoed {id}");
+            Ok(())
+        }
+        crate::cli::DiAction::Show { id, json } => {
+            let req = crate::di::get_request(&ctx.conn, id)?
+                .ok_or_else(|| TrelaneError::msg(format!("unknown DI request '{id}'")))?;
+            if *json {
+                let overlapping = overlapping_bulletins(ctx, &req)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "id": req.id,
+                        "requester": req.requester_agent,
+                        "target_domain": req.target_domain,
+                        "path_glob": req.path_glob,
+                        "purpose": req.purpose,
+                        "status": req.status,
+                        "created_at": req.created_at,
+                        "objection_deadline": req.objection_deadline,
+                        "resolved_at": req.resolved_at,
+                        "veto_agent": req.veto_agent,
+                        "veto_reason": req.veto_reason,
+                        "approvals": req.approvals,
+                        "bulletin_overlap_warning": overlapping,
+                    }))?
+                );
+            } else {
+                println!("id          : {}", req.id);
+                println!("requester   : {}", req.requester_agent);
+                println!("target      : {} (path {})", req.target_domain, req.path_glob);
+                println!("purpose     : {}", req.purpose);
+                println!("status      : {}", req.status);
+                println!("created     : {}", req.created_at);
+                println!("obj deadline: {}", req.objection_deadline);
+                if let Some(resolved) = &req.resolved_at {
+                    println!("resolved    : {resolved}");
+                }
+                if let Some(veto) = &req.veto_agent {
+                    println!("veto        : {veto}: {}", req.veto_reason.as_deref().unwrap_or(""));
+                }
+                println!(
+                    "approvals   : {}",
+                    if req.approvals.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        req.approvals.join(", ")
+                    }
+                );
+                // 4B: overlapping active bulletin entries are a soft warning,
+                // not a block -- arm the approver/owner with information.
+                let overlapping = overlapping_bulletins(ctx, &req)?;
+                if !overlapping.is_empty() {
+                    println!();
+                    println!("WARNING: active bulletin entries overlap the requested path:");
+                    for line in overlapping {
+                        println!("  {line}");
+                    }
+                }
+            }
+            Ok(())
+        }
+        crate::cli::DiAction::List { status, json } => {
+            let reqs = crate::di::list_requests(&ctx.conn, status.as_deref())?;
+            if *json {
+                let out: Vec<serde_json::Value> = reqs
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "id": r.id,
+                            "requester": r.requester_agent,
+                            "target_domain": r.target_domain,
+                            "path_glob": r.path_glob,
+                            "status": r.status,
+                            "created_at": r.created_at,
+                            "approvals": r.approvals,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&out)?);
+            } else {
+                if reqs.is_empty() {
+                    println!("(no DI requests)");
+                }
+                for r in &reqs {
+                    println!(
+                        "{}  {:<9} {} -> {}  {}  {}",
+                        r.id, r.status, r.requester_agent, r.target_domain, r.path_glob, r.purpose
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Active bulletin entries in the target domain whose announced paths
+/// overlap the request's glob (4B soft warning).
+fn overlapping_bulletins(ctx: &Context, req: &crate::di::DiRequest) -> Result<Vec<String>> {
+    let entries = store::get_bulletin(&ctx.conn, &req.target_domain, false)?;
+    let mut out = Vec::new();
+    for e in entries {
+        if e.from == req.requester_agent {
+            continue;
+        }
+        let overlap = e.paths.is_empty()
+            || e.paths.iter().any(|p| {
+                di_glob_overlap(&req.path_glob, p)
+            });
+        if overlap {
+            out.push(format!(
+                "{} is working in {}: {}",
+                e.from,
+                req.target_domain,
+                if e.paths.is_empty() {
+                    "(whole domain)".to_string()
+                } else {
+                    e.paths.join(", ")
+                }
+            ));
+        }
+    }
+    Ok(out)
+}
+
+fn di_glob_overlap(glob: &str, path: &str) -> bool {
+    if glob == path || path.starts_with(&format!("{glob}/")) {
+        return true;
+    }
+    if let Some(prefix) = glob.strip_suffix("/**") {
+        return path.starts_with(&format!("{prefix}/")) || prefix.starts_with(&format!("{path}/"));
+    }
+    globset::Glob::new(glob)
+        .map(|g| g.compile_matcher().is_match(path))
+        .unwrap_or(false)
+}
+
 // ------------------------------------------------------------------- ack
 
 pub fn cmd_ack(ctx: &Context, agent: &str, msg_id: &str) -> Result<()> {
@@ -1148,8 +1307,17 @@ pub fn cmd_claim(
         ));
     }
 
-    let requires_delegation =
-        (!mine && !others.is_empty()) || delegation_id.is_some() || existing_delegation.is_some();
+    // R10: an approved DI request covering this path is an alternative to a
+    // delegation for the *permission* gate. The claim itself (the lease, the
+    // second gate) is still required and still taken below.
+    let di_approved = if !mine && !others.is_empty() && delegation_id.is_none() {
+        crate::di::has_approved_covering(ctx, agent, &rel)?
+    } else {
+        false
+    };
+    let requires_delegation = ((!mine && !others.is_empty()) && !di_approved)
+        || delegation_id.is_some()
+        || existing_delegation.is_some();
     let authorized = if requires_delegation {
         let id = delegation_id.ok_or_else(|| {
             TrelaneError::msg(format!(
@@ -1200,8 +1368,10 @@ pub fn cmd_claim(
             return Ok(());
         }
         return Err(TrelaneError::msg(format!(
-            "DENIED: {rel} is leased by {} until {}",
-            lease.holder, lease.expires_human
+            "DENIED: {rel} is leased by {} until {}. If this claim follows an approved \
+             DI request, park on the contention instead of retrying: \
+             `trelane park {agent} --wait-contested-claim {rel} --waiting-on {}` (R26)",
+            lease.holder, lease.expires_human, lease.holder
         )));
     }
 
@@ -1271,23 +1441,35 @@ pub fn cmd_park(
     task: Option<&str>,
     wait_reply: &Option<String>,
     wait_claim: &Option<String>,
+    wait_contested_claim: &Option<String>,
     waiting_on: &str,
     resume_hint: &str,
 ) -> Result<()> {
     if !store::agent_exists(&ctx.conn, agent)? {
         return Err(TrelaneError::msg(format!("unknown agent '{agent}'")));
     }
-    if wait_reply.is_some() == wait_claim.is_some() {
+    let chosen = wait_reply.is_some() as u8
+        + wait_claim.is_some() as u8
+        + wait_contested_claim.is_some() as u8;
+    if chosen != 1 {
         return Err(TrelaneError::msg(
-            "specify exactly one of --wait-reply MSG_ID or --wait-claim PATH",
+            "specify exactly one of --wait-reply MSG_ID, --wait-claim PATH, or \
+             --wait-contested-claim PATH",
         ));
     }
 
-    let (wait_type, wait_re, wait_path) = match (wait_reply, wait_claim) {
-        (Some(re), None) => ("reply".to_string(), Some(re.clone()), None),
-        (None, Some(p)) => {
+    let (wait_type, wait_re, wait_path) = match (wait_reply, wait_claim, wait_contested_claim) {
+        (Some(re), None, None) => ("reply".to_string(), Some(re.clone()), None),
+        (None, Some(p), None) => {
             let rel = domain::norm_rel(&ctx.root, p)?;
             ("claim".to_string(), None, Some(rel))
+        }
+        (None, None, Some(p)) => {
+            // R26: parked on a lease lost to another holder after DI
+            // approval; resolves like any lease wait, with its own timeout
+            // (di.claim_contested_timeout_s).
+            let rel = domain::norm_rel(&ctx.root, p)?;
+            ("claim-contested".to_string(), None, Some(rel))
         }
         _ => unreachable!(),
     };
@@ -1541,7 +1723,13 @@ pub fn cmd_wake(
     }
 
     let reason = why.unwrap_or("manual wake");
-    let prompt_text = prompt::compose_prompt(&ctx.conn, &ctx.root, agent, reason)?;
+    // 4E (R14): diff the agent's own domain against the snapshot from its
+    // last run. Anything in the delta wasn't caused by the agent itself --
+    // the baseline was last refreshed when its previous run ended. Attach it
+    // to the wake context; interpreting it is the agent's job (R3 split).
+    let domain_change_paths = domain_change_since_baseline(ctx, agent)?;
+    let prompt_text =
+        prompt::compose_prompt(&ctx.conn, &ctx.root, agent, reason, &domain_change_paths)?;
     let prompt_file = prompt::write_prompt_file(&ctx.trelane_dir(), agent, &prompt_text)?;
 
     // Record the git baseline before the run for diff computation on done.
@@ -1716,7 +1904,14 @@ pub fn cmd_relaunch(
             "agent '{agent}' is mapped to a disabled session agent/model"
         )));
     }
-    let prompt_text = prompt::compose_prompt(&ctx.conn, &ctx.root, agent, "manual relaunch")?;
+    let domain_change_paths = domain_change_since_baseline(ctx, agent)?;
+    let prompt_text = prompt::compose_prompt(
+        &ctx.conn,
+        &ctx.root,
+        agent,
+        "manual relaunch",
+        &domain_change_paths,
+    )?;
     let prompt_file = prompt::write_prompt_file(&ctx.trelane_dir(), agent, &prompt_text)?;
 
     let stored = store::get_launch_target(&ctx.conn, agent)?;
@@ -1761,6 +1956,14 @@ pub fn cmd_relaunch(
 
 pub fn cmd_done(ctx: &Context, agent: &str) -> Result<()> {
     store::delete_running_lock(&ctx.conn, agent)?;
+
+    // 4E: refresh the agent's snapshot to the post-run state, so the next
+    // wake's domain-change diff contains only what *others* changed since
+    // this run ended -- never this run's own work. Best-effort: a snapshot
+    // failure must not fail the agent's exit (R16).
+    if let Some(dirty) = git_dirty(&ctx.root) {
+        let _ = store::save_audit_baseline(&ctx.conn, agent, &dirty);
+    }
 
     // Record telemetry: read wake metadata, compute diff, emit span.
     let wake_meta = ctx
@@ -1948,7 +2151,32 @@ pub fn cmd_stub(ctx: &Context, agent: &str) -> Result<()> {
     Ok(())
 }
 
-// ----------------------------------------------------------------- audit
+// ------------------------------------------------------------------ audit
+
+/// 4E: paths in the agent's own domain that changed since the snapshot taken
+/// at the end of its last run. Empty when there is no prior snapshot (first
+/// run), when git is unavailable, or when nothing in-domain changed.
+pub fn domain_change_since_baseline(ctx: &Context, agent: &str) -> Result<Vec<String>> {
+    let current = match git_dirty(&ctx.root) {
+        Some(d) => d,
+        None => return Ok(vec![]),
+    };
+    let baseline = match store::get_audit_baseline(&ctx.conn, agent)? {
+        Some(b) => b,
+        // No prior snapshot (first run): nothing to diff against.
+        None => return Ok(vec![]),
+    };
+    let dom = store::get_domain(&ctx.conn, agent)?
+        .ok_or_else(|| TrelaneError::msg(format!("agent '{agent}' not found")))?;
+    let compiled = CompiledDomain::from_domain(&dom)?;
+    let mut changed: Vec<String> = current
+        .iter()
+        .filter(|(rel, hash)| baseline.get(*rel) != Some(*hash) && compiled.is_writable(rel))
+        .map(|(rel, _)| rel.clone())
+        .collect();
+    changed.sort();
+    Ok(changed)
+}
 
 pub fn cmd_audit(ctx: &Context, agent: &str) -> Result<()> {
     if !store::agent_exists(&ctx.conn, agent)? {
@@ -3403,6 +3631,11 @@ mod tests {
             writable: vec!["**".to_string()],
             launcher_agent: None,
             forbidden_write: vec![".trelane/**".to_string(), ".git/**".to_string()],
+            granularity_tier: default_granularity_tier(),
+            parent_domain: None,
+            created_in_pass: 0,
+            owner_at_split_time: None,
+            tier_set_at: None,
         };
         assert!(
             validate_submission_paths(&task, &delegation, &owner, &["src/tests/a.rs".to_string()])
@@ -3423,6 +3656,140 @@ mod tests {
                 .to_string()
                 .contains("hard-forbidden")
         );
+    }
+
+    // ---------------------------------------------------------- 4E (R14)
+
+    /// Another agent's in-domain change between runs shows up in the wake
+    /// context; the agent's own work (captured by the done-time refresh)
+    /// never does; out-of-domain changes are irrelevant.
+    #[test]
+    fn domain_change_diff_scopes_to_domain_and_excludes_own() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        git_ok(root, &["init", "-q"]);
+        git_ok(root, &["config", "user.email", "tests@example.invalid"]);
+        git_ok(root, &["config", "user.name", "Trelane Tests"]);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("helper")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "const A: u8 = 1;\n").unwrap();
+        std::fs::write(root.join("helper/b.rs"), "// b\n").unwrap();
+        git_ok(root, &["add", "."]);
+        git_ok(root, &["commit", "-q", "-m", "base"]);
+
+        let ctx = assistance_ctx(&temp);
+        // Snapshot at the end of owner's last run: clean tree.
+        store::save_audit_baseline(&ctx.conn, "owner", &git_dirty(root).unwrap()).unwrap();
+        assert!(domain_change_since_baseline(&ctx, "owner").unwrap().is_empty());
+
+        // Another agent dirties one file in owner's domain and one outside it.
+        std::fs::write(root.join("src/a.rs"), "const A: u8 = 2;\n").unwrap();
+        std::fs::write(root.join("helper/b.rs"), "// changed\n").unwrap();
+        let changed = domain_change_since_baseline(&ctx, "owner").unwrap();
+        assert_eq!(changed, vec!["src/a.rs".to_string()]);
+
+        // The wake prompt carries the notice with R14 instructions.
+        let prompt_text =
+            prompt::compose_prompt(&ctx.conn, &ctx.root, "owner", "test", &changed).unwrap();
+        assert!(prompt_text.contains("Domain-change check"));
+        assert!(prompt_text.contains("src/a.rs"));
+        assert!(prompt_text.contains("Never park on this"));
+
+        // The done-time refresh captures the current state as the new "seen"
+        // baseline -- the agent's own acknowledged work never re-flags.
+        store::save_audit_baseline(&ctx.conn, "owner", &git_dirty(root).unwrap()).unwrap();
+        assert!(domain_change_since_baseline(&ctx, "owner").unwrap().is_empty());
+    }
+
+    /// No prior snapshot (first-ever run) means nothing to diff against.
+    #[test]
+    fn domain_change_empty_without_baseline() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        git_ok(root, &["init", "-q"]);
+        git_ok(root, &["config", "user.email", "tests@example.invalid"]);
+        git_ok(root, &["config", "user.name", "Trelane Tests"]);
+        let ctx = assistance_ctx(&temp);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/new.rs"), "// new\n").unwrap();
+        assert!(domain_change_since_baseline(&ctx, "owner").unwrap().is_empty());
+    }
+
+    // ------------------------------------------------------------- 4A DI
+    /// Approved DI + no lease held -> claim succeeds with no delegation
+    /// (R10: permission and the write are two gates; approval passes the
+    /// first, the claim itself passes the second).
+    #[test]
+    fn di_approved_claim_needs_no_delegation() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src/tests")).unwrap();
+        let file = temp.path().join("src/tests/di.rs");
+        std::fs::write(&file, "// di\n").unwrap();
+        let abs = file.to_string_lossy().to_string();
+        let mut ctx = assistance_ctx(&temp);
+        ctx.config.di.objection_window_s = 3600;
+        let id = crate::di::create_request(
+            &ctx,
+            "helper",
+            "owner",
+            "src/tests/di.rs",
+            "add DI coverage for the combat module",
+        )
+        .unwrap();
+        crate::di::approve(&ctx, &id, "owner").unwrap();
+        crate::di::resolve_pending(&ctx).unwrap();
+
+        // Without the approval this errors demanding --delegation.
+        cmd_claim(&ctx, "helper", &abs, None, None, None, None).unwrap();
+        let lease = store::get_claim(&ctx.conn, "src/tests/di.rs")
+            .unwrap()
+            .expect("lease should exist");
+        assert_eq!(lease.holder, "helper");
+    }
+
+    /// Same path with no DI approval: the delegation requirement still
+    /// guards the owner's domain.
+    #[test]
+    fn cross_domain_claim_without_di_still_needs_delegation() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src/tests")).unwrap();
+        let file = temp.path().join("src/tests/nope.rs");
+        std::fs::write(&file, "// nope\n").unwrap();
+        let abs = file.to_string_lossy().to_string();
+        let ctx = assistance_ctx(&temp);
+        let err = cmd_claim(&ctx, "helper", &abs, None, None, None, None)
+            .unwrap_err();
+        assert!(err.to_string().contains("delegation"));
+    }
+
+    /// R26: an approved DI whose claim loses the lease race gets the
+    /// claim-contested park hint, not a bare denial.
+    #[test]
+    fn di_approved_claim_losing_race_suggests_contested_park() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("src/tests")).unwrap();
+        let file = temp.path().join("src/tests/hot.rs");
+        std::fs::write(&file, "// hot\n").unwrap();
+        let abs = file.to_string_lossy().to_string();
+        let mut ctx = assistance_ctx(&temp);
+        ctx.config.di.objection_window_s = 3600;
+        cmd_claim(&ctx, "owner", &abs, None, None, None, None).unwrap();
+        let id = crate::di::create_request(
+            &ctx,
+            "helper",
+            "owner",
+            "src/tests/hot.rs",
+            "touch the hot file for the DI race test",
+        )
+        .unwrap();
+        crate::di::approve(&ctx, &id, "owner").unwrap();
+        crate::di::resolve_pending(&ctx).unwrap();
+
+        let err = cmd_claim(&ctx, "helper", &abs, None, None, None, None)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("DENIED"), "got: {msg}");
+        assert!(msg.contains("--wait-contested-claim"), "got: {msg}");
     }
 
     #[test]

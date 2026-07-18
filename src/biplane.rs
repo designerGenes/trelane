@@ -301,7 +301,7 @@ fn execute_biplane_plan(
     )))
 }
 
-fn resolve_launcher_template(model: &str) -> Result<String> {
+pub(crate) fn resolve_launcher_template(model: &str) -> Result<String> {
     // Determine the fully-qualified model id. Prefer the exact id from a
     // configured launcher profile so we never guess an "openrouter/{model}"
     // id -- an invalid id makes OpenRouter return an opaque
@@ -429,7 +429,7 @@ fn strip_ansi(input: &str) -> String {
     result
 }
 
-fn extract_text_from_json_events(stdout: &str) -> String {
+pub(crate) fn extract_text_from_json_events(stdout: &str) -> String {
     let mut text_parts = Vec::new();
     for line in stdout.lines() {
         let line = line.trim();

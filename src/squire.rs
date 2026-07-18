@@ -4,7 +4,7 @@ use crate::error::Result;
 use crate::models::{AgentActivityState, AgentStatus, Message, WakeCandidate, WakeKind};
 use crate::prompt;
 use crate::store;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::collections::{HashMap, HashSet};
 
 type WaitEdges = HashMap<String, HashSet<String>>;
@@ -238,8 +238,16 @@ pub fn wake_plan(ctx: &Context) -> Result<WakePlan> {
         let abandoned: Vec<&crate::models::ParkedTask> = parked
             .iter()
             .filter(|e| {
-                !prompt::park_satisfied(&ctx.conn, e).unwrap_or(false)
-                    && prompt::park_abandoned(&ctx.conn, e, reply_timeout).unwrap_or(false)
+                if prompt::park_satisfied(&ctx.conn, e).unwrap_or(false) {
+                    return false;
+                }
+                // R26: contested DI claims abandon on their own configured
+                // timeout, not the generic reply timeout.
+                let timeout = match e.wait_type.as_str() {
+                    "claim-contested" => Some(ctx.config.di.claim_contested_timeout_s),
+                    _ => reply_timeout,
+                };
+                prompt::park_abandoned(&ctx.conn, e, timeout).unwrap_or(false)
             })
             .collect();
 
@@ -268,6 +276,67 @@ pub fn wake_plan(ctx: &Context) -> Result<WakePlan> {
                     reasons.join("; ")
                 ),
                 urgency_rank: 1,
+                task_id: None,
+                delegation_id: None,
+                discovery_fingerprint: None,
+                discovery_task_id: None,
+            });
+            seen.insert(agent.clone());
+            continue;
+        }
+
+        // 4A: resolved DI requests wake the parked requester with the
+        // outcome as the wake reason (checked before generic ready-parks so
+        // the reason is specific -- R4: one wake, one recorded reason).
+        let di_resolved: Vec<crate::di::DiRequest> = parked
+            .iter()
+            .filter(|e| e.wait_type == "di_request")
+            .filter_map(|e| {
+                e.wait_re
+                    .as_deref()
+                    .and_then(|id| crate::di::get_request(&ctx.conn, id).ok().flatten())
+            })
+            .filter(|req| req.status != crate::di::STATUS_PENDING)
+            .collect();
+        if let Some(req) = di_resolved.into_iter().next() {
+            let (kind, reason) = match req.status.as_str() {
+                crate::di::STATUS_APPROVED => (
+                    WakeKind::DIApproved,
+                    format!(
+                        "DI request {} APPROVED for {} in domain {}. Approval is permission, \
+                         not a lock (R10): run `trelane claim {} {}` before writing. If the \
+                         path is already leased, park on the contention instead of retrying: \
+                         `trelane park {} --wait-contested-claim {} --waiting-on <holder>` (R26). \
+                         Never write .trelane/** or .git/** regardless of approval (R11).",
+                        req.id, req.path_glob, req.target_domain, agent, req.path_glob,
+                        agent, req.path_glob
+                    ),
+                ),
+                crate::di::STATUS_VETOED => (
+                    WakeKind::DIVetoed,
+                    format!(
+                        "DI request {} VETOED by {}: {}. A veto is final for this request -- \
+                         do not retry the same request without addressing the objection.",
+                        req.id,
+                        req.veto_agent.as_deref().unwrap_or("?"),
+                        req.veto_reason.as_deref().unwrap_or("(no reason given)")
+                    ),
+                ),
+                _ => (
+                    WakeKind::DIExpired,
+                    format!(
+                        "DI request {} EXPIRED: no approval and no veto within \
+                         di.request_timeout_s (R25 -- silence is not permission). Re-request \
+                         with a clearer purpose, or find another path.",
+                        req.id
+                    ),
+                ),
+            };
+            cands.push(WakeCandidate {
+                agent: agent.clone(),
+                kind,
+                reason,
+                urgency_rank: 2,
                 task_id: None,
                 delegation_id: None,
                 discovery_fingerprint: None,
@@ -568,6 +637,11 @@ pub fn tick(ctx: &Context, launcher_override: Option<&str>, verbose: bool) -> Re
         eprintln!("retention sweep failed (non-fatal): {e}");
     }
     reap_leases(ctx)?;
+    // 4A: resolve pending domain-intrusion requests against current durable
+    // state (veto always wins; owner approval immediate; standing non-owner
+    // approval past the objection window; silence expires per R25). Done
+    // before planning so resolved requests surface as wake reasons this tick.
+    let _di_resolved = crate::di::resolve_pending(ctx)?;
     let plan = wake_plan(ctx)?;
     let cycle_detected = plan.cycle.is_some();
     if plan.candidates.is_empty() {
@@ -580,6 +654,8 @@ pub fn tick(ctx: &Context, launcher_override: Option<&str>, verbose: bool) -> Re
                     .count()
             })
             .unwrap_or(0);
+        // R28: total quiescence is recorded, never auto-acted on.
+        maybe_post_quiescence_notice(ctx, running_now);
         emit_tick_span(0, running_now, cycle_detected);
         return Ok(0);
     }
@@ -614,6 +690,10 @@ pub fn tick(ctx: &Context, launcher_override: Option<&str>, verbose: bool) -> Re
     let budget = report.budget;
     let mut launched = 0;
     let now = crate::crypto::now_iso();
+    // GAP-06: per-candidate launch outcomes, for the squire.wake_candidate
+    // spans emitted at the end of the tick.
+    let mut launched_agents: HashSet<&str> = HashSet::new();
+    let mut launcher_skipped: HashSet<&str> = HashSet::new();
 
     for cand in &plan.candidates {
         if launched >= budget {
@@ -632,6 +712,7 @@ pub fn tick(ctx: &Context, launcher_override: Option<&str>, verbose: bool) -> Re
         match commands::cmd_wake(ctx, &cand.agent, Some(cand.reason.as_str()), launcher_override) {
             Ok(()) => {
                 launched += 1;
+                launched_agents.insert(cand.agent.as_str());
                 // Apply deferred side effects now that the agent launched.
 
                 // R23: the agent actually launched, so its starvation streak is
@@ -722,16 +803,135 @@ pub fn tick(ctx: &Context, launcher_override: Option<&str>, verbose: bool) -> Re
                 }
             }
             Err(e) if e.is_launcher_not_configured() => {
+                launcher_skipped.insert(cand.agent.as_str());
                 eprintln!("{} SKIPPED {}: {}", crate::crypto::now_iso(), cand.agent, e);
             }
             Err(e) => return Err(e),
         }
     }
 
+    // GAP-06: one squire.wake_candidate span per agent *considered* this tick
+    // -- not just the winners -- so "why didn't X wake" is answerable after
+    // the fact. Best-effort per R16.
+    emit_wake_candidate_spans(ctx, &plan, &agents, &launched_agents, &launcher_skipped, start_ns);
+
     // Record the completed tick: how many launched, how many were running at
     // the start of the launch phase, and whether a wait-cycle was detected.
     emit_tick_span(launched, running_count, cycle_detected);
     Ok(launched)
+}
+
+/// GAP-06: emit a `squire.wake_candidate` span for every registered agent,
+/// recording what was considered and why it was or wasn't chosen.
+fn emit_wake_candidate_spans(
+    ctx: &Context,
+    plan: &WakePlan,
+    agents: &[String],
+    launched_agents: &HashSet<&str>,
+    launcher_skipped: &HashSet<&str>,
+    start_ns: u64,
+) {
+    let Ok(tracer) =
+        crate::telemetry::Tracer::ephemeral(&ctx.trelane_dir(), &ctx.root.display().to_string())
+    else {
+        return;
+    };
+    let end_ns = crate::telemetry::now_nanos();
+    for agent in agents {
+        let cand = plan.candidates.iter().find(|c| &c.agent == agent);
+        let (kind, chosen, reason_skipped) = match cand {
+            Some(c) if launched_agents.contains(agent.as_str()) => {
+                (format!("{:?}", c.kind), "true", "")
+            }
+            Some(c) if launcher_skipped.contains(agent.as_str()) => {
+                (format!("{:?}", c.kind), "false", "launcher not configured")
+            }
+            Some(c) => (format!("{:?}", c.kind), "false", "concurrency budget"),
+            None if commands::is_running(&ctx.conn, agent).unwrap_or(false) => {
+                ("None".to_string(), "false", "already running")
+            }
+            None => ("None".to_string(), "false", "no wake reason"),
+        };
+        let _ = tracer.record_event(
+            "squire.wake_candidate",
+            &[
+                ("agent.name", agent.as_str()),
+                ("wake.kind_considered", kind.as_str()),
+                ("wake.chosen", chosen),
+                ("wake.reason_skipped", reason_skipped),
+            ],
+            start_ns,
+            end_ns,
+        );
+    }
+}
+
+/// R28: when the whole swarm is quiescent -- no candidates, no running
+/// agents, zero open tasks, zero open parked waits -- record that fact as a
+/// system-level bulletin notice. Informational only: never a wake trigger,
+/// never an automatic Biplane invocation (R19 holds even here). Posted once
+/// per quiescent stretch (fresh activity re-arms it).
+fn maybe_post_quiescence_notice(ctx: &Context, running_now: usize) {
+    let _ = (|| -> Result<()> {
+        if running_now > 0 {
+            return Ok(());
+        }
+        // Zero open (non-terminal) tasks across every domain.
+        let open_tasks: i64 = ctx.conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE state NOT IN ('done', 'cancelled')",
+            [],
+            |r| r.get(0),
+        )?;
+        if open_tasks > 0 {
+            return Ok(());
+        }
+        // Zero open parked waits -- a parked swarm is waiting, not finished.
+        let open_parks: i64 =
+            ctx.conn
+                .query_row("SELECT COUNT(*) FROM parked_tasks", [], |r| r.get(0))?;
+        if open_parks > 0 {
+            return Ok(());
+        }
+        // Once per quiescent stretch: if the most recent activity on record
+        // is already a quiescence notice, don't pile on. rowid orders by
+        // insertion (created_at is only second-granularity).
+        let latest: Option<(String, String)> = ctx
+            .conn
+            .query_row(
+                "SELECT msg_type, id FROM messages ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if matches!(latest, Some((ref t, _)) if t == "quiescence_notice") {
+            return Ok(());
+        }
+        let now = crate::crypto::now_iso();
+        let mut msg = Message::new(
+            crate::crypto::new_id("msg"),
+            "system".to_string(),
+            String::new(), // broadcast: not addressed to one agent
+            "quiescence_notice".to_string(),
+            "low".to_string(),
+            "quiescence: zero ready work across all domains".to_string(),
+            "Total quiescence observed: no running agents, no open tasks, no parked waits. \
+             Informational only (R28) -- this notice never triggers a wake and never invokes \
+             Biplane automatically (R19)."
+                .to_string(),
+            None,
+            None,
+            vec![],
+            now,
+        );
+        msg.channel = crate::models::CHANNEL_BULLETIN.to_string();
+        msg.scope = Some("system".to_string());
+        let secret = ctx.secret()?;
+        crate::crypto::sign(&secret, &mut msg);
+        store::insert_message(&ctx.conn, &msg)?;
+        eprintln!("{} quiescence: zero ready work across all domains (notice posted)",
+            crate::crypto::now_iso());
+        Ok(())
+    })();
 }
 
 /// Derived, read-only explanation of why an agent is in its current state.
@@ -1098,7 +1298,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let ctx = migrated_ctx(&temp);
         setup_two_agents(&ctx);
-        let mut task = make_task("task_1", "alpha", TaskState::Active);
+        let task = make_task("task_1", "alpha", TaskState::Active);
         store::insert_task(&ctx.conn, &task).unwrap();
         let del = make_delegation("del_1", "task_1", "alpha", "beta", DelegationStatus::Active);
         store::insert_delegation(&ctx.conn, &del).unwrap();
@@ -1280,8 +1480,205 @@ mod tests {
         assert_eq!(status.state, AgentActivityState::AvailableToHelp);
     }
 
-    // ------------------------------------------------------- R23 starvation
+    // ------------------------------------------------------- R28 quiescence
 
+    fn count_quiescence_notices(ctx: &crate::Context) -> i64 {
+        ctx.conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE msg_type = 'quiescence_notice'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn quiescence_notice_posted_once_per_quiet_stretch() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = migrated_ctx(&temp);
+        crate::commands::cmd_add_agent(&ctx, "alpha", &["src/**".to_string()], &[], None, None)
+            .unwrap();
+
+        // Total quiescence: no tasks, no parks, no running agents.
+        tick(&ctx, None, false).unwrap();
+        assert_eq!(count_quiescence_notices(&ctx), 1);
+        // Second tick: same stretch, no duplicate.
+        tick(&ctx, None, false).unwrap();
+        assert_eq!(count_quiescence_notices(&ctx), 1);
+
+        // Fresh activity (a bulletin post) re-arms the notice.
+        crate::commands::post_bulletin(&ctx, "alpha", "alpha", &["src/a.rs".to_string()], "work")
+            .unwrap();
+        tick(&ctx, None, false).unwrap();
+        assert_eq!(count_quiescence_notices(&ctx), 2);
+    }
+
+    #[test]
+    fn open_tasks_prevent_quiescence_notice() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = migrated_ctx(&temp);
+        setup_two_agents(&ctx);
+        store::insert_task(&ctx.conn, &make_task("task_1", "alpha", TaskState::Ready)).unwrap();
+        // The ready task itself is a wake reason, but even with candidates
+        // suppressed the notice must not post while work is open.
+        let _ = tick(&ctx, None, false);
+        assert_eq!(count_quiescence_notices(&ctx), 0);
+    }
+
+    #[test]
+    fn wake_candidate_spans_cover_considered_and_skipped() {
+        // Two agents with inbox wakes, no launchers configured: both are
+        // considered, neither chosen. Spans must record the skip reason.
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = migrated_ctx(&temp);
+        crate::commands::cmd_add_agent(&ctx, "aa", &["src/**".to_string()], &[], None, None)
+            .unwrap();
+        crate::commands::cmd_add_agent(&ctx, "bb", &["lib/**".to_string()], &[], None, None)
+            .unwrap();
+        for to in ["aa", "bb"] {
+            crate::commands::cmd_send(
+                &ctx, "user", to, "question", "normal", "q", "", &None, &None, &[],
+            )
+            .unwrap();
+        }
+
+        tick(&ctx, None, false).unwrap();
+
+        let trace_file = ctx.trelane_dir().join("traces").join("ephemeral.jsonl");
+        let spans = crate::telemetry::Tracer::read_spans(&trace_file).unwrap();
+        let candidate_spans: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name == "squire.wake_candidate")
+            .collect();
+        assert_eq!(candidate_spans.len(), 2, "one span per considered agent");
+        for span in candidate_spans {
+            let attrs = format!("{:?}", span.attributes);
+            assert!(attrs.contains("Inbox"), "kind recorded: {attrs}");
+            assert!(attrs.contains("wake.chosen"), "chosen attr present: {attrs}");
+            assert!(
+                attrs.contains(r#"value: StringValue("false")"#),
+                "not chosen: {attrs}"
+            );
+            assert!(attrs.contains("launcher not configured"), "skip reason: {attrs}");
+        }
+        // And the tick span itself is present (GAP-06).
+        assert!(spans.iter().any(|s| s.name == "squire.tick"));
+    }
+
+    // ------------------------------------------------------------- 4A DI
+
+    #[test]
+    fn di_resolution_produces_specific_wake_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut ctx = migrated_ctx(&temp);
+        ctx.config.di.objection_window_s = 3600;
+        crate::commands::cmd_add_agent(&ctx, "owner", &["src/**".to_string()], &[], None, None)
+            .unwrap();
+        crate::commands::cmd_add_agent(&ctx, "helper", &["lib/**".to_string()], &[], None, None)
+            .unwrap();
+        let id = crate::di::create_request(
+            &ctx,
+            "helper",
+            "owner",
+            "src/enemy.rs",
+            "add a Damage import for the autoplay decider",
+        )
+        .unwrap();
+        crate::di::approve(&ctx, &id, "owner").unwrap();
+        crate::di::resolve_pending(&ctx).unwrap();
+
+        let plan = wake_plan(&ctx).unwrap();
+        let cand = plan
+            .candidates
+            .iter()
+            .find(|c| c.agent == "helper")
+            .expect("helper should have a wake candidate");
+        assert_eq!(cand.kind, crate::models::WakeKind::DIApproved);
+        assert!(cand.reason.contains("APPROVED"));
+        assert!(cand.reason.contains("R10"));
+    }
+
+    #[test]
+    fn di_veto_produces_vetoed_wake_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = migrated_ctx(&temp);
+        crate::commands::cmd_add_agent(&ctx, "owner", &["src/**".to_string()], &[], None, None)
+            .unwrap();
+        crate::commands::cmd_add_agent(&ctx, "helper", &["lib/**".to_string()], &[], None, None)
+            .unwrap();
+        let id = crate::di::create_request(
+            &ctx,
+            "helper",
+            "owner",
+            "src/enemy.rs",
+            "add a Damage import for the autoplay decider",
+        )
+        .unwrap();
+        crate::di::deny(&ctx, &id, "owner", "mid-rewrite, hands off").unwrap();
+        crate::di::resolve_pending(&ctx).unwrap();
+
+        let plan = wake_plan(&ctx).unwrap();
+        let cand = plan
+            .candidates
+            .iter()
+            .find(|c| c.agent == "helper")
+            .expect("helper should have a wake candidate");
+        assert_eq!(cand.kind, crate::models::WakeKind::DIVetoed);
+        assert!(cand.reason.contains("VETOED"));
+        assert!(cand.reason.contains("mid-rewrite"));
+    }
+
+    #[test]
+    fn claim_contested_park_abandons_on_own_timeout() {
+        // R26: a contested DI claim waits out di.claim_contested_timeout_s,
+        // not the (longer) generic reply timeout.
+        let temp = tempfile::tempdir().unwrap();
+        let mut ctx = migrated_ctx(&temp);
+        ctx.config.squire.reply_timeout_s = Some(86_400);
+        ctx.config.di.claim_contested_timeout_s = 60;
+        crate::commands::cmd_add_agent(&ctx, "owner", &["src/**".to_string()], &[], None, None)
+            .unwrap();
+        crate::commands::cmd_add_agent(&ctx, "helper", &["lib/**".to_string()], &[], None, None)
+            .unwrap();
+        // The contested lease is still held by the owner (unexpired), so the
+        // park is genuinely unsatisfied.
+        store::insert_claim(
+            &ctx.conn,
+            &crate::models::Lease {
+                path: "src/enemy.rs".to_string(),
+                holder: "owner".to_string(),
+                task: None,
+                grant: None,
+                delegation_id: None,
+                acquired_at: crate::crypto::now_iso(),
+                expires_at: chrono::Utc::now().timestamp() as f64 + 3600.0,
+                expires_human: "2099-01-01T00:00:00Z".to_string(),
+                contested: true,
+            },
+        )
+        .unwrap();
+        store::insert_parked_task(&ctx.conn, &ParkedTask {
+            task: "contested".to_string(),
+            agent: "helper".to_string(),
+            wait_type: "claim-contested".to_string(),
+            wait_re: None,
+            wait_path: Some("src/enemy.rs".to_string()),
+            waiting_on: "owner".to_string(),
+            resume_hint: String::new(),
+            created_at: "2020-01-01T00:00:00Z".to_string(),
+        })
+        .unwrap();
+
+        let plan = wake_plan(&ctx).unwrap();
+        let cand = plan
+            .candidates
+            .iter()
+            .find(|c| c.agent == "helper")
+            .expect("helper should have a wake candidate");
+        assert_eq!(cand.kind, crate::models::WakeKind::AbandonedPark);
+    }
+
+    // ------------------------------------------------------- R23 starvation
     #[test]
     fn starvation_count_increments_and_clears() {
         let temp = tempfile::tempdir().unwrap();

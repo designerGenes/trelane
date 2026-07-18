@@ -4,6 +4,7 @@ pub mod cli;
 pub mod commands;
 pub mod crypto;
 pub mod db;
+pub mod di;
 pub mod diagnostic;
 pub mod domain;
 pub mod entropy;
@@ -13,6 +14,7 @@ pub mod models;
 pub mod prompt;
 pub mod prop;
 pub mod pump;
+pub mod refine;
 pub mod retention;
 pub mod splash;
 pub mod squire;
@@ -522,6 +524,14 @@ pub fn handle(cli: Cli) -> Result<()> {
             let ctx = Context::open(cli.root.as_deref())?;
             commands::cmd_retention(&ctx, &action)
         }
+        Some(Command::Di { action }) => {
+            let ctx = Context::open(cli.root.as_deref())?;
+            commands::cmd_di(&ctx, &action)
+        }
+        Some(Command::Split { action }) => {
+            let ctx = Context::open(cli.root.as_deref())?;
+            refine::cmd_split(&ctx, &action)
+        }
         Some(Command::Ack { agent, msg_id }) => {
             let ctx = Context::open(cli.root.as_deref())?;
             commands::cmd_ack(&ctx, &agent, &msg_id)
@@ -554,6 +564,7 @@ pub fn handle(cli: Cli) -> Result<()> {
             task,
             wait_reply,
             wait_claim,
+            wait_contested_claim,
             waiting_on,
             resume_hint,
         }) => {
@@ -564,6 +575,7 @@ pub fn handle(cli: Cli) -> Result<()> {
                 task.as_deref(),
                 &wait_reply,
                 &wait_claim,
+                &wait_contested_claim,
                 &waiting_on,
                 &resume_hint,
             )
@@ -633,7 +645,19 @@ pub fn handle(cli: Cli) -> Result<()> {
             ui,
             accept_defaults,
             json,
+            refine,
+            refine_model,
         }) => {
+            if refine {
+                // Slice 5: the deliberate, model-calling refinement pass
+                // (R19). Never on the squire's wake path.
+                let ctx = Context::open(cli.root.as_deref())?;
+                let model = refine_model
+                    .as_deref()
+                    .map(str::to_string)
+                    .unwrap_or_else(biplane::default_biplane_model);
+                return refine::cmd_refine(&ctx, &model, json);
+            }
             if ui {
                 let root = match cli.root.as_deref() {
                     Some(p) => p.to_path_buf(),

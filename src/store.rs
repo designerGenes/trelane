@@ -1,8 +1,9 @@
 use crate::error::{Result, TrelaneError};
 use crate::models::{
     AssistDiscoveryState, AssistPolicy, CompletionBlocker, Delegation, DelegationStatus,
-    Domain, LaunchTarget, Lease, Message, ParkedTask, ProjectCompletionReport, ReviewDecision,
-    RunningLock, Task, TaskAssignment, TaskReview, TaskRole, TaskState, TaskSubmission, Violation,
+    Domain, DomainAdjacency, LaunchTarget, Lease, Message, ParkedTask, ProjectCompletionReport,
+    ReviewDecision, RunningLock, SplitProposal, Task, TaskAssignment, TaskReview, TaskRole,
+    TaskState, TaskSubmission, Violation,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::HashMap;
@@ -55,7 +56,9 @@ pub fn agent_exists(conn: &Connection, name: &str) -> Result<bool> {
 pub fn get_domain(conn: &Connection, agent: &str) -> Result<Option<Domain>> {
     let result = conn
         .query_row(
-            "SELECT id, description, writable_json, launcher_agent, forbidden_json FROM agents WHERE id = ?1",
+            "SELECT id, description, writable_json, launcher_agent, forbidden_json, \
+             granularity_tier, parent_domain, created_in_pass, owner_at_split_time, tier_set_at \
+             FROM agents WHERE id = ?1",
             params![agent],
             |r| {
                 let writable: Vec<String> =
@@ -68,11 +71,33 @@ pub fn get_domain(conn: &Connection, agent: &str) -> Result<Option<Domain>> {
                     writable,
                     launcher_agent: r.get(3)?,
                     forbidden_write: forbidden,
+                    granularity_tier: r.get(5)?,
+                    parent_domain: r.get(6)?,
+                    created_in_pass: r.get(7)?,
+                    owner_at_split_time: r.get(8)?,
+                    tier_set_at: r.get(9)?,
                 })
             },
         )
         .optional()?;
     Ok(result)
+}
+
+/// Slice 5: stamp refinement lineage on a domain row (R17/R18).
+pub fn set_domain_lineage(
+    conn: &Connection,
+    agent: &str,
+    tier: &str,
+    parent_domain: Option<&str>,
+    created_in_pass: i64,
+    tier_set_at: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE agents SET granularity_tier = ?2, parent_domain = ?3, \
+         created_in_pass = ?4, tier_set_at = ?5 WHERE id = ?1",
+        params![agent, tier, parent_domain, created_in_pass, tier_set_at],
+    )?;
+    Ok(())
 }
 
 pub fn upsert_agent(
@@ -844,6 +869,184 @@ pub fn list_cycle_break_attempts(conn: &Connection) -> Result<Vec<CycleBreakAtte
         out.push(row?);
     }
     Ok(out)
+}
+
+// --------------------------------------------------- Slice 5: adjacency
+
+/// Recomputed, not accumulated (5B): replace a domain's whole adjacency list
+/// with the freshly computed one.
+pub fn replace_adjacency(
+    conn: &Connection,
+    from_domain: &str,
+    entries: &[(String, i64, String, String)],
+    now: &str,
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM domain_adjacency WHERE from_domain = ?1",
+        params![from_domain],
+    )?;
+    for (to, rank, rationale, source) in entries {
+        conn.execute(
+            "INSERT INTO domain_adjacency (from_domain, to_domain, rank, rationale, source, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![from_domain, to, rank, rationale, source, now],
+        )?;
+    }
+    Ok(())
+}
+
+/// A domain's ranked move targets, best first (R21).
+pub fn get_adjacency(conn: &Connection, from_domain: &str) -> Result<Vec<DomainAdjacency>> {
+    let mut stmt = conn.prepare(
+        "SELECT from_domain, to_domain, rank, rationale, source, created_at
+         FROM domain_adjacency WHERE from_domain = ?1 ORDER BY rank",
+    )?;
+    let rows = stmt.query_map(params![from_domain], |r| {
+        Ok(DomainAdjacency {
+            from_domain: r.get(0)?,
+            to_domain: r.get(1)?,
+            rank: r.get(2)?,
+            rationale: r.get(3)?,
+            source: r.get(4)?,
+            created_at: r.get(5)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------- Slice 5: split proposals
+
+pub fn insert_split_proposal(conn: &Connection, proposal: &SplitProposal) -> Result<()> {
+    conn.execute(
+        "INSERT INTO split_proposals
+            (id, domain, owner_at_split_time, proposal_json, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            proposal.id,
+            proposal.domain,
+            proposal.owner_at_split_time,
+            proposal.proposal_json,
+            proposal.status,
+            proposal.created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_split_proposal(conn: &Connection, id: &str) -> Result<Option<SplitProposal>> {
+    let result = conn
+        .query_row(
+            "SELECT id, domain, owner_at_split_time, proposal_json, status, created_at, resolved_at
+             FROM split_proposals WHERE id = ?1",
+            params![id],
+            |r| {
+                Ok(SplitProposal {
+                    id: r.get(0)?,
+                    domain: r.get(1)?,
+                    owner_at_split_time: r.get(2)?,
+                    proposal_json: r.get(3)?,
+                    status: r.get(4)?,
+                    created_at: r.get(5)?,
+                    resolved_at: r.get(6)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(result)
+}
+
+/// R29: unreviewed split proposals against an owner's domain, surfaced at
+/// the owner's next wake.
+pub fn list_pending_split_proposals_for(
+    conn: &Connection,
+    owner: &str,
+) -> Result<Vec<SplitProposal>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, domain, owner_at_split_time, proposal_json, status, created_at, resolved_at
+         FROM split_proposals
+         WHERE owner_at_split_time = ?1 AND status = 'pending'
+         ORDER BY created_at",
+    )?;
+    let rows = stmt.query_map(params![owner], |r| {
+        Ok(SplitProposal {
+            id: r.get(0)?,
+            domain: r.get(1)?,
+            owner_at_split_time: r.get(2)?,
+            proposal_json: r.get(3)?,
+            status: r.get(4)?,
+            created_at: r.get(5)?,
+            resolved_at: r.get(6)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub fn list_split_proposals(
+    conn: &Connection,
+    status: Option<&str>,
+) -> Result<Vec<SplitProposal>> {
+    let (sql, filtered) = match status {
+        Some(_) => ("SELECT id, domain, owner_at_split_time, proposal_json, status, created_at, resolved_at
+             FROM split_proposals WHERE status = ?1 ORDER BY created_at", true),
+        None => ("SELECT id, domain, owner_at_split_time, proposal_json, status, created_at, resolved_at
+             FROM split_proposals ORDER BY created_at", false),
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let map_row = |r: &rusqlite::Row| {
+        Ok(SplitProposal {
+            id: r.get(0)?,
+            domain: r.get(1)?,
+            owner_at_split_time: r.get(2)?,
+            proposal_json: r.get(3)?,
+            status: r.get(4)?,
+            created_at: r.get(5)?,
+            resolved_at: r.get(6)?,
+        })
+    };
+    let rows: Vec<SplitProposal> = if filtered {
+        stmt.query_map(params![status.unwrap()], map_row)?
+            .filter_map(|r| r.ok())
+            .collect()
+    } else {
+        stmt.query_map([], map_row)?.filter_map(|r| r.ok()).collect()
+    };
+    Ok(rows)
+}
+
+pub fn resolve_split_proposal(conn: &Connection, id: &str, status: &str, at: &str) -> Result<()> {
+    let n = conn.execute(
+        "UPDATE split_proposals SET status = ?2, resolved_at = ?3
+         WHERE id = ?1 AND status = 'pending'",
+        params![id, status, at],
+    )?;
+    if n == 0 {
+        return Err(TrelaneError::Msg(format!(
+            "no pending split proposal '{id}'"
+        )));
+    }
+    Ok(())
+}
+
+/// Slice 5 pass numbering (project_state singleton).
+pub fn next_refinement_pass(conn: &Connection) -> Result<i64> {
+    conn.execute(
+        "UPDATE project_state SET refinement_pass = refinement_pass + 1 WHERE id = 1",
+        [],
+    )?;
+    let pass: i64 = conn.query_row(
+        "SELECT refinement_pass FROM project_state WHERE id = 1",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(pass)
 }
 
 // --------------------------------------------------------------- starvation

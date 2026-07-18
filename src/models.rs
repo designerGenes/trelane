@@ -350,6 +350,15 @@ pub struct BiplaneConfig {
     /// agents for emergent domains discovered during reconciliation.
     /// Additive-only: existing agents are never removed or re-assigned.
     pub reanalyze_on_all_stop: bool,
+    /// R18: the finest tier the refinement pass may propose (default
+    /// "feature"). Refinement stops at this rung even when a domain keeps
+    /// growing.
+    #[serde(default = "default_max_granularity_tier")]
+    pub max_granularity_tier: String,
+}
+
+fn default_max_granularity_tier() -> String {
+    "feature".to_string()
 }
 
 impl Default for BiplaneConfig {
@@ -357,6 +366,7 @@ impl Default for BiplaneConfig {
         Self {
             detect_thematic_deadlock: true,
             reanalyze_on_all_stop: false,
+            max_granularity_tier: default_max_granularity_tier(),
         }
     }
 }
@@ -434,6 +444,90 @@ pub struct Domain {
     pub launcher_agent: Option<String>,
     #[serde(default)]
     pub forbidden_write: Vec<String>,
+    /// R18: where this domain sits on the open-ended granularity ladder.
+    #[serde(default = "default_granularity_tier")]
+    pub granularity_tier: String,
+    /// R17: lineage -- the domain this one was split from, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_domain: Option<String>,
+    #[serde(default)]
+    pub created_in_pass: i64,
+    /// R20: set only on the proposal record when a split targets an owned
+    /// domain; also stamped on the domain row for audit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_at_split_time: Option<String>,
+    /// When the current tier was assigned (growth signals are scoped to
+    /// files changed since this time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_set_at: Option<String>,
+}
+
+pub(crate) fn default_granularity_tier() -> String {
+    "coarse".to_string()
+}
+
+/// R18: the open-ended granularity ladder, climbed one rung at a time, each
+/// domain advancing independently. The ladder is *open-ended*: tiers finer
+/// than the last named rung are representable as free strings, but the
+/// built-in refinement pass only ever proposes the next named rung.
+pub const GRANULARITY_LADDER: &[&str] = &["coarse", "file-group", "feature"];
+
+/// Rank of a tier on the ladder. Unknown (finer, custom) tiers rank beyond
+/// the named rungs, preserving order without hardcoding the end.
+pub fn tier_rank(tier: &str) -> usize {
+    GRANULARITY_LADDER
+        .iter()
+        .position(|t| *t == tier)
+        .unwrap_or(GRANULARITY_LADDER.len())
+}
+
+/// The next named rung up, or None at/above the ladder's current top (or for
+/// a custom tier, which refinement never advances automatically).
+pub fn next_tier(tier: &str) -> Option<&'static str> {
+    GRANULARITY_LADDER
+        .iter()
+        .position(|t| *t == tier)
+        .and_then(|i| GRANULARITY_LADDER.get(i + 1).copied())
+}
+
+/// R21: a ranked move target for a domain that has run out of ready work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainAdjacency {
+    pub from_domain: String,
+    pub to_domain: String,
+    pub rank: i64,
+    #[serde(default)]
+    pub rationale: String,
+    /// Sibling | Structural | LLM
+    #[serde(default = "default_adjacency_source")]
+    pub source: String,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+fn default_adjacency_source() -> String {
+    "sibling".to_string()
+}
+
+/// R20: a proposed split of an OWNED domain. Takes effect only through
+/// review; the owner's current scope is untouched until it separately
+/// finishes or redomains.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitProposal {
+    pub id: String,
+    pub domain: String,
+    pub owner_at_split_time: Option<String>,
+    /// JSON: Vec<DomainSpec>-shaped children plus rationale.
+    pub proposal_json: String,
+    #[serde(default = "default_split_status")]
+    pub status: String,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<String>,
+}
+
+fn default_split_status() -> String {
+    "pending".to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -914,6 +1008,13 @@ pub enum WakeKind {
     OwnedTask,
     HelperAssignment,
     AssistDiscovery,
+    /// 4A: a parked DI request resolved to Approved (R9).
+    DIApproved,
+    /// 4A: a parked DI request resolved to Vetoed (owner veto always wins).
+    DIVetoed,
+    /// 4A/R25: a parked DI request resolved to Expired (silence is not
+    /// permission).
+    DIExpired,
 }
 
 impl WakeKind {
@@ -924,6 +1025,9 @@ impl WakeKind {
             WakeKind::AbandonedPark => 1,
             WakeKind::ReadyPark => 2,
             WakeKind::CycleBreak => 3,
+            WakeKind::DIApproved => 3,
+            WakeKind::DIVetoed => 3,
+            WakeKind::DIExpired => 3,
             WakeKind::OwnedTask => 4,
             WakeKind::HelperAssignment => 5,
             WakeKind::AssistDiscovery => 6,
