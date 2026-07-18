@@ -1,4 +1,5 @@
 pub mod bench;
+pub mod bench_ui;
 pub mod biplane;
 pub mod biplane_ui;
 pub mod cli;
@@ -862,6 +863,7 @@ pub fn handle(cli: Cli) -> Result<()> {
                 report,
                 sandbox_root,
                 free_models_only,
+                ui,
             } => bench::run_bench(
                 &scenario,
                 runs,
@@ -870,6 +872,7 @@ pub fn handle(cli: Cli) -> Result<()> {
                 max_turns,
                 model.as_deref(),
                 free_models_only,
+                ui,
             ),
         },
         Some(Command::Help { action }) => {

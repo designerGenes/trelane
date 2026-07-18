@@ -173,6 +173,7 @@ pub fn run_bench(
     max_turns: Option<u32>,
     model: Option<&str>,
     free_models_only: bool,
+    ui: bool,
 ) -> Result<()> {
     let config = crate::load_config()?;
     let max_turns = max_turns.unwrap_or(config.bench.default_max_turns);
@@ -209,13 +210,48 @@ pub fn run_bench(
     let launcher_override = build_launcher_override(model, max_turns);
     eprintln!("[bench] model={model} max_turns={max_turns} free_models_only={free_models_only}");
 
-    crate::testing::run_testing(
-        scenario_path,
-        runs,
-        report_path,
-        sandbox_root,
-        Some(&launcher_override),
-    )
+    if ui {
+        // The events file is created by run_once inside the sandbox. The TUI
+        // tails it. The path follows the convention: sandbox_root/scenario-run-1/
+        // bench-events.jsonl (run 1 is the first run; for multi-run benches,
+        // the TUI shows the first run's events -- multi-run TUI is a follow-up).
+        let sandbox = sandbox_root
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::env::temp_dir().join("trelane-testing"));
+        let events_path = sandbox.join("scenario-run-1").join("bench-events.jsonl");
+
+        let scenario_name = scenario.name.clone();
+        let model_owned = model.to_string();
+        let runs_val = runs;
+        let scenario_path_owned = scenario_path.to_path_buf();
+        let report_owned = report_path.map(std::path::Path::to_path_buf);
+        let sandbox_owned = sandbox;
+
+        crate::bench_ui::run_with_tui(
+            &events_path,
+            &scenario_name,
+            &model_owned,
+            max_turns,
+            runs_val,
+            move || {
+                crate::testing::run_testing(
+                    &scenario_path_owned,
+                    runs_val,
+                    report_owned.as_deref(),
+                    Some(&sandbox_owned),
+                    Some(&launcher_override),
+                )
+            },
+        )
+    } else {
+        crate::testing::run_testing(
+            scenario_path,
+            runs,
+            report_path,
+            sandbox_root,
+            Some(&launcher_override),
+        )
+    }
 }
 
 #[cfg(test)]

@@ -715,5 +715,10 @@ pub enum BenchAction {
         /// Reject any model not in bench.free_models (prevents paid-model spend).
         #[arg(long = "free-models-only")]
         free_models_only: bool,
+        /// Open a live full-screen TUI showing message traffic and tick
+        /// progress while the bench runs. Without --ui, the bench runs
+        /// headless and the events file is the only record.
+        #[arg(long = "ui")]
+        ui: bool,
     },
 }
