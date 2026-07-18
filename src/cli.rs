@@ -403,6 +403,20 @@ pub enum Command {
     /// Interactive diagnostic view for the main Trelane session (TUI)
     Diagnostic,
 
+    /// Native tabbed session monitor: one tab per agent plus a Trelane
+    /// summary tab. Each agent tab tails that agent's run log and shows its
+    /// live thoughts, tool calls, and output (richest with a streaming
+    /// launcher profile such as `opencode-stream` or `claude-code-stream`).
+    Monitor {
+        /// Watch a `trelane bench run` sandbox instead of the current project.
+        /// Pass the sandbox root used by the bench (the `--sandbox-root` you
+        /// gave `bench run`, or the default temp dir); the monitor resolves
+        /// the active `scenario-run-1` session under it. Without this flag the
+        /// monitor watches the project resolved from `--root`/cwd as usual.
+        #[arg(long = "bench-sandbox")]
+        bench_sandbox: Option<PathBuf>,
+    },
+
     /// Inspect or change Trelane configuration values
     Config {
         #[command(subcommand)]

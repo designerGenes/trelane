@@ -44,6 +44,16 @@ pub const URGENCIES: &[&str] = &["low", "normal", "high", "critical"];
 
 pub const TRELANE_DIR: &str = ".trelane";
 
+/// R11: the two paths that are permission-proof under every protocol,
+/// unconditionally -- no DI approval, no delegation, no operator override
+/// makes them writable. This is the single source of truth; every place that
+/// used to hand-write `format!("{TRELANE_DIR}/**")` + `".git/**"` (domain.rs,
+/// commands.rs, biplane.rs) now calls this instead, so a third forbidden
+/// path -- or a rename of TRELANE_DIR -- only ever needs to change here.
+pub fn hard_forbidden_globs() -> Vec<String> {
+    vec![format!("{TRELANE_DIR}/**"), ".git/**".to_string()]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -83,6 +93,21 @@ impl Default for Config {
         profiles.insert(
             "opencode".to_string(),
             r#"opencode run "$(cat {prompt_file})""#.to_string(),
+        );
+        // Streaming variants: same harnesses, but stdout becomes an NDJSON
+        // event stream (thoughts, tool calls, step boundaries) instead of
+        // prose. cmd_wake already redirects stdout to the agent's run log, so
+        // selecting one of these profiles is ALL it takes for `trelane
+        // monitor` tabs to show live reasoning. Additive: the plain profiles
+        // above keep their existing behavior.
+        profiles.insert(
+            "opencode-stream".to_string(),
+            r#"opencode run --format json --thinking "$(cat {prompt_file})""#.to_string(),
+        );
+        profiles.insert(
+            "claude-code-stream".to_string(),
+            r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50 --output-format stream-json --verbose"#
+                .to_string(),
         );
         profiles.insert(
             "copilot".to_string(),
@@ -419,7 +444,7 @@ impl Default for BiplaneConfig {
 #[serde(default)]
 pub struct BenchConfig {
     /// Free model ids the bench may use. Empty = no restriction. Set via
-    /// `trelane config set bench.free_models '["openrouter/nvidia/nemotron-3-super-120b-a12b:free"]'`.
+    /// `trelane config set bench.free_models '["openrouter/z-ai/glm-5.2"]'`.
     #[serde(default)]
     pub free_models: Vec<String>,
     /// Default --max-turns per agent slice (default 50). A slice ends when
@@ -1249,5 +1274,11 @@ mod tests {
         assert_eq!(keys.pane_right, "F7");
         assert_eq!(keys.pane_up, "F8");
         assert_eq!(keys.pane_down, "F9");
+    }
+
+    #[test]
+    fn hard_forbidden_globs_covers_trelane_and_git() {
+        let globs = hard_forbidden_globs();
+        assert_eq!(globs, vec![".trelane/**".to_string(), ".git/**".to_string()]);
     }
 }

@@ -708,7 +708,7 @@ pub fn cmd_add_agent(
         )));
     }
 
-    let mut forbidden = vec![format!("{TRELANE_DIR}/**"), ".git/**".to_string()];
+    let mut forbidden = crate::models::hard_forbidden_globs();
     forbidden.extend(forbidden_write.iter().cloned());
     let agent_dir = ctx.trelane_dir().join("agents").join(name);
     std::fs::create_dir_all(agent_dir.join("logs"))?;
@@ -746,7 +746,7 @@ pub fn cmd_redomain(
     let existing = store::get_domain(&ctx.conn, agent)?
         .ok_or_else(|| TrelaneError::msg(format!("unknown agent '{agent}'")))?;
 
-    let mut forbidden = vec![format!("{TRELANE_DIR}/**"), ".git/**".to_string()];
+    let mut forbidden = crate::models::hard_forbidden_globs();
     forbidden.extend(forbidden_write.iter().cloned());
     let now = crypto::now_iso();
     store::upsert_agent(
@@ -3700,7 +3700,7 @@ mod tests {
             description: String::new(),
             writable: vec!["**".to_string()],
             launcher_agent: None,
-            forbidden_write: vec![".trelane/**".to_string(), ".git/**".to_string()],
+            forbidden_write: crate::models::hard_forbidden_globs(),
             granularity_tier: default_granularity_tier(),
             parent_domain: None,
             created_in_pass: 0,

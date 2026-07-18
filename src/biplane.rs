@@ -1826,10 +1826,7 @@ fn apply_plan_to_session(
             // re-applied, which is exactly what left some agents stuck on the
             // (now safety-refused) default launcher while sibling agents
             // created in a later apply picked up the right one.
-            let mut forbidden = vec![
-                format!("{}/**", crate::models::TRELANE_DIR),
-                ".git/**".to_string(),
-            ];
+            let mut forbidden = crate::models::hard_forbidden_globs();
             forbidden.extend(fw.iter().cloned());
             crate::store::upsert_agent(
                 &ctx.conn,

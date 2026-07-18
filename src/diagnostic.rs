@@ -870,7 +870,7 @@ fn confirm_and_kill<B: ratatui::backend::Backend>(
     }
 }
 
-fn theme_color(rgb: (u8, u8, u8)) -> ratatui::style::Color {
+pub fn theme_color(rgb: (u8, u8, u8)) -> ratatui::style::Color {
     ratatui::style::Color::Rgb(rgb.0, rgb.1, rgb.2)
 }
 

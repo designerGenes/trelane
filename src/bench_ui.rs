@@ -25,6 +25,58 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+/// Redirect process stdout (fd 1) to a file for as long as this guard lives,
+/// restoring the original on drop.
+///
+/// Why this exists: the orchestrator reuses `testing::run_testing`, which was
+/// written as a CLI runner and prints ~30 progress lines to stdout (`[testing]
+/// step 1: ...`, `waking engine`, `launched ... pid=`). Under the TUI those
+/// prints land on the SAME terminal the alternate screen owns, in raw mode, so
+/// newlines don't carriage-return -- producing the cascading staircase of
+/// corrupted text. Rather than convert all 30 print sites (they're still the
+/// right behavior for a non-TUI run), we capture fd 1 into a `bench.log` file
+/// for the TUI's lifetime. The progress isn't lost -- it's in the file, and
+/// the TUI already renders the same information from the events stream -- it
+/// just stops fighting the screen.
+///
+/// fd-level (not `print!`-level) redirect is required because the prints
+/// happen on a background thread and inside `run_testing`, which we don't
+/// thread a writer through; swapping the fd catches every write regardless of
+/// where it originates.
+struct StdoutCapture {
+    saved_fd: i32,
+}
+
+impl StdoutCapture {
+    /// Point stdout at `path` (created/truncated). On any failure, returns a
+    /// guard that restores nothing -- capture is best-effort; a bench that
+    /// can't open its log should still run (just with the old corruption),
+    /// not abort.
+    fn to_file(path: &std::path::Path) -> Self {
+        use std::os::unix::io::IntoRawFd;
+        let saved_fd = unsafe { libc::dup(libc::STDOUT_FILENO) };
+        if let Ok(file) = std::fs::File::create(path) {
+            let file_fd = file.into_raw_fd();
+            unsafe {
+                libc::dup2(file_fd, libc::STDOUT_FILENO);
+                libc::close(file_fd);
+            }
+        }
+        StdoutCapture { saved_fd }
+    }
+}
+
+impl Drop for StdoutCapture {
+    fn drop(&mut self) {
+        if self.saved_fd >= 0 {
+            unsafe {
+                libc::dup2(self.saved_fd, libc::STDOUT_FILENO);
+                libc::close(self.saved_fd);
+            }
+        }
+    }
+}
+
 /// Run the bench TUI in the foreground while the orchestrator runs on a
 /// background thread. The orchestrator is `orchestrator()` -- a closure that
 /// runs `bench::run_bench` (or equivalent) and writes to `events_path`.
@@ -43,8 +95,19 @@ where
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
 
+    // Capture stdout (fd 1) into bench.log beside the events file, for the
+    // whole run. The orchestrator reuses run_testing, which prints ~30
+    // progress lines to stdout; the TUI draws to /dev/tty (see run_loop) so it
+    // is immune to this redirect. Result: progress is preserved in a file the
+    // user can read, and it no longer corrupts the screen. Best-effort -- if
+    // the log can't be opened, the guard restores nothing and the run
+    // proceeds (with the old behavior) rather than aborting.
+    let capture = events_path
+        .parent()
+        .map(|dir| StdoutCapture::to_file(&dir.join("bench.log")));
+
     // Spawn the orchestrator on a background thread. It writes to
-    // bench-events.jsonl; the TUI tails that file.
+    // bench-events.jsonl (tailed by the TUI); its stdout goes to bench.log.
     let handle = std::thread::spawn(move || -> Result<()> {
         let result = orchestrator();
         // Signal the TUI to stop regardless of outcome.
@@ -62,6 +125,15 @@ where
     let orch_result = handle
         .join()
         .map_err(|_| TrelaneError::msg("bench orchestrator thread panicked"))?;
+
+    // Restore the real stdout before the final summary prints.
+    drop(capture);
+    if let Some(dir) = events_path.parent() {
+        eprintln!(
+            "[bench] orchestrator progress log: {}",
+            dir.join("bench.log").display()
+        );
+    }
 
     tui_result?;
     orch_result
@@ -82,9 +154,18 @@ fn run_loop(
     };
 
     enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
+    // Draw to /dev/tty directly rather than std::io::stdout(). This decouples
+    // the TUI from fd 1, so the orchestrator's captured stdout (redirected to
+    // bench.log by run_with_tui) can't corrupt the screen and, conversely, the
+    // redirect can't steal the TUI's output. Falls back to stdout if /dev/tty
+    // is unavailable (e.g. not a real terminal), which is the old behavior.
+    let mut tty: Box<dyn std::io::Write + Send> =
+        match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+            Ok(f) => Box::new(f),
+            Err(_) => Box::new(std::io::stdout()),
+        };
+    execute!(tty, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(tty);
     let mut terminal = Terminal::new(backend)?;
 
     let start = Instant::now();

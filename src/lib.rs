@@ -13,6 +13,7 @@ pub mod entropy;
 pub mod error;
 pub mod logo;
 pub mod models;
+pub mod monitor;
 pub mod prompt;
 pub mod prop;
 pub mod pump;
@@ -852,6 +853,27 @@ pub fn handle(cli: Cli) -> Result<()> {
         Some(Command::Diagnostic) => {
             let ctx = Context::open(cli.root.as_deref())?;
             diagnostic::run(&ctx)
+        }
+        Some(Command::Monitor { bench_sandbox }) => {
+            let ctx = match bench_sandbox {
+                Some(sandbox) => {
+                    // A bench run provisions its throwaway session under
+                    // <sandbox>/scenario-run-1/.trelane. Point the monitor
+                    // there so it can watch bench agents live.
+                    let session_root = sandbox.join("scenario-run-1");
+                    if !session_root.join(TRELANE_DIR).is_dir() {
+                        return Err(TrelaneError::msg(format!(
+                            "no bench session at {} -- is a `trelane bench run` active with \
+                             this --sandbox-root? (expected {}/.trelane)",
+                            session_root.display(),
+                            session_root.display()
+                        )));
+                    }
+                    Context::open(Some(&session_root))?
+                }
+                None => Context::open(cli.root.as_deref())?,
+            };
+            monitor::run_monitor(&ctx)
         }
         Some(Command::Config { action }) => cmd_config(&action),
         Some(Command::Bench { action }) => match action {
