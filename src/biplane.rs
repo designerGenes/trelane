@@ -649,35 +649,37 @@ fn gather_md_recursive(
     }
 }
 
-/// Look for an existing `biplane-report.json` in any of `dirs` (top-level of
-/// each, not recursive -- a report is a top-level artifact). Returns the first
-/// found, in the order the dirs were given (current dir first).
-pub fn find_report_in_dirs(dirs: &[PathBuf]) -> Option<PathBuf> {
-    for dir in dirs {
-        let candidate = dir.join(BIPLANE_REPORT_FILENAME);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
+/// Look for an existing `biplane-report.json` for the project at `root`. A
+/// report is a projectDir artifact (never in an `-i` markdown-source folder):
+/// the canonical location is `<root>/.trelane/biplane-report.json`, but a
+/// portable report dropped directly in `<root>` is also accepted so a report
+/// can be moved between machines/folders with the project.
+pub fn find_project_report(root: &Path) -> Option<PathBuf> {
+    let nested = root.join(".trelane").join(BIPLANE_REPORT_FILENAME);
+    if nested.is_file() {
+        return Some(nested);
+    }
+    let direct = root.join(BIPLANE_REPORT_FILENAME);
+    if direct.is_file() {
+        return Some(direct);
     }
     None
 }
 
-/// Look for an existing `biplane-description.json` under `<dir>/.trelane/` for
-/// each of `dirs`. This is the editable domain plan the Biplane UI loads and a
-/// Trelane session launches its agents from -- distinct from the live-session
-/// `biplane-report.json`. Returns the first found, current dir first. Also
-/// accepts a description sitting directly in `dir` (e.g. when the user points
-/// at a `.trelane` folder itself), so detection is robust to either layout.
-pub fn find_description_in_dirs(dirs: &[PathBuf]) -> Option<PathBuf> {
-    for dir in dirs {
-        let nested = dir.join(".trelane").join("biplane-description.json");
-        if nested.is_file() {
-            return Some(nested);
-        }
-        let direct = dir.join("biplane-description.json");
-        if direct.is_file() {
-            return Some(direct);
-        }
+/// Look for an existing `biplane-description.json` (the editable domain plan the
+/// UI loads and a Trelane session launches from) for the project at `root`.
+/// Like the report, this is a projectDir artifact -- never searched in `-i`
+/// folders, which contribute markdown only. Canonical location is
+/// `<root>/.trelane/biplane-description.json`; a portable plan dropped directly
+/// in `<root>` is also accepted.
+pub fn find_project_description(root: &Path) -> Option<PathBuf> {
+    let nested = root.join(".trelane").join("biplane-description.json");
+    if nested.is_file() {
+        return Some(nested);
+    }
+    let direct = root.join("biplane-description.json");
+    if direct.is_file() {
+        return Some(direct);
     }
     None
 }
@@ -2371,33 +2373,33 @@ mod tests {
     }
 
     #[test]
-    fn find_report_returns_first_dir_with_report() {
+    fn find_project_report_detects_nested_and_direct() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
-        std::fs::create_dir_all(root.join("a")).unwrap();
-        std::fs::create_dir_all(root.join("b")).unwrap();
-        // Report only in b.
-        std::fs::write(root.join("b").join(BIPLANE_REPORT_FILENAME), "{}").unwrap();
-        let found = find_report_in_dirs(&[root.join("a"), root.join("b")]);
-        assert_eq!(found, Some(root.join("b").join(BIPLANE_REPORT_FILENAME)));
-        // None when absent.
-        assert!(find_report_in_dirs(&[root.join("a")]).is_none());
+        // Nested canonical location.
+        let td = root.join(".trelane");
+        std::fs::create_dir_all(&td).unwrap();
+        std::fs::write(td.join(BIPLANE_REPORT_FILENAME), "{}").unwrap();
+        assert_eq!(
+            find_project_report(root),
+            Some(td.join(BIPLANE_REPORT_FILENAME))
+        );
     }
 
     #[test]
-    fn find_report_prefers_earlier_dir_on_ties() {
+    fn find_project_report_direct_portable_drop_in() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
-        std::fs::create_dir_all(root.join("first")).unwrap();
-        std::fs::create_dir_all(root.join("second")).unwrap();
-        std::fs::write(root.join("first").join(BIPLANE_REPORT_FILENAME), "{}").unwrap();
-        std::fs::write(root.join("second").join(BIPLANE_REPORT_FILENAME), "{}").unwrap();
-        let found = find_report_in_dirs(&[root.join("first"), root.join("second")]);
-        assert_eq!(found, Some(root.join("first").join(BIPLANE_REPORT_FILENAME)));
+        // A portable report dropped directly in the project dir (no .trelane).
+        std::fs::write(root.join(BIPLANE_REPORT_FILENAME), "{}").unwrap();
+        assert_eq!(
+            find_project_report(root),
+            Some(root.join(BIPLANE_REPORT_FILENAME))
+        );
     }
 
     #[test]
-    fn find_description_detects_nested_trelane_layout() {
+    fn find_project_description_detects_nested_trelane_layout() {
         // The real layout: <root>/.trelane/biplane-description.json
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -2405,44 +2407,51 @@ mod tests {
         std::fs::create_dir_all(&td).unwrap();
         std::fs::write(td.join("biplane-description.json"), "{}").unwrap();
         assert_eq!(
-            find_description_in_dirs(&[root.to_path_buf()]),
+            find_project_description(root),
             Some(td.join("biplane-description.json"))
         );
     }
 
     #[test]
-    fn find_description_detects_direct_layout() {
-        // Pointing at a folder that directly holds the description.
+    fn find_project_description_detects_direct_portable_layout() {
+        // A portable plan dropped directly in the project dir.
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         std::fs::write(root.join("biplane-description.json"), "{}").unwrap();
         assert_eq!(
-            find_description_in_dirs(&[root.to_path_buf()]),
+            find_project_description(root),
             Some(root.join("biplane-description.json"))
         );
     }
 
     #[test]
-    fn find_description_searches_include_dirs() {
+    fn detection_is_projectdir_only_not_sibling_folders() {
+        // The corrected model: a plan living in a DIFFERENT folder (as an `-i`
+        // markdown source would) is NOT detected for the project dir. Detection
+        // and generation belong to the projectDir; `-i` contributes markdown
+        // only. This test pins that boundary so the old conflation can't creep
+        // back.
         let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        let empty = root.join("empty");
-        let other = root.join("other");
-        std::fs::create_dir_all(&empty).unwrap();
-        std::fs::create_dir_all(other.join(".trelane")).unwrap();
-        std::fs::write(other.join(".trelane").join("biplane-description.json"), "{}").unwrap();
-        // Root (empty) has none; the include dir does.
-        let found = find_description_in_dirs(&[empty, other.clone()]);
-        assert_eq!(
-            found,
-            Some(other.join(".trelane").join("biplane-description.json"))
+        let project = temp.path().join("projectDir");
+        let source = temp.path().join("safe_pocket");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(source.join(".trelane")).unwrap();
+        // A plan exists in the -i-style source folder, but NOT in projectDir.
+        std::fs::write(
+            source.join(".trelane").join("biplane-description.json"),
+            "{}",
+        )
+        .unwrap();
+        assert!(
+            find_project_description(&project).is_none(),
+            "a plan in a sibling/source folder must not be detected for projectDir"
         );
     }
 
     #[test]
-    fn find_description_none_when_absent() {
+    fn find_project_description_none_when_absent() {
         let temp = tempfile::tempdir().unwrap();
-        assert!(find_description_in_dirs(&[temp.path().to_path_buf()]).is_none());
+        assert!(find_project_description(temp.path()).is_none());
     }
 
     fn migrated_ctx(temp: &tempfile::TempDir) -> crate::Context {

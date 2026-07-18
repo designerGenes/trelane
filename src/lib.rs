@@ -254,70 +254,58 @@ fn run_session_command(cli: Cli) -> Result<()> {
     }
 }
 
-/// Open the Biplane UI, with the markdown-gathering / report-detection flow in
-/// front of it:
-///  1. Candidate dirs = the project root plus every `-i/--include` dir.
-///  2. If a `biplane-description.json` (the editable plan) exists in any
-///     candidate dir and `--regenerate` was not passed, that IS the plan to
+/// Open the Biplane UI. Detection and generation belong to the projectDir
+/// (`root` -- the cwd `trelane biplane` runs in); the `-i/--include` folders
+/// contribute markdown ONLY. Concretely:
+///  1. If a `biplane-description.json` (the editable plan) already exists in
+///     `root` and `--regenerate` was not passed, that IS the plan to
 ///     view/edit: open the UI on it, no gathering. A `biplane-report.json`
-///     (live-session snapshot) is a secondary fallback.
-///  3. Otherwise gather all markdown recursively from the candidate dirs, warn
-///     if the set is large, ask before submitting to a model, generate a plan
-///     from the sources, persist it as an editable description, and open the UI.
+///     (live-session snapshot) in `root` is a secondary fallback. The `-i`
+///     folders are never checked for either -- a report is a projectDir
+///     artifact so it stays portable with the project.
+///  2. Otherwise gather markdown recursively from `root` PLUS every `-i`
+///     folder, warn if the set is large, ask before submitting to a model,
+///     generate a plan from those sources, persist it into `root`'s
+///     `.trelane/`, and open the UI.
 fn biplane_open_ui(root: &Path, include: &[PathBuf], regenerate: bool) -> Result<()> {
     use std::io::{IsTerminal, Write};
 
-    // Candidate dirs: the root first (so its report wins ties), then includes.
+    // Step 1: existing-artifact detection -- projectDir ONLY. The `-i` folders
+    // are markdown sources, not places a report can live, so a plan generated
+    // here stays portable: it's always found in the folder it was made in.
+    if !regenerate {
+        if let Some(desc_path) = biplane::find_project_description(root) {
+            println!("[biplane] found existing plan: {}", desc_path.display());
+            // Canonical location is <root>/.trelane/biplane-description.json.
+            // A portable plan dropped directly in <root> is copied into place
+            // so the UI (and later a session) load it uniformly.
+            let ui_desc = root.join(TRELANE_DIR).join("biplane-description.json");
+            if desc_path != ui_desc {
+                if let Some(parent) = ui_desc.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::copy(&desc_path, &ui_desc)?;
+            }
+            return biplane_ui::run_with_includes(root, include);
+        }
+        if let Some(report_path) = biplane::find_project_report(root) {
+            println!("[biplane] found existing report: {}", report_path.display());
+            let ui_report = root.join(TRELANE_DIR).join("biplane-report.json");
+            if report_path != ui_report {
+                if let Some(parent) = ui_report.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::copy(&report_path, &ui_report)?;
+            }
+            return biplane_ui::run_with_includes(root, include);
+        }
+    }
+
+    // Step 2: gather markdown for the size warning + confirmation. Sources are
+    // root PLUS the -i folders; this gather is what lets us count/size-check
+    // and confirm before the model call (generation re-scans the same dirs).
     let mut dirs: Vec<PathBuf> = vec![root.to_path_buf()];
     dirs.extend(include.iter().cloned());
-
-    // Step 1: existing PLAN detection. A biplane-description.json is the
-    // editable domain plan the UI loads and a session launches from. If one
-    // exists (in root or any include dir) and --regenerate wasn't passed, that
-    // IS the plan to view/edit -- open the UI on it, no markdown gathering.
-    if !regenerate
-        && let Some(desc_path) = biplane::find_description_in_dirs(&dirs)
-    {
-        println!(
-            "[biplane] found existing plan: {}",
-            desc_path.display()
-        );
-        // The UI loads from <root>/.trelane/biplane-description.json. If the
-        // found plan lives elsewhere (an include dir), copy it into place so
-        // the UI picks it up, without disturbing the original.
-        let ui_desc = root.join(TRELANE_DIR).join("biplane-description.json");
-        if desc_path != ui_desc {
-            if let Some(parent) = ui_desc.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::copy(&desc_path, &ui_desc)?;
-        }
-        return biplane_ui::run_with_includes(root, include);
-    }
-
-    // Step 2: existing report detection (live-session snapshot). Kept as a
-    // secondary signal: if no editable plan exists but a report does, open on
-    // it so its analysis is visible.
-    if !regenerate
-        && let Some(report_path) = biplane::find_report_in_dirs(&dirs)
-    {
-        println!("[biplane] found existing report: {}", report_path.display());
-        // The UI loads the report from <root>/.trelane/biplane-report.json. If
-        // the found report lives elsewhere (an include dir), copy it into place
-        // so the UI picks it up, without disturbing the original.
-        let ui_report = root.join(TRELANE_DIR).join("biplane-report.json");
-        if report_path != ui_report {
-            if let Some(parent) = ui_report.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::copy(&report_path, &ui_report)?;
-        }
-        return biplane_ui::run_with_includes(root, include);
-    }
-
-    // Step 3: gather markdown for the size warning + confirmation. The actual
-    // generation uses run_biplane_plan_from_sources (which re-scans the same
-    // dirs); this gather is what lets us count/size-check and confirm first.
     let gather = biplane::gather_markdown_files(&dirs);
     if gather.count() == 0 {
         println!(
