@@ -378,6 +378,20 @@ pub fn archive_message(conn: &Connection, id: &str, at: &str) -> Result<()> {
     Ok(())
 }
 
+/// Archive every still-active bulletin entry posted by `agent`, across all
+/// scopes. Canonical site for the redomain hook (4B): when an agent switches
+/// domains its prior working-set announcements no longer describe what it is
+/// doing and must come off the boards immediately. Also reused by the
+/// idle-agent archival pass in retention. Returns the count archived.
+pub fn archive_agent_bulletins(conn: &Connection, agent: &str, at: &str) -> Result<usize> {
+    let n = conn.execute(
+        "UPDATE messages SET archived_at = ?2
+         WHERE channel = 'bulletin' AND from_agent = ?1 AND archived_at IS NULL",
+        params![agent, at],
+    )?;
+    Ok(n)
+}
+
 pub fn mark_processed(conn: &Connection, agent: &str, msg_id: &str, at: &str) -> Result<()> {
     let n = conn.execute(
         "UPDATE messages SET processed_at = ?3

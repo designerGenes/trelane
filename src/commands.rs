@@ -759,6 +759,13 @@ pub fn cmd_redomain(
         &now,
     )?;
 
+    // 4B: the agent is leaving its old domain -- archive any still-active
+    // bulletin entries it posted so the old domain's board no longer shows a
+    // departed agent as working in it. The idle-agent archival in retention
+    // is the time-based path; this is the deliberate, immediate hook on a
+    // domain switch (R12: a bulletin describes *current* intent).
+    let archived_bulletins = store::archive_agent_bulletins(&ctx.conn, agent, &now)?;
+
     for other in store::list_agents(&ctx.conn)? {
         if other == agent {
             continue;
@@ -784,7 +791,9 @@ pub fn cmd_redomain(
         store::insert_message(&ctx.conn, &msg)?;
     }
 
-    println!("updated domain for '{agent}' writable={writable:?}");
+    println!(
+        "updated domain for '{agent}' writable={writable:?} (archived {archived_bulletins} stale bulletin entry/ies)"
+    );
     Ok(())
 }
 
@@ -3713,6 +3722,60 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/new.rs"), "// new\n").unwrap();
         assert!(domain_change_since_baseline(&ctx, "owner").unwrap().is_empty());
+    }
+
+    /// 4B remainder: redomain archives the agent's still-active bulletin
+    /// entries so the old domain's board no longer shows a departed agent as
+    /// working in it. Archived entries stay readable via --include-archived
+    /// (R15: staleness demotes, it never destroys).
+    #[test]
+    fn redomain_archives_active_bulletins() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        git_ok(root, &["init", "-q"]);
+        git_ok(root, &["config", "user.email", "tests@example.invalid"]);
+        git_ok(root, &["config", "user.name", "Trelane Tests"]);
+        let ctx = assistance_ctx(&temp);
+
+        // Owner announces intent in its own domain (scope "owner").
+        post_bulletin(
+            &ctx,
+            "owner",
+            "owner",
+            &["src/a.rs".to_string()],
+            "starting work",
+        )
+        .unwrap();
+        assert_eq!(
+            store::get_bulletin(&ctx.conn, "owner", false)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Owner switches to a different domain.
+        cmd_redomain(
+            &ctx,
+            "owner",
+            &["ui/**".to_string()],
+            &[],
+            Some("moved to ui"),
+        )
+        .unwrap();
+
+        // The old domain's active board no longer carries the departed agent.
+        assert!(
+            store::get_bulletin(&ctx.conn, "owner", false)
+                .unwrap()
+                .is_empty()
+        );
+        // But the entry survives in history (archived, not deleted).
+        assert_eq!(
+            store::get_bulletin(&ctx.conn, "owner", true)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     // ------------------------------------------------------------- 4A DI

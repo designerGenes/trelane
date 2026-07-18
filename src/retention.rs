@@ -91,11 +91,8 @@ pub fn sweep(ctx: &Context, force: bool) -> Result<RetentionOutcome> {
                 .map(|s| s.state == crate::models::AgentActivityState::Idle)
                 .unwrap_or(false);
             if idle {
-                bulletin_archived += ctx.conn.execute(
-                    "UPDATE messages SET archived_at = ?1
-                     WHERE channel = 'bulletin' AND from_agent = ?2 AND archived_at IS NULL",
-                    params![now, poster],
-                )?;
+                bulletin_archived +=
+                    crate::store::archive_agent_bulletins(&ctx.conn, &poster, &now)?;
             }
         }
     }
