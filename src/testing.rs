@@ -42,6 +42,12 @@ pub struct ScenarioAgent {
     pub forbidden_write: Vec<String>,
     #[serde(default)]
     pub launcher_agent: Option<String>,
+    /// Per-agent max_turns override for Bench mode. When set, the bench
+    /// orchestrator builds a per-agent launch command with this value
+    /// instead of using the global default. Lets scenarios give complex
+    /// agents more turns than simple ones.
+    #[serde(default)]
+    pub max_turns: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -301,9 +307,16 @@ fn run_once(
     // Bench mode: open the events file the live TUI (step 4) will tail.
     // One file per run, in the sandbox, so concurrent runs don't collide.
     let mut bench_events = if matches!(scenario.mode, ScenarioMode::Bench) {
-        Some(crate::bench::BenchEvents::create(
-            &run_dir.join("bench-events.jsonl"),
-        )?)
+        let mut ev = crate::bench::BenchEvents::create(&run_dir.join("bench-events.jsonl"))?;
+        ev.emit(
+            "run_start",
+            serde_json::json!({
+                "run": run,
+                "scenario": scenario.name,
+                "total_steps": scenario.steps.len(),
+            }),
+        )?;
+        Some(ev)
     } else {
         None
     };
@@ -330,6 +343,46 @@ fn run_once(
             )?;
         }
     }
+
+    // Bench mode per-agent max_turns: set "shell" launch targets for every
+    // agent with the model + max_turns baked into the command. The squire's
+    // tick calls cmd_wake with launcher_override=None (set below), so cmd_wake
+    // checks the stored launch targets first and spawns the per-agent
+    // subprocess with the right max_turns.
+    let launcher_override = if matches!(scenario.mode, ScenarioMode::Bench) {
+        let global_max_turns = ctx.config.bench.default_max_turns;
+        let global_model = launcher_override.and_then(|o| {
+            // Extract the model from the override (built by
+            // bench::build_launcher_override, which puts "--model <id>" in
+            // the command).
+            let parts: Vec<&str> = o.split_whitespace().collect();
+            let i = parts.iter().position(|p| *p == "--model")?;
+            parts.get(i + 1).map(|s| s.to_string())
+        });
+        for agent in &scenario.agents {
+            let max_turns = agent.max_turns.unwrap_or(global_max_turns);
+            let model = agent
+                .launcher_agent
+                .as_deref()
+                .or(global_model.as_deref())
+                .unwrap_or("unknown-model");
+            let cmd = crate::bench::build_launcher_override(model, max_turns);
+            let now = crypto::now_iso();
+            crate::store::upsert_launch_target(
+                &ctx.conn,
+                &agent.name,
+                "shell",
+                "",
+                &cmd,
+                None,
+                &now,
+            )?;
+        }
+        // Clear the override so cmd_wake uses the per-agent launch targets.
+        None
+    } else {
+        launcher_override
+    };
 
     if matches!(scenario.mode, ScenarioMode::Interactive) {
         validate_interactive_setup(&ctx, scenario)?;
@@ -644,6 +697,17 @@ fn run_once(
     let ended_at = chrono::Utc::now();
     let (_, cycle) = crate::pump::wait_graph(&ctx.conn)?;
     let deadlocks_detected = usize::from(cycle.is_some());
+
+    if let Some(ref mut events) = bench_events {
+        let _ = events.emit(
+            "run_end",
+            serde_json::json!({
+                "run": run,
+                "result": if deadlocks_detected == 0 { "ok" } else { "failed" },
+                "duration_ms": (ended_at - started_at).num_milliseconds(),
+            }),
+        );
+    }
 
     Ok(ScenarioReport {
         run,
@@ -1184,6 +1248,7 @@ mod tests {
                 writable: vec!["src/**".to_string()],
                 forbidden_write: vec![],
                 launcher_agent: None,
+                max_turns: None,
             }],
             steps: vec![
                 ScenarioStep::AssertFileExists {
@@ -1238,6 +1303,7 @@ mod tests {
                 writable: vec!["src/**".to_string()],
                 forbidden_write: vec![],
                 launcher_agent: None,
+                max_turns: None,
             }],
             steps: vec![ScenarioStep::AssertFileExists {
                 explanation: "nonexistent file must fail".to_string(),
@@ -1281,6 +1347,7 @@ mod tests {
                 writable: vec!["src/**".to_string()],
                 forbidden_write: vec![],
                 launcher_agent: None,
+                max_turns: None,
             }],
             steps: vec![ScenarioStep::AssertFileContains {
                 explanation: "must contain the real impl".to_string(),
@@ -1323,6 +1390,7 @@ mod tests {
                 writable: vec!["src/**".to_string()],
                 forbidden_write: vec![],
                 launcher_agent: None,
+                max_turns: None,
             }],
             steps: vec![ScenarioStep::AssertTaskState {
                 explanation: "unknown task must fail".to_string(),

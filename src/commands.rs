@@ -1788,6 +1788,47 @@ pub fn cmd_wake(
             ..target.clone()
         });
 
+        // The "shell" adapter spawns the agent as a subprocess (the bench
+        // mode path), using the launch target's command template directly
+        // rather than building one from the agent's launcher_agent. This is
+        // how per-agent --max-turns is injected: the bench setup writes a
+        // per-agent command with max_turns baked in, stored as a launch
+        // target with adapter="shell". The squire's tick calls cmd_wake,
+        // which sees the stored target and spawns the subprocess.
+        if target.adapter == "shell" {
+            let log_dir = ctx.trelane_dir().join("agents").join(agent).join("logs");
+            std::fs::create_dir_all(&log_dir)?;
+            let log_name = format!("run-{}.log", crypto::new_id("r"));
+            let log_path = log_dir.join(&log_name);
+            let launch_script = format!(
+                "({}) >> {} 2>&1 & printf '%s' $!",
+                command,
+                shell_double_quote(&log_path.display().to_string())
+            );
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(&launch_script)
+                .current_dir(&ctx.root)
+                .output()?;
+            if !output.status.success() {
+                return Err(TrelaneError::msg(format!(
+                    "launcher shell failed for {agent}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            let pid_text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let pid = pid_text.parse::<i32>().map_err(|_| {
+                TrelaneError::msg(format!("failed to parse launched pid from '{pid_text}'"))
+            })?;
+            let inserted =
+                store::insert_running_lock(&ctx.conn, agent, pid, &crypto::now_iso(), reason)?;
+            if !inserted {
+                eprintln!("warning: {agent} was already launched by another squire");
+            }
+            println!("launched {agent} pid={pid} reason={reason} (shell launch-target)");
+            return Ok(());
+        }
+
         if target.adapter == "tmux" {
             // Write a single launch script containing the splash AND the
             // agent command.  Sending two separate send-keys calls (splash

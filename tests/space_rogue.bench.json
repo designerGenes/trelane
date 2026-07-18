@@ -1,0 +1,28 @@
+{
+  "name": "space_rogue_bench",
+  "description": "Bench-mode variant of space_rogue: provisions from the Biplane describe fixture, then runs free-model agents against the planned tasks with --max-turns. Uses per-agent max_turns (engine gets more turns for the complex turn-loop + RNG work; combat gets fewer). AssertFileExists/AssertFileContains verify the planned work was actually produced -- the floor that makes this a real benchmark, not just a no-deadlock check.",
+  "mode": "bench",
+  "project": {
+    "files": []
+  },
+  "agents": [],
+  "steps": [
+    {
+      "type": "BiplaneDescribe",
+      "explanation": "Provision from space_rogue.describe.json: engine, worldgen, combat (max_agents=3 caps ui out).",
+      "describe_path": "space_rogue.describe.json"
+    },
+    {
+      "type": "PumpWatch",
+      "explanation": "Run the squire until the swarm is quiescent -- agents produce their planned work across bounded --max-turns slices, persisting and resuming each tick until all tasks are done.",
+      "interval_s": 5,
+      "max_ticks": 60,
+      "idle_grace_ticks": 3
+    },
+    {
+      "type": "AssertNoDeadlock",
+      "explanation": "The Biplane-planned swarm must not produce a wait-cycle."
+    }
+  ],
+  "metrics": ["messages_sent", "pumps"]
+}
