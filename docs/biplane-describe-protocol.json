@@ -1,0 +1,436 @@
+{
+  "$schema": "trelane-biplane-describe-protocol-v1",
+  "meta": {
+    "title": "Biplane Project-Description Protocol",
+    "version": "1.0",
+    "generated": "2026-07-18",
+    "purpose": "Machine-readable specification of the Biplane *.describe.json format. Given to an agent to invent new Biplane reports for testing periodically. Every field, type, default, validation rule, and the canonical example are captured here so the generating agent needs no other reference.",
+    "source_files": [
+      "src/biplane.rs (ProjectDescription, DomainSpec, PlannedWork, validate_description, plan_from_description, apply_description_to_session)",
+      "src/models.rs (AssistPolicy)",
+      "tests/space_rogue.describe.json (canonical example)"
+    ],
+    "how_it_works": [
+      "1. A *.describe.json file is a ProjectDescription serialized as JSON.",
+      "2. `trelane biplane --describe <file>` validates it, derives a BiplanePlan (agents + tasks), and optionally writes the plan to .trelane/biplane-plan.json.",
+      "3. `apply_description_to_session(ctx, &desc)` provisions the plan into the live Trelane session: cmd_add_agent per domain + insert_task per planned_work item. Idempotent on re-apply.",
+      "4. In bench/scenario mode, a `BiplaneDescribe` scenario step does steps 1-3 automatically, so a scenario can provision its agents entirely from a describe file.",
+      "5. The agent budget (max_agents) caps how many domains are provisioned. Domains are ordered by topological sort of their depends_on graph; the first N domains (up to the cap) get agents, and only their planned_work becomes tasks. Domains beyond the cap are silently cut."
+    ]
+  },
+
+  "root_struct": {
+    "name": "ProjectDescription",
+    "rust_type": "src/biplane.rs:1071",
+    "fields": {
+      "name": {
+        "type": "string",
+        "required": true,
+        "description": "Human-readable project name. Must not be empty (validated).",
+        "example": "space_rogue"
+      },
+      "description": {
+        "type": "string",
+        "required": false,
+        "default": "\"\"",
+        "description": "One-line project description. Optional; defaults to empty string.",
+        "example": "A roguelike where you pilot a ship through procedurally generated sectors."
+      },
+      "domains": {
+        "type": "array<DomainSpec>",
+        "required": true,
+        "min_items": 1,
+        "description": "The project's domain decomposition. At least one domain is required (validated). Domain names must be unique (validated). No dependency cycles among domains (validated via DFS).",
+        "item_ref": "#/domain_spec"
+      },
+      "max_agents": {
+        "type": "integer (usize)",
+        "required": false,
+        "default": "null (uses the effective budget, which is min of this and any CLI --max-agents)",
+        "description": "Optional cap on total agents provisioned. The effective cap is min(max_agents, CLI --max-agents, or len(domains) if neither is set). Domains beyond the cap in topological order are silently cut from the plan. This is how space_rogue.describe.json's max_agents=3 provisions only engine/worldgen/combat, not ui.",
+        "example": 3
+      },
+      "default_model": {
+        "type": "string (optional)",
+        "required": false,
+        "default": "null",
+        "description": "Default opencode model id for all domain agents (e.g. 'openrouter/nvidia/nemotron-3-super-120b-a12b:free'). Per-domain model overrides take precedence (see DomainSpec.model). If null and no per-domain model is set, agents have no launcher_agent and cmd_wake will refuse to launch them (launcher_not_configured). For free-model benchmarks, set this to a valid free Nemotron model id.",
+        "example": "openrouter/nvidia/nemotron-3-super-120b-a12b:free"
+      }
+    },
+    "validation_rules": [
+      "name must not be empty (trimmed)",
+      "domains must have at least one entry",
+      "domain names must be unique (case-sensitive)",
+      "no domain may depend on itself",
+      "every depends_on target must be a known domain name",
+      "no dependency cycle among domains (DFS cycle detection)"
+    ]
+  },
+
+  "domain_spec": {
+    "name": "DomainSpec",
+    "rust_type": "src/biplane.rs:1084",
+    "description": "One domain in the project decomposition. A domain maps 1:1 to a registered Trelane agent (the domain name becomes the agent name). The domain's writable globs define the agent's write permissions; its planned_work items become Ready tasks owned by the agent.",
+    "fields": {
+      "name": {
+        "type": "string",
+        "required": true,
+        "description": "Domain identifier. Must not be empty, must be unique across domains (validated). Becomes the Trelane agent name.",
+        "example": "engine"
+      },
+      "description": {
+        "type": "string",
+        "required": false,
+        "default": "\"\"",
+        "description": "Human-readable domain description. Becomes the agent's description in Trelane.",
+        "example": "Core simulation: turn loop, RNG, entity/component storage."
+      },
+      "writable": {
+        "type": "array<string>",
+        "required": true,
+        "min_items": 1,
+        "description": "Glob patterns for files this domain may write. Must have at least one entry (validated). These become the agent's writable globs. Use glob syntax: 'src/engine/**' means all files under src/engine/. A writable glob of '**' means the entire tree.",
+        "examples": ["src/engine/**"]
+      },
+      "forbidden_write": {
+        "type": "array<string>",
+        "required": false,
+        "default": "[]",
+        "description": "Glob patterns for files this domain may NOT write, even if writable matches. .trelane/** and .git/** are always added to forbidden_write by Trelane regardless of this field.",
+        "example": ["src/engine/secrets/**"]
+      },
+      "depends_on": {
+        "type": "array<string>",
+        "required": false,
+        "default": "[]",
+        "description": "Names of other domains that must be underway before this one. Used ONLY for topological ordering of the plan -- never for write permissions. A domain with depends_on=['engine'] will be provisioned after engine in the topo order. Must reference existing domain names (validated). No self-dependencies (validated). No cycles (validated).",
+        "example": ["engine"]
+      },
+      "planned_work": {
+        "type": "array<PlannedWork>",
+        "required": false,
+        "default": "[]",
+        "description": "The work items this domain should produce. Each becomes a Ready task in the Trelane ledger, owned by this domain's agent. See #/planned_work.",
+        "item_ref": "#/planned_work"
+      },
+      "agents": {
+        "type": "integer (usize)",
+        "required": false,
+        "default": 1,
+        "description": "Desired number of agents for this domain. Plan derivation keeps exactly ONE agent per domain (so writable globs never overlap); this field is honored only by the next-steps scheduler when allocating the agent budget across phases. Must be >= 1 (validated).",
+        "example": 2
+      },
+      "model": {
+        "type": "string (optional)",
+        "required": false,
+        "default": "null",
+        "description": "Per-domain opencode model id. Overrides the project-level default_model for this domain's agent. Use a valid free model id for benchmarks (e.g. 'openrouter/nvidia/nemotron-3-super-120b-a12b:free'). When set, this is stored as the agent's launcher_agent.",
+        "example": "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
+      }
+    }
+  },
+
+  "planned_work": {
+    "name": "PlannedWork",
+    "rust_type": "src/biplane.rs:1137",
+    "description": "A unit of work for a domain. Becomes a Task in the Trelane ledger with state=Ready, owned by the domain's agent. The task's path_scope defaults to the domain's writable globs if not explicitly set.",
+    "fields": {
+      "subject": {
+        "type": "string",
+        "required": true,
+        "description": "Short title for the work item. Becomes the task subject. Used for idempotent re-apply: if the owner already has a task with the same subject, it is reused rather than duplicated.",
+        "example": "Turn loop and scheduler"
+      },
+      "body": {
+        "type": "string",
+        "required": false,
+        "default": "\"\"",
+        "description": "Detailed description of what to do. Becomes the task body. Should be specific enough for the agent to act on without guessing.",
+        "example": "Implement the deterministic turn scheduler that advances entities in initiative order."
+      },
+      "priority": {
+        "type": "string",
+        "required": false,
+        "default": "\"normal\"",
+        "enum": ["critical", "high", "normal", "low"],
+        "description": "Task urgency. The squire's wake_plan sorts candidates by priority (critical=highest). 'critical' and 'high' wake before 'normal' and 'low'.",
+        "example": "high"
+      },
+      "id": {
+        "type": "string (optional)",
+        "required": false,
+        "default": "null",
+        "description": "Optional stable task id. If set, used as the task's id in the ledger (idempotent on re-apply). If null, a random id is generated. Setting an explicit id makes task state assertions easier in bench scenarios (AssertTaskState references the task_id)."
+      },
+      "depends_on": {
+        "type": "array<string>",
+        "required": false,
+        "default": "[]",
+        "description": "Task-level dependencies (other task subjects or ids that must be Done before this one starts). Stored as the task's blocked_by list. The squire will not wake an agent for a task whose blocked_by targets are not yet Done."
+      },
+      "desired_parallelism": {
+        "type": "integer (u32)",
+        "required": false,
+        "default": 1,
+        "description": "How many agents may work on this task in parallel. Stored on the task. Must be >= 1 (max(1) is applied)."
+      },
+      "assist_policy": {
+        "type": "string (enum)",
+        "required": false,
+        "default": "\"open\"",
+        "enum": ["open", "solo"],
+        "enum_docs": {
+          "open": "Any eligible idle agent may offer to help (subject to owner approval via the C2 assistance protocol).",
+          "solo": "Owner-only: not open to cross-domain assistance."
+        }
+      },
+      "reviewer": {
+        "type": "string (optional)",
+        "required": false,
+        "default": "null",
+        "description": "Agent name designated as the reviewer for submitted work on this task. If set, a TaskAssignment with role=Reviewer is created when the task is provisioned."
+      },
+      "subtasks": {
+        "type": "array<PlannedWork>",
+        "required": false,
+        "default": "[]",
+        "description": "Nested work items. Each subtask becomes a separate task with parent_task set to the parent task's id. Subtasks are NOT subject to the idempotent re-apply subject check (they are skipped if a task with the same subject already exists for the owner)."
+      },
+      "collision_risk": {
+        "type": "string (optional enum)",
+        "required": false,
+        "default": "null",
+        "enum": ["low", "medium", "high"],
+        "description": "Annotation for how likely this work is to collide with other domains' work. Informational only; does not affect scheduling."
+      },
+      "work_kind": {
+        "type": "string (enum)",
+        "required": false,
+        "default": "\"implementation\"",
+        "enum": ["implementation", "investigation"],
+        "description": "Whether this is implementation work (writing code) or investigation work (research/analysis). Informational; does not change the task lifecycle."
+      },
+      "path_scope": {
+        "type": "array<string>",
+        "required": false,
+        "default": "[] (falls back to the domain's writable globs)",
+        "description": "Glob patterns for files this task is expected to touch. If empty, the domain's writable globs are used. Stored on the task's path_scope field. Used by the delegation protocol to scope cross-domain help."
+      },
+      "acceptance": {
+        "type": "array<string>",
+        "required": false,
+        "default": "[]",
+        "description": "Acceptance criteria for the task. Each string is a single criterion. Stored on the task; the review flow checks these when deciding accept/request-changes/reject."
+      }
+    }
+  },
+
+  "validation_rules_summary": [
+    {
+      "rule": "non-empty name",
+      "field": "ProjectDescription.name",
+      "check": "name.trim() must not be empty"
+    },
+    {
+      "rule": "at least one domain",
+      "field": "ProjectDescription.domains",
+      "check": "domains.len() >= 1"
+    },
+    {
+      "rule": "unique domain names",
+      "field": "DomainSpec.name",
+      "check": "all domain names must be distinct (case-sensitive HashSet)"
+    },
+    {
+      "rule": "non-empty domain name",
+      "field": "DomainSpec.name",
+      "check": "name.trim() must not be empty"
+    },
+    {
+      "rule": "at least one writable glob",
+      "field": "DomainSpec.writable",
+      "check": "writable.len() >= 1"
+    },
+    {
+      "rule": "agents >= 1",
+      "field": "DomainSpec.agents",
+      "check": "agents != 0"
+    },
+    {
+      "rule": "no self-dependency",
+      "field": "DomainSpec.depends_on",
+      "check": "a domain may not list itself in depends_on"
+    },
+    {
+      "rule": "depends_on targets exist",
+      "field": "DomainSpec.depends_on",
+      "check": "every name in depends_on must be a known domain name"
+    },
+    {
+      "rule": "no dependency cycle",
+      "field": "ProjectDescription.domains (collective depends_on graph)",
+      "check": "DFS cycle detection over the depends_on graph; a cycle makes the work impossible to order"
+    }
+  ],
+
+  "plan_derivation": {
+    "description": "How a ProjectDescription becomes a BiplanePlan (the agents + tasks that get provisioned).",
+    "function": "plan_from_description(desc, max_agents) -> BiplanePlan (src/biplane.rs:1382)",
+    "steps": [
+      "1. Topologically sort domains by their depends_on graph (topo_order_domains). Domains with no dependencies come first; domains whose dependencies are all satisfied come next.",
+      "2. Compute the effective agent cap: min(desc.max_agents, max_agents).max(1). This caps how many domains get an agent.",
+      "3. Walk the topo-ordered domains. For each domain (up to the cap): create a BiplanePlanAgent (name, description, writable) and for each planned_work item, create a BiplanePlanTask (agent=domain name, work=the PlannedWork).",
+      "4. Domains beyond the cap are silently cut: their agents and planned_work are NOT in the plan. This is how max_agents=3 provisions only the first 3 topo-ordered domains.",
+      "5. Tasks whose agent was cut are retained (filtered out) -- only tasks belonging to kept agents survive."
+    ],
+    "note": "The topo order means a domain with depends_on=['engine'] is provisioned AFTER engine. If the cap cuts it, both the domain and its planned_work are lost. Design describe files so the most important domains come first in topo order (fewer dependencies = earlier)."
+  },
+
+  "session_provisioning": {
+    "function": "apply_description_to_session(ctx, desc) -> usize (src/biplane.rs:88)",
+    "description": "Provisions a BiplanePlan into a live Trelane session. Idempotent: re-applying the same description re-syncs existing agents (writable/model/description) and reuses tasks with matching subjects rather than duplicating.",
+    "steps": [
+      "1. validate_description(desc)",
+      "2. plan_from_description(desc, budget)",
+      "3. apply_plan_to_session(ctx, desc, plan):",
+      "  3a. For each plan agent: if the agent is already registered, upsert_agent (re-sync writable/forbidden/model/description). If new, cmd_add_agent.",
+      "  3b. For each plan task: if the owner already has a task with the same subject, reuse it. Otherwise, insert a new Task (state=Ready, path_scope from work.path_scope or domain writable, blocked_by from work.depends_on).",
+      "  3c. Create subtasks with parent_task set.",
+      "  3d. Create reviewer TaskAssignment if work.reviewer is set.",
+      "  3e. Returns count of agents+tasks added."
+    ]
+  },
+
+  "canonical_example": {
+    "file": "tests/space_rogue.describe.json",
+    "description": "A roguelike game decomposed into 4 domains (engine, worldgen, combat, ui) with max_agents=3. The cap provisions only engine, worldgen, combat (ui is cut). Each domain has 1-2 planned_work items.",
+    "content": {
+      "name": "space_rogue",
+      "description": "A roguelike where you pilot a ship through procedurally generated sectors.",
+      "max_agents": 3,
+      "default_model": "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
+      "domains": [
+        {
+          "name": "engine",
+          "description": "Core simulation: turn loop, RNG, entity/component storage. Everything else builds on this.",
+          "writable": ["src/engine/**"],
+          "depends_on": [],
+          "agents": 1,
+          "planned_work": [
+            {
+              "subject": "Turn loop and scheduler",
+              "body": "Implement the deterministic turn scheduler that advances entities in initiative order.",
+              "priority": "high"
+            },
+            {
+              "subject": "Seedable RNG",
+              "body": "Wrap a seedable PRNG so sector generation is reproducible from a seed.",
+              "priority": "high"
+            }
+          ]
+        },
+        {
+          "name": "worldgen",
+          "description": "Procedural sector, map, and encounter generation.",
+          "writable": ["src/worldgen/**"],
+          "depends_on": ["engine"],
+          "agents": 1,
+          "planned_work": [
+            {
+              "subject": "Sector graph generator",
+              "body": "Generate a connected graph of sectors with jump lanes between them.",
+              "priority": "high"
+            }
+          ]
+        },
+        {
+          "name": "combat",
+          "description": "Ship-to-ship combat rules, weapons, and damage resolution.",
+          "writable": ["src/combat/**"],
+          "depends_on": ["engine"],
+          "agents": 2,
+          "planned_work": [
+            {
+              "subject": "Weapon and damage model",
+              "body": "Model weapons, cooldowns, shields, and hull damage resolution.",
+              "priority": "normal"
+            }
+          ]
+        },
+        {
+          "name": "ui",
+          "description": "Terminal rendering and input handling for the map and combat views.",
+          "writable": ["src/ui/**"],
+          "forbidden_write": ["src/ui/secrets/**"],
+          "depends_on": ["worldgen", "combat"],
+          "agents": 1,
+          "planned_work": [
+            {
+              "subject": "Sector map view",
+              "body": "Render the current sector graph and the player's position.",
+              "priority": "normal"
+            },
+            {
+              "subject": "Combat HUD",
+              "body": "Show shields, hull, and weapon cooldowns during combat.",
+              "priority": "low"
+            }
+          ]
+        }
+      ]
+    }
+  },
+
+  "how_to_invent_new_reports": {
+    "guidelines": [
+      "Start with a project concept (a game, a web app, a CLI tool, a data pipeline). Keep it simple enough that free models can produce it in a bounded slice.",
+      "Decompose into 2-5 domains. Each domain should have a clear, non-overlapping writable area (e.g. src/engine/**, src/ui/**, src/api/**).",
+      "Order domains by dependency: foundational domains (engine, core, api) first; dependent domains (ui, docs, tests) later. depends_on is how you express this.",
+      "Set max_agents to cap provisioning. If you have 4 domains but want to test the cap behavior, set max_agents=3 and the 4th domain (in topo order) will be cut.",
+      "Give each domain 1-3 planned_work items. The subject should be a concrete, testable deliverable ('Turn loop and scheduler', not 'core stuff'). The body should tell the agent exactly what to build.",
+      "Use priority='high' for foundational work that blocks others; 'normal' for most work; 'low' for polish. The squire wakes high-priority work first.",
+      "Set default_model to a free Nemotron model id (e.g. 'openrouter/nvidia/nemotron-3-super-120b-a12b:free'). Per-domain model overrides let you give complex domains the bigger ultra model and simple domains the nano model.",
+      "Use forbidden_write for secrets/config files that must never be touched, even though the writable glob matches the directory.",
+      "Keep planned_work bodies SHORT. Free models have limited context; a 3-sentence body is better than a 3-paragraph one.",
+      "Make the expected output testable: each planned_work should produce a file whose existence and contents can be asserted with AssertFileExists/AssertFileContains in a bench scenario. E.g. 'Implement fn run_turn in src/engine/turn.rs' -> assert that file exists and contains 'fn run_turn'."
+    ],
+    "complexity_tiers": {
+      "simple": "2 domains, 1-2 planned_work each, no dependencies, max_agents=2. Tests basic fan-out and inbox-first protocol. Example: a CLI tool with an 'args' domain and a 'commands' domain.",
+      "regular": "3 domains, 2-3 planned_work each, one dependency chain (A->B->C), max_agents=3. Tests cross-domain coordination and dependency ordering. Example: a web app with 'api', 'ui', 'db' domains where ui depends on api which depends on db.",
+      "semi_complex": "4-5 domains, 2-4 planned_work each, branching dependencies (A->B, A->C, B+C->D), max_agents=3 (tests the cap). Tests the cap behavior, fan-in/fan-out, and the squire's wake-plan against a real dependency graph. Example: a game with 'engine', 'worldgen', 'combat', 'ui' where worldgen and combat both depend on engine, and ui depends on both."
+    },
+    "available_free_models": [
+      {
+        "id": "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free",
+        "params": "550B total, 55B active (Mamba/Transformer hybrid)",
+        "best_for": "complex domains, multi-step reasoning",
+        "note": "largest free model; may be slower/rate-limited"
+      },
+      {
+        "id": "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
+        "params": "120B total, 12B active",
+        "best_for": "general-purpose code generation, balanced speed/capability",
+        "note": "recommended default for bench scenarios"
+      },
+      {
+        "id": "openrouter/nvidia/nemotron-3-nano-30b-a3b:free",
+        "params": "30B total, 3B active",
+        "best_for": "simple domains, fast iteration",
+        "note": "fastest; may struggle with complex logic"
+      },
+      {
+        "id": "openrouter/nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+        "params": "30B, reasoning variant",
+        "best_for": "investigation/research tasks",
+        "note": "reasoning model; use work_kind='investigation' for these tasks"
+      }
+    ],
+    "naming_convention": {
+      "file_pattern": "<project_name>.describe.json",
+      "scenario_pattern": "<project_name>.scenario.json (Stub mode for CI) or <project_name>.bench.json (Bench mode for free-model testing)",
+      "location": "tests/ directory alongside the existing fixtures"
+    },
+    "validation": "After inventing a new *.describe.json, validate it with: `trelane biplane --describe <file> --emit-plan` (writes the derived plan to .trelane/biplane-plan.json and prints the analysis). If validation fails, the error names the violated rule and the offending domain."
+  }
+}
