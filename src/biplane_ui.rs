@@ -1001,22 +1001,22 @@ fn run_loop(
     state: &mut BiplaneUiState,
 ) -> Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-    use crossterm::execute;
-    use crossterm::terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    };
-    use ratatui::prelude::*;
+    use crate::tui_session::TuiSession;
     use std::time::Duration;
 
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    // TUI-006: the shared guard owns the raw-mode/alternate-screen ladder
+    // and restores every completed stage in reverse order on Drop, so a
+    // draw/poll error or a panic in the loop below can't strand the user's
+    // terminal. stdout is boxed to match the guard's writer type.
+    let mut session = TuiSession::enter()?;
+    session.enter_alternate_screen(Box::new(std::io::stdout()))?;
 
     let outcome = (|| -> Result<()> {
         loop {
-            terminal.draw(|f| render(f, state))?;
+            // Short-lived per-statement borrows of the terminal: the loop
+            // body calls `generate_via_model(&mut session, ...)` (suspend/
+            // resume), which conflicts with a long-lived terminal borrow.
+            session.terminal().unwrap().draw(|f| render(f, state))?;
             if event::poll(Duration::from_millis(250))? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind != KeyEventKind::Press {
@@ -1194,7 +1194,7 @@ fn run_loop(
                             // domains with the generated plan. The call takes
                             // seconds and prints, so it runs with the alternate
                             // screen suspended, then the TUI is restored.
-                            match generate_via_model(&mut terminal, root, includes) {
+                            match generate_via_model(&mut session, root, includes) {
                                 Ok(new_state) => {
                                     let report = state.report_json.clone();
                                     // Preserve the standing free-only preference so
@@ -1217,8 +1217,10 @@ fn run_loop(
                                 }
                             }
                             // A full redraw next frame clears any residue the
-                            // suspended model output may have left.
-                            terminal.clear()?;
+                            // suspended model output may have left. (resume()
+                            // already cleared, but a second clear here is
+                            // harmless and matches the old explicit intent.)
+                            session.terminal().unwrap().clear()?;
                         }
                         KeyCode::Char('s') => {
                             if let Some(desc) = state.validated() {
@@ -1261,10 +1263,11 @@ fn run_loop(
         Ok(())
     })();
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    outcome
+    // TUI-006: restore every stage in reverse order without short-circuiting;
+    // the loop's outcome takes precedence over a cleanup error.
+    let close_result = session.close();
+    outcome?;
+    close_result
 }
 
 /// Run AI analysis over the project (root + include dirs) and return a fresh
@@ -1275,21 +1278,18 @@ fn run_loop(
 /// so it survives a later reload, and its report JSON is attached for the
 /// Project view. Any failure (model error, no network) propagates as an Err for
 /// the caller to surface in the status line; the TUI is always restored first.
+///
+/// TUI-006: the leave/re-enter is the shared guard's suspend()/resume(), so
+/// the stage flags track state across the pair and a panic or error in the
+/// middle can't strand the terminal in a half-suspended state.
 fn generate_via_model(
-    terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    session: &mut crate::tui_session::TuiSession,
     root: &std::path::Path,
     includes: &[std::path::PathBuf],
 ) -> Result<BiplaneUiState> {
-    use crossterm::execute;
-    use crossterm::terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    };
-
     // Leave the alternate screen so the model subprocess can print to a normal
     // terminal without fighting the TUI's cells.
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    session.suspend()?;
     println!();
     println!("[biplane] generating domains via AI analysis...");
 
@@ -1331,11 +1331,10 @@ fn generate_via_model(
         Ok(new_state)
     })();
 
-    // Re-enter the alternate screen no matter what happened above.
-    enable_raw_mode()?;
-    execute!(terminal.backend_mut(), EnterAlternateScreen)?;
-    terminal.hide_cursor()?;
-    terminal.clear()?;
+    // Re-enter the alternate screen no matter what happened above. resume()
+    // re-enables raw mode, re-enters the alt screen, and clears (the normal
+    // screen's content is untrusted after the subprocess printed).
+    session.resume()?;
 
     result
 }

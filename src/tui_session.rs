@@ -179,16 +179,47 @@ fn io_err(ctx: &str) -> TrelaneError {
 
 // ---------------------------------------------------------------- TuiSession
 
-/// RAII guard for the crossterm terminal-setup ladder.
+/// Injectable raw-mode operations. `enable_raw_mode`/`disable_raw_mode` are
+/// process-global crossterm calls (tcsetattr on stdin), so they can't be
+/// exercised or failure-injected in unit tests without a real tty. Routing
+/// them through this seam lets the acceptance tests for TUI-006 (injected
+/// failure after each setup stage; panic inside a draw closure) count calls
+/// and force failures without touching the test runner's own terminal.
+///
+/// Production callers use `RawModeOps::real()`; tests build their own with
+/// counting closures.
+pub struct RawModeOps {
+    pub enable: Box<dyn Fn() -> std::io::Result<()> + Send>,
+    pub disable: Box<dyn Fn() -> std::io::Result<()> + Send>,
+}
+
+impl RawModeOps {
+    /// The real crossterm operations.
+    pub fn real() -> Self {
+        RawModeOps {
+            enable: Box::new(|| {
+                crossterm::terminal::enable_raw_mode()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            }),
+            disable: Box::new(|| {
+                crossterm::terminal::disable_raw_mode()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            }),
+        }
+    }
+}
+
+/// RAII guard for the crossterm terminal-setup ladder, shared by the four
+/// TUI entry points (monitor, diagnostic, biplane_ui, bench_ui).
 ///
 /// The setup stages, in install order:
-///   1. `enable_raw_mode`
-///   2. `EnterAlternateScreen` (on the backend's writer)
-///   3. `hide_cursor` (via `terminal.hide_cursor()`)
+///   1. `enable_raw_mode`            (via RawModeOps)
+///   2. `EnterAlternateScreen`       (on the backend's writer)
+///   3. `hide_cursor`                (optional; some UIs never hide)
 ///
 /// `Drop` reverses every stage that was actually reached, never
 /// short-circuiting on the first error: show cursor, leave alternate screen,
-/// disable raw mode, flush the backend. A panic in the middle of the draw
+/// flush the backend, disable raw mode. A panic in the middle of the draw
 /// loop is the canonical case this guard exists for -- the terminal would
 /// otherwise be left in raw mode with no visible cursor and the user would
 /// have to `stty sane` and `reset` by hand.
@@ -197,42 +228,66 @@ fn io_err(ctx: &str) -> TrelaneError {
 /// if any stage failed, for callers that want to surface cleanup problems
 /// on a normal exit. `Drop` is the panic/error safety net and is infallible.
 ///
+/// `suspend()`/`resume()` handle the mid-loop exit-and-re-enter pattern
+/// (biplane_ui's `generate_via_model`, which runs a model subprocess that
+/// needs the normal terminal): suspend shows the cursor, leaves the
+/// alternate screen, and disables raw mode; resume re-enters in reverse.
+/// The stage flags track state across the pair so `close()`/`Drop` still
+/// do the right thing if the error path unwinds while suspended.
+///
+/// Extension point: mouse-capture and bracketed-paste stages (none of the
+/// current UIs enable them) would slot in between stages 2 and 3, with the
+/// corresponding disable on the unwind path, tracked by flags exactly like
+/// `cursor_hidden`.
+///
 /// (TUI-006)
 pub struct TuiSession {
     raw_mode: bool,
     alternate_screen: bool,
     cursor_hidden: bool,
+    raw_ops: RawModeOps,
     // The backend is owned by the terminal; we keep the terminal so we can
-    // flush and leave the alternate screen on drop. Boxed to keep the guard
-    // movable without generic params.
+    // flush and leave the alternate screen on drop. Boxed writer keeps the
+    // guard movable without generic params and unifies the four UIs'
+    // writer types (/dev/tty or stdout) behind one signature.
     terminal:
         Option<ratatui::Terminal<ratatui::backend::CrosstermBackend<Box<dyn std::io::Write + Send>>>>,
 }
 
+/// The concrete terminal type the guard hands out, so call sites can name
+/// it without repeating the full generic.
+pub type GuardedTerminal =
+    ratatui::Terminal<ratatui::backend::CrosstermBackend<Box<dyn std::io::Write + Send>>>;
+
 impl TuiSession {
-    /// Build the guard and perform stage 1 (`enable_raw_mode`). On failure
-    /// no stages have been completed and no guard is returned -- the caller
-    /// can simply propagate the error.
+    /// Build the guard and perform stage 1 (`enable_raw_mode`) with the real
+    /// crossterm operations. On failure no stages have been completed and no
+    /// guard is returned -- the caller can simply propagate the error.
     pub fn enter() -> Result<Self> {
-        crossterm::terminal::enable_raw_mode()?;
+        Self::enter_with_ops(RawModeOps::real())
+    }
+
+    /// Stage 1 with caller-provided raw-mode ops (tests inject counting or
+    /// failing closures here).
+    pub fn enter_with_ops(raw_ops: RawModeOps) -> Result<Self> {
+        (raw_ops.enable)()?;
         Ok(TuiSession {
             raw_mode: true,
             alternate_screen: false,
             cursor_hidden: false,
+            raw_ops,
             terminal: None,
         })
     }
 
-    /// Stage 2: open the writer (typically `/dev/tty`, falling back to
-    /// stdout), enter the alternate screen, and construct the ratatui
-    /// terminal. Idempotent-ish: calling twice replaces the terminal; the
-    /// previous one is dropped (which would leave the alt screen via its
-    /// own drop path -- but we don't support nested sessions, so this is
-    /// just a panic guard).
+    /// Stage 2: enter the alternate screen with the given writer and
+    /// construct the ratatui terminal. On failure the guard keeps its prior
+    /// state (raw mode on) and the error propagates; the caller typically
+    /// returns it, dropping the guard, which disables raw mode.
     pub fn enter_alternate_screen(
-        mut self,
+        &mut self,
         writer: Box<dyn std::io::Write + Send>,
-    ) -> Result<Self> {
+    ) -> Result<()> {
         use crossterm::execute;
         use crossterm::terminal::EnterAlternateScreen;
         use ratatui::Terminal;
@@ -244,25 +299,32 @@ impl TuiSession {
         let terminal = Terminal::new(backend)?;
         self.terminal = Some(terminal);
         self.alternate_screen = true;
-        Ok(self)
+        Ok(())
     }
 
     /// Borrow the underlying terminal for drawing. Returns `None` if the
-    /// alternate screen was never entered.
-    pub fn terminal(
-        &mut self,
-    ) -> Option<&mut ratatui::Terminal<ratatui::backend::CrosstermBackend<Box<dyn std::io::Write + Send>>>>
-    {
+    /// alternate screen was never entered (or the session is suspended --
+    /// the terminal is kept across suspend, so terminal() still returns it,
+    /// but drawing while suspended writes to the normal screen's buffer).
+    pub fn terminal(&mut self) -> Option<&mut GuardedTerminal> {
         self.terminal.as_mut()
     }
 
-    /// Stage 3: hide the cursor. Optional because some entry points hide
-    /// the cursor only while a full-screen picker is open and show it again
-    /// for text entry.
+    /// Stage 3 (optional): hide the cursor.
     pub fn hide_cursor(&mut self) -> Result<()> {
         if let Some(t) = self.terminal.as_mut() {
             t.hide_cursor()?;
             self.cursor_hidden = true;
+        }
+        Ok(())
+    }
+
+    /// Show the cursor (inverse of stage 3). Tracked so `resume()` and
+    /// `close()` restore exactly the pre-hide state.
+    pub fn show_cursor(&mut self) -> Result<()> {
+        if let Some(t) = self.terminal.as_mut() {
+            t.show_cursor()?;
+            self.cursor_hidden = false;
         }
         Ok(())
     }
@@ -278,22 +340,71 @@ impl TuiSession {
         Ok(())
     }
 
-    /// Run a closure with mutable access to the terminal, then automatically
-    /// restore the cursor visibility at the end (the common TUI pattern:
-    /// draw with cursor hidden, show it again when the user quits).
-    pub fn draw<F>(&mut self, f: F) -> Result<()>
-    where
-        F: FnOnce(&mut ratatui::Terminal<ratatui::backend::CrosstermBackend<Box<dyn std::io::Write + Send>>>) -> Result<()>,
-    {
+    /// Mid-loop exit: hand the normal terminal back to a subprocess or a
+    /// blocking prompt. Shows the cursor, leaves the alternate screen,
+    /// disables raw mode -- in reverse setup order, tracking each stage so
+    /// `resume()` re-enters exactly and `close()`/`Drop` stay correct even
+    /// if the error path unwinds while suspended.
+    pub fn suspend(&mut self) -> Result<()> {
+        // Cursor: ALWAYS show while suspended when we have a terminal, not
+        // only when the guard's flag is set -- ratatui's draw() hides the
+        // cursor internally whenever a frame sets no cursor position, and
+        // that internal state isn't visible to the flag, so the flag alone
+        // can't decide whether the physical cursor is currently hidden.
+        // show_cursor is idempotent (CSI ?25h when already visible is a
+        // no-op), and a subprocess on the normal screen needs it.
         if let Some(t) = self.terminal.as_mut() {
-            f(t)?;
+            t.show_cursor()?;
+            self.cursor_hidden = false;
+        }
+        // Leave the alternate screen (keep the terminal so resume can
+        // re-enter without rebuilding the backend).
+        if self.alternate_screen {
+            if let Some(t) = self.terminal.as_mut() {
+                use crossterm::execute;
+                use crossterm::terminal::LeaveAlternateScreen;
+                execute!(t.backend_mut(), LeaveAlternateScreen)?;
+                use std::io::Write;
+                t.backend_mut().flush()?;
+            }
+            self.alternate_screen = false;
+        }
+        // Disable raw mode last (subprocess expects a cooked terminal).
+        if self.raw_mode {
+            (self.raw_ops.disable)()?;
+            self.raw_mode = false;
         }
         Ok(())
     }
 
-    /// Normal-exit cleanup: reverse every completed stage and return an
-    /// aggregated error if any stage failed. Consumes the guard.
-    pub fn close(mut self) -> Result<()> {
+    /// Re-enter after `suspend()`: enable raw mode, re-enter the alternate
+    /// screen, re-hide the cursor if it was hidden before suspending, and
+    /// clear (the normal screen's content may have changed while suspended,
+    /// so the backend's previous buffer is untrusted).
+    pub fn resume(&mut self) -> Result<()> {
+        if !self.raw_mode {
+            (self.raw_ops.enable)()?;
+            self.raw_mode = true;
+        }
+        if !self.alternate_screen {
+            if let Some(t) = self.terminal.as_mut() {
+                use crossterm::execute;
+                use crossterm::terminal::EnterAlternateScreen;
+                execute!(t.backend_mut(), EnterAlternateScreen)?;
+            }
+            self.alternate_screen = true;
+            // The normal screen may have arbitrary content now; force a full
+            // clear so the next draw's diff is against a known-blank state.
+            self.clear()?;
+        }
+        Ok(())
+    }
+
+    /// Reverse the completed stages without consuming `self`, attempting
+    /// every applicable restoration in reverse order without
+    /// short-circuiting. Returns the first error encountered, if any.
+    /// Shared by `close()` and `Drop`.
+    fn restore(&mut self) -> Result<()> {
         let mut first_err: Option<TrelaneError> = None;
         let mut push = |e: TrelaneError| {
             if first_err.is_none() {
@@ -301,16 +412,23 @@ impl TuiSession {
             }
         };
 
-        // Show the cursor first (the inverse of stage 3).
-        if self.cursor_hidden
-            && let Some(t) = self.terminal.as_mut()
-        {
+        // Cursor: ALWAYS show on teardown when we have a terminal, not only
+        // when the guard's flag is set -- ratatui's draw() hides the cursor
+        // internally whenever a frame sets no cursor position, and that
+        // internal state isn't visible to the flag, so the flag alone can't
+        // decide whether the physical cursor is currently hidden. show_cursor
+        // is idempotent (CSI ?25h when already visible is a no-op). This is
+        // the parity fix for the old unconditional `terminal.show_cursor()`
+        // cleanup in the four UIs this guard replaces.
+        if self.terminal.is_some() {
+            let t = self.terminal.as_mut().unwrap();
             if let Err(e) = t.show_cursor() {
                 push(TrelaneError::msg(format!("show_cursor: {e}")));
             }
+            self.cursor_hidden = false;
         }
-        // Leave the alternate screen (inverse of stage 2). We use the
-        // backend's writer so the command reaches the same tty.
+        // Stage 2 inverse: leave the alternate screen and flush the backend
+        // so the leave command is actually written.
         if self.alternate_screen
             && let Some(t) = self.terminal.as_mut()
         {
@@ -319,18 +437,18 @@ impl TuiSession {
             if let Err(e) = execute!(t.backend_mut(), LeaveAlternateScreen) {
                 push(TrelaneError::msg(format!("LeaveAlternateScreen: {e}")));
             }
-            // Flush the backend so the leave command is actually written.
             if let Err(e) = t.flush() {
                 push(TrelaneError::msg(format!("backend flush: {e}")));
             }
+            self.alternate_screen = false;
         }
-        // Drop the terminal before disabling raw mode -- the Drop may flush
-        // the backend, which wants raw mode off only after the alt screen
-        // is left. We've already left it; safe to drop now.
+        // Drop the terminal before disabling raw mode -- the backend's own
+        // Drop may flush, and that wants raw mode off only after the alt
+        // screen is left. We've already left it; safe to drop now.
         self.terminal = None;
-        // Disable raw mode (inverse of stage 1).
+        // Stage 1 inverse: disable raw mode.
         if self.raw_mode {
-            if let Err(e) = crossterm::terminal::disable_raw_mode() {
+            if let Err(e) = (self.raw_ops.disable)() {
                 push(TrelaneError::msg(format!("disable_raw_mode: {e}")));
             }
             self.raw_mode = false;
@@ -340,30 +458,23 @@ impl TuiSession {
             None => Ok(()),
         }
     }
+
+    /// Normal-exit cleanup: reverse every completed stage and return an
+    /// aggregated error if any stage failed. Consumes the guard (which is
+    /// why Drop's own restore becomes a no-op afterward -- every stage flag
+    /// is already false).
+    pub fn close(mut self) -> Result<()> {
+        self.restore()
+    }
 }
 
 impl Drop for TuiSession {
     fn drop(&mut self) {
         // Best-effort restoration without short-circuiting. We can't report
-        // errors from drop, so we swallow them -- use close() for that.
-        if self.cursor_hidden
-            && let Some(t) = self.terminal.as_mut()
-        {
-            let _ = t.show_cursor();
-        }
-        if self.alternate_screen
-            && let Some(t) = self.terminal.as_mut()
-        {
-            use crossterm::execute;
-            use crossterm::terminal::LeaveAlternateScreen;
-            let _ = execute!(t.backend_mut(), LeaveAlternateScreen);
-            let _ = t.flush();
-        }
-        self.terminal = None;
-        if self.raw_mode {
-            let _ = crossterm::terminal::disable_raw_mode();
-            self.raw_mode = false;
-        }
+        // errors from drop, so we swallow them -- use close() for that. This
+        // is the panic/error safety net: a panic unwinding through the draw
+        // loop drops this guard and still leaves the terminal usable.
+        let _ = self.restore();
     }
 }
 
@@ -372,6 +483,219 @@ impl Drop for TuiSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// A writer that shares its bytes with the test so we can inspect which
+    /// escape sequences were written (Enter/LeaveAlternateScreen, cursor
+    /// show/hide) after the guard has moved it into the backend.
+    #[derive(Clone, Default)]
+    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Raw-mode ops that count enable/disable calls and can be told to fail.
+    #[derive(Clone, Default)]
+    struct RawCounter {
+        enables: Arc<Mutex<usize>>,
+        disables: Arc<Mutex<usize>>,
+        fail_enable: Arc<Mutex<bool>>,
+        fail_disable: Arc<Mutex<bool>>,
+    }
+    impl RawCounter {
+        fn ops(&self) -> RawModeOps {
+            let (en, dis) = (self.enables.clone(), self.disables.clone());
+            let (fe, fd) = (self.fail_enable.clone(), self.fail_disable.clone());
+            RawModeOps {
+                enable: Box::new(move || {
+                    *en.lock().unwrap() += 1;
+                    if *fe.lock().unwrap() {
+                        Err(std::io::Error::new(std::io::ErrorKind::Other, "injected enable failure"))
+                    } else {
+                        Ok(())
+                    }
+                }),
+                disable: Box::new(move || {
+                    *dis.lock().unwrap() += 1;
+                    if *fd.lock().unwrap() {
+                        Err(std::io::Error::new(std::io::ErrorKind::Other, "injected disable failure"))
+                    } else {
+                        Ok(())
+                    }
+                }),
+            }
+        }
+        fn enables(&self) -> usize { *self.enables.lock().unwrap() }
+        fn disables(&self) -> usize { *self.disables.lock().unwrap() }
+    }
+
+    fn bytes_of(w: &SharedWriter) -> String {
+        String::from_utf8_lossy(&w.0.lock().unwrap()).into_owned()
+    }
+
+    const ENTER_ALT: &str = "\x1b[?1049h";
+    const LEAVE_ALT: &str = "\x1b[?1049l";
+    const SHOW_CURSOR: &str = "\x1b[?25h";
+
+    // Regression: ratatui's draw() hides the cursor INTERNALLY whenever a
+    // frame sets no cursor position (all four UIs are like this), and that
+    // internal hide is invisible to the guard's cursor_hidden flag. close()
+    // must still emit a show-cursor so the user's terminal isn't left with
+    // an invisible cursor -- the unconditional `terminal.show_cursor()` in
+    // the old hand-rolled cleanup did this; the guard must match it.
+    #[test]
+    fn close_shows_cursor_even_when_only_ratatui_hid_it() {
+        let c = RawCounter::default();
+        let w = SharedWriter::default();
+        let mut session = TuiSession::enter_with_ops(c.ops()).unwrap();
+        session
+            .enter_alternate_screen(Box::new(w.clone()))
+            .unwrap();
+        // Draw a frame that sets NO cursor position: ratatui hides the
+        // cursor internally as a result. The guard's cursor_hidden flag
+        // stays false -- the exact state the four UIs are in every frame.
+        session.terminal().unwrap().draw(|_| {}).unwrap();
+        assert!(!session.cursor_hidden, "guard's flag was never set");
+        // close() must still show the cursor (physical state was hidden by
+        // the draw). If restore() gated on the flag, this assertion fails.
+        session.close().unwrap();
+        let bytes = bytes_of(&w);
+        assert!(
+            bytes.contains(SHOW_CURSOR),
+            "close() must emit show-cursor after ratatui's internal hide: {bytes:?}"
+        );
+    }
+
+    // Acceptance: injected failure at stage 1 (raw mode) -> no guard, no
+    // restore attempt against a half-set-up terminal.
+    #[test]
+    fn stage1_failure_returns_error_without_guard() {
+        let c = RawCounter::default();
+        *c.fail_enable.lock().unwrap() = true;
+        let res = TuiSession::enter_with_ops(c.ops());
+        assert!(res.is_err());
+        assert_eq!(c.enables(), 1, "enable attempted once");
+        assert_eq!(c.disables(), 0, "disable never called on stage-1 failure");
+    }
+
+    // Acceptance: injected failure at stage 2 (alternate screen) after stage
+    // 1 succeeded -> dropping the errored path restores stage 1.
+    #[test]
+    fn stage2_failure_restores_stage1_on_drop() {
+        let c = RawCounter::default();
+        let mut session = TuiSession::enter_with_ops(c.ops()).unwrap();
+        // A writer that fails every write makes EnterAlternateScreen fail.
+        struct FailWriter;
+        impl std::io::Write for FailWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::Other, "injected write failure"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let res = session.enter_alternate_screen(Box::new(FailWriter));
+        assert!(res.is_err());
+        // Caller returns the error, dropping the session.
+        drop(session);
+        assert_eq!(c.disables(), 1, "raw mode restored on drop after stage-2 failure");
+    }
+
+    // Acceptance: a full setup then an injected error in the draw path ->
+    // drop restores everything (cursor shown, alt screen left, raw off).
+    #[test]
+    fn draw_error_leaves_terminal_restored() {
+        let c = RawCounter::default();
+        let w = SharedWriter::default();
+        let mut session = TuiSession::enter_with_ops(c.ops()).unwrap();
+        session
+            .enter_alternate_screen(Box::new(w.clone()))
+            .unwrap();
+        session.hide_cursor().unwrap();
+        // Simulate a draw error: the caller propagates and the guard drops.
+        let draw_result: Result<()> = (|| {
+            let t = session.terminal().unwrap();
+            t.draw(|_| {})?;
+            Err(TrelaneError::msg("injected draw failure"))
+        })();
+        assert!(draw_result.is_err());
+        drop(session);
+        let bytes = bytes_of(&w);
+        assert!(bytes.contains(ENTER_ALT), "entered alt screen: {bytes:?}");
+        assert!(bytes.contains(LEAVE_ALT), "left alt screen on drop: {bytes:?}");
+        assert_eq!(c.disables(), 1, "raw mode disabled on drop");
+    }
+
+    // Acceptance: a panic inside the draw closure triggers guard cleanup
+    // (Drop is the panic safety net).
+    #[test]
+    fn panic_in_draw_triggers_cleanup() {
+        let c = RawCounter::default();
+        let w = SharedWriter::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut session = TuiSession::enter_with_ops(c.ops()).unwrap();
+            session
+                .enter_alternate_screen(Box::new(w.clone()))
+                .unwrap();
+            let t = session.terminal().unwrap();
+            let _ = t.draw(|_| panic!("injected draw panic"));
+        }));
+        assert!(result.is_err(), "panic propagated");
+        let bytes = bytes_of(&w);
+        assert!(
+            bytes.contains(LEAVE_ALT),
+            "panic unwinding left alt screen: {bytes:?}"
+        );
+        assert_eq!(c.disables(), 1, "panic unwinding disabled raw mode");
+    }
+
+    // Acceptance: suspend/resume round-trips raw mode + alt screen, and a
+    // drop WHILE SUSPENDED does not double-restore (flags track state).
+    #[test]
+    fn suspend_resume_tracks_stages_across_the_pair() {
+        let c = RawCounter::default();
+        let w = SharedWriter::default();
+        let mut session = TuiSession::enter_with_ops(c.ops()).unwrap();
+        session
+            .enter_alternate_screen(Box::new(w.clone()))
+            .unwrap();
+        assert_eq!(c.enables(), 1);
+        session.suspend().unwrap();
+        assert_eq!(c.disables(), 1, "suspend disabled raw mode");
+        session.resume().unwrap();
+        assert_eq!(c.enables(), 2, "resume re-enabled raw mode");
+        // Now drop while fully set up: exactly one more disable, no double.
+        drop(session);
+        assert_eq!(c.disables(), 2, "single disable on drop after resume");
+        let bytes = bytes_of(&w);
+        // Enter appears twice (initial + resume), Leave twice (suspend + drop).
+        assert_eq!(bytes.matches(ENTER_ALT).count(), 2);
+        assert_eq!(bytes.matches(LEAVE_ALT).count(), 2);
+    }
+
+    // Acceptance: close() aggregates cleanup errors instead of
+    // short-circuiting -- an injected disable failure is reported, and the
+    // alt-screen leave was still attempted before it.
+    #[test]
+    fn close_reports_cleanup_error_but_attempts_all_stages() {
+        let c = RawCounter::default();
+        let w = SharedWriter::default();
+        let mut session = TuiSession::enter_with_ops(c.ops()).unwrap();
+        session
+            .enter_alternate_screen(Box::new(w.clone()))
+            .unwrap();
+        // Inject a failure into the disable step.
+        *c.fail_disable.lock().unwrap() = true;
+        let res = session.close();
+        assert!(res.is_err(), "cleanup error surfaced");
+        // The alt screen leave was still attempted BEFORE the failing disable.
+        let bytes = bytes_of(&w);
+        assert!(bytes.contains(LEAVE_ALT), "leave attempted before failing disable");
+    }
 
     /// Repeatedly creating and dropping a capture must always restore the
     /// original fds exactly. Catches a class of bugs where the drop path

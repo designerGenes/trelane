@@ -496,18 +496,17 @@ fn gather_state(ctx: &crate::Context) -> Result<DiagnosticState> {
 
 fn run_loop(ctx: &crate::Context, state: &mut DiagnosticState) -> Result<()> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-    use crossterm::execute;
-    use crossterm::terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    };
-    use ratatui::prelude::*;
+    use crate::tui_session::TuiSession;
     use std::time::Duration;
 
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    // TUI-006: the shared guard owns the raw-mode/alternate-screen ladder
+    // and restores every completed stage in reverse order on Drop, so a
+    // draw/poll error or a panic in the loop below can't strand the user's
+    // terminal. stdout is boxed to match the guard's writer type (the same
+    // concrete terminal type monitor/bench_ui use via /dev/tty).
+    let mut session = TuiSession::enter()?;
+    session.enter_alternate_screen(Box::new(std::io::stdout()))?;
+    let terminal = session.terminal().unwrap();
 
     let outcome = (|| -> Result<()> {
         loop {
@@ -541,7 +540,7 @@ fn run_loop(ctx: &crate::Context, state: &mut DiagnosticState) -> Result<()> {
                                 state.mark_models_saved();
                             }
                         }
-                        KeyCode::Char('K') => confirm_and_kill(&mut terminal, state)?,
+                        KeyCode::Char('K') => confirm_and_kill(terminal, state)?,
                         _ => {}
                     }
                 }
@@ -553,10 +552,11 @@ fn run_loop(ctx: &crate::Context, state: &mut DiagnosticState) -> Result<()> {
         Ok(())
     })();
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    // TUI-006: restore every stage in reverse order without short-circuiting;
+    // the loop's outcome takes precedence over a cleanup error.
+    let close_result = session.close();
     outcome?;
+    close_result?;
 
     if state.kill_requested {
         let _ = ctx; // kill is process-global; handled by cmd_kill in lib.rs

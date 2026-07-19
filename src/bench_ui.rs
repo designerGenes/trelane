@@ -119,25 +119,25 @@ fn run_loop(
     stop: &Arc<AtomicBool>,
 ) -> Result<()> {
     use crossterm::event::{self, Event, KeyCode};
-    use crossterm::execute;
-    use crossterm::terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    };
+    use crate::tui_session::TuiSession;
 
-    enable_raw_mode()?;
     // Draw to /dev/tty directly rather than std::io::stdout(). This decouples
     // the TUI from fd 1, so the orchestrator's captured stdout (redirected to
     // bench.log by run_with_tui) can't corrupt the screen and, conversely, the
     // redirect can't steal the TUI's output. Falls back to stdout if /dev/tty
     // is unavailable (e.g. not a real terminal), which is the old behavior.
-    let mut tty: Box<dyn std::io::Write + Send> =
+    let tty: Box<dyn std::io::Write + Send> =
         match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
             Ok(f) => Box::new(f),
             Err(_) => Box::new(std::io::stdout()),
         };
-    execute!(tty, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(tty);
-    let mut terminal = Terminal::new(backend)?;
+    // TUI-006: the shared guard owns the raw-mode/alternate-screen ladder
+    // and restores every completed stage in reverse order on Drop, so a
+    // draw/read error or a panic in the loop below can't strand the user's
+    // terminal.
+    let mut session = TuiSession::enter()?;
+    session.enter_alternate_screen(tty)?;
+    let terminal = session.terminal().unwrap();
 
     let start = Instant::now();
     let mut events: Vec<BenchEventView> = Vec::new();
@@ -202,10 +202,11 @@ fn run_loop(
         Ok(())
     })();
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    outcome
+    // TUI-006: restore every stage in reverse order without short-circuiting;
+    // the loop's outcome takes precedence over a cleanup error.
+    let close_result = session.close();
+    outcome?;
+    close_result
 }
 
 /// A simplified view of a bench event for rendering. Parsed from the JSONL

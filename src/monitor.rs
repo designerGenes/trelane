@@ -1047,40 +1047,49 @@ fn kill_session_agents(ctx: &Context) -> Result<(usize, usize)> {
 /// tab's log on an interval; renders tabs; handles navigation keys.
 pub fn run_monitor(ctx: &Context) -> Result<()> {
     use crossterm::event::{self, Event, KeyCode};
-    use crossterm::execute;
-    use crossterm::terminal::{
-        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    };
-    use ratatui::Terminal;
-    use ratatui::backend::CrosstermBackend;
+    use crate::tui_session::TuiSession;
 
     let agents = store::list_agents(&ctx.conn)?;
     let mut state = MonitorState::new(&agents);
     poll_statuses(ctx, &mut state);
 
-    enable_raw_mode()?;
     // Draw to /dev/tty directly, not std::io::stdout(). When the monitor
     // co-runs with a background squire tick-loop (the default `trelane`
     // session), that loop prints progress to stdout; drawing to /dev/tty keeps
     // the TUI immune to it (stdout is captured to a session log by the caller).
     // Falls back to stdout when /dev/tty is unavailable (not a real terminal).
-    let mut tty: Box<dyn std::io::Write + Send> =
+    let tty: Box<dyn std::io::Write + Send> =
         match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
             Ok(f) => Box::new(f),
             Err(_) => Box::new(std::io::stdout()),
         };
-    execute!(tty, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(tty);
-    let mut terminal = Terminal::new(backend)?;
+    // TUI-006: the TuiSession guard owns the raw-mode/alternate-screen
+    // ladder and restores every completed stage in reverse order on Drop,
+    // so a panic or an error anywhere in the loop below can't strand the
+    // user's terminal in raw mode with the cursor hidden.
+    let mut session = TuiSession::enter()?;
+    session.enter_alternate_screen(tty)?;
     // Force a full clear before the first draw. Some terminals/multiplexers
     // don't guarantee a blank alternate screen on entry, and ratatui only
     // diffs against its OWN prior frame -- so without this, a cell that no
     // widget happens to touch this frame (a quiet gap in the layout) can go
     // on showing whatever was there before this session started.
-    terminal.clear()?;
+    session.clear()?;
 
     let outcome = (|| -> Result<()> {
+        let terminal = session.terminal().unwrap();
         let mut last_poll = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        // TUI-005: a full terminal.clear() is requested on Resize (the
+        // backend and both ratatui buffers must be invalidated together --
+        // old-geometry cells otherwise linger) and on Ctrl-L (manual
+        // recovery after out-of-band terminal corruption, e.g. a stray
+        // background write or a pager glitch). It is NOT done per-frame or
+        // per-tab-switch; the per-frame Clear widget that used to live in
+        // render() was a misleading mitigation that can't repair backend/
+        // terminal desync after an out-of-band write. See the plan's
+        // TUI-005 "do_not" list: no clearing every frame, no sleeps, and
+        // input draining alone is not the guarantee.
+        let mut needs_clear = false;
         loop {
             // Poll on an interval, not every frame: agent list + statuses are
             // DB queries, and the active feed is a file read.
@@ -1108,16 +1117,30 @@ pub fn run_monitor(ctx: &Context) -> Result<()> {
             // terminal can fall behind on. Collapsing the burst into a single
             // state update plus one draw for the final state removes it.
             // event::poll(0) is a non-blocking check, so this never waits.
-            // (The other fix is the per-frame Clear + one-row-per-event
-            // rendering in render(), which removes the debris at its source.)
             loop {
                 if !event::poll(std::time::Duration::from_millis(0))? {
                     break;
                 }
-                if let Event::Key(key) = event::read()? {
-                    let mode = state.active_mode();
-                    let on_trelane =
-                        matches!(state.tabs.get(state.active), Some(MonitorTab::Trelane));
+                // TUI-005: Resize is not a Key event -- it must be handled
+                // here in the drain loop, and it invalidates both ratatui
+                // buffers (the backend's previous-frame diff state) via a
+                // full clear before the next draw. Without this, cells from
+                // the old geometry can survive into the new frame. Ctrl-L
+                // is the manual-recovery binding for out-of-band corruption.
+                // Both classifications live in the pure `requests_full_clear`
+                // / `is_ctrl_l` helpers above so they're unit-testable.
+                let ev = event::read()?;
+                if requests_full_clear(&ev) {
+                    needs_clear = true;
+                    continue; // redraw with clear happens below this iteration
+                }
+                let Event::Key(key) = ev else {
+                    continue; // mouse/focus/paste: ignored
+                };
+                {
+                        let mode = state.active_mode();
+                        let on_trelane =
+                            matches!(state.tabs.get(state.active), Some(MonitorTab::Trelane));
 
                     // A pending kill confirmation captures the very next key --
                     // before any global key -- so 'q'/Tab/'d' can't slip past
@@ -1230,16 +1253,22 @@ pub fn run_monitor(ctx: &Context) -> Result<()> {
                         }
                         _ => {}
                     }
-                }
+                } // end Event::Key handling block
                 if state.should_quit {
                     return Ok(());
                 }
             }
 
-            // A tab switch changes the pane's content entirely; the per-frame
-            // Clear widget in render() wipes the content area before each draw,
-            // so the switch needs no extra between-frames clear here.
-
+            // TUI-005: honor a full-clear request (Resize or Ctrl-L) BEFORE
+            // the draw, so the backend's previous-buffer state and the
+            // physical terminal are invalidated together. A tab switch
+            // deliberately does NOT request a clear: the frame's own content
+            // covers the whole pane, and clearing on every switch would be
+            // exactly the per-frame clearing the plan forbids.
+            if needs_clear {
+                terminal.clear()?;
+                needs_clear = false;
+            }
             terminal.draw(|f| render(f, &state))?;
 
             // Block briefly for the next event so the loop doesn't busy-spin
@@ -1250,10 +1279,15 @@ pub fn run_monitor(ctx: &Context) -> Result<()> {
         }
     })();
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    outcome
+    // TUI-006: close() restores cursor, leaves the alternate screen, and
+    // disables raw mode in reverse order, attempting every stage even if one
+    // fails (the plan's TUI-006 invariant: a failure in disable_raw_mode
+    // must not short-circuit LeaveAlternateScreen or show_cursor). The
+    // loop's own outcome takes precedence over a cleanup error; on a clean
+    // loop exit, a cleanup error is surfaced instead of swallowed.
+    let close_result = session.close();
+    outcome?;
+    close_result
 }
 
 /// Redirect process stdout (fd 1) AND stderr (fd 2) to a file for this
@@ -1267,6 +1301,46 @@ pub fn run_monitor(ctx: &Context) -> Result<()> {
 /// implementation is shared with `bench_ui` so both entry points get the
 /// same flush-both, restore-both, fail-before-alt-screen semantics.
 pub(crate) use crate::tui_session::StdCapture;
+
+// ---------------------------------------------------- TUI-005 event helpers
+//
+// The full-clear decision is factored out of run_monitor's event loop into
+// these pure functions so it's unit-testable without a PTY: the loop calls
+// `requests_full_clear(event)` and, when true, calls `terminal.clear()`
+// before the next draw. See TUI-005 in the remediation plan.
+
+/// True when this key event is Ctrl-L. Most terminals deliver it as
+/// `Char('l')` with the CONTROL modifier; a few deliver the raw form-feed
+/// byte (0x0C), which crossterm reports as `Char('\x0c')` with no modifier.
+/// Handle both so the binding works across kitty/iTerm/Terminal.app/
+/// alacritty equally.
+pub fn is_ctrl_l(key: &crossterm::event::KeyEvent) -> bool {
+    (key.code == crossterm::event::KeyCode::Char('l')
+        && key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL))
+        || key.code == crossterm::event::KeyCode::Char('\u{c}')
+}
+
+/// True when this event requires a full `terminal.clear()` before the next
+/// draw, per TUI-005:
+/// - `Event::Resize`: the backend's previous-buffer state refers to the old
+///   geometry, so it and both ratatui buffers must be invalidated together
+///   or old-geometry cells linger.
+/// - Ctrl-L: manual recovery after out-of-band terminal corruption (a stray
+///   background write, a pager glitch). Draws immediately after the clear.
+///
+/// Deliberately NOT requested on tab switches: the in-frame Clear widget in
+/// render() makes every tab's frame specify every cell of the content area,
+/// so a switch is exact in one frame without a full-terminal clear (which
+/// would be exactly the per-frame clearing the plan forbids).
+pub fn requests_full_clear(ev: &crossterm::event::Event) -> bool {
+    match ev {
+        crossterm::event::Event::Resize(_, _) => true,
+        crossterm::event::Event::Key(key) => is_ctrl_l(key),
+        _ => false,
+    }
+}
 
 /// Run the squire tick-loop until `stop` is set. This is the ticking engine
 /// that launches agents on `interval_s`; it runs on a background thread under
@@ -1432,11 +1506,25 @@ fn render(f: &mut ratatui::Frame, state: &MonitorState) {
         );
     f.render_widget(tabs, chunks[0]);
 
-    // Wipe the content area every frame before drawing into it. This is the
-    // reliable ratatui idiom (see diagnostic.rs) for guaranteeing no cell from
-    // a previous frame -- e.g. a taller agent tab's output -- survives when the
-    // current frame's content is shorter. terminal.clear() between frames is
-    // less dependable than an in-frame Clear over the exact area.
+    // Clear the content area inside the frame. Purpose and limits, precisely:
+    // ratatui widgets only write the cells they own -- a Paragraph with N
+    // lines leaves rows N..H untouched in the buffer -- so switching from a
+    // dense agent tab to a sparse Trelane tab without this would leave the
+    // old tab's rows lingering (a frame-geometry bug, visible as stale
+    // rows). The in-frame Clear makes THIS frame specify every cell of the
+    // area, so the diff is exact and tab switches are correct in one frame
+    // with no timing delay (acceptance test 3 of TUI-005).
+    //
+    // What this does NOT do (and never did): repair the physical terminal
+    // after an OUT-OF-BAND write. A logical Clear participates in the frame
+    // diff, so if another writer (a background thread's println, or an
+    // embedded escape sequence in event text) changed the physical terminal
+    // behind ratatui's buffer model, diff draws are not guaranteed to repair
+    // cells ratatui believes are already correct. Those cases are handled
+    // elsewhere: TUI-001 (sanitize all log-derived text), TUI-002
+    // (structured launcher output), TUI-003 (exclusive terminal ownership
+    // via stdout+stderr capture), and the deterministic full terminal.clear()
+    // calls in run_monitor (initial entry, Resize, Ctrl-L).
     f.render_widget(Clear, chunks[1]);
 
     // Diagnostic mode replaces the content area with detail/editor views.
@@ -1583,10 +1671,12 @@ fn render_footer(
     let on_trelane = matches!(state.tabs.get(state.active), Some(MonitorTab::Trelane));
     let hint = match (state.active_mode(), on_trelane) {
         (ViewMode::Diagnostic, true) => {
-            "Tab switch  d feed  ↑↓ row  ←→ adjust  space toggle  s save  p/r pause/resume  k kill  q quit"
+            "Tab switch  d feed  ↑↓ row  ←→ adjust  space toggle  s save  p/r pause/resume  k kill  ^L redraw  q quit"
         }
-        (ViewMode::Diagnostic, false) => "Tab switch  d back to feed  q quit",
-        (ViewMode::Normal, _) => "Tab/←→ switch  0-9 jump  d diagnostic  ↑↓ scroll  End/f follow  q quit",
+        (ViewMode::Diagnostic, false) => "Tab switch  d back to feed  ^L redraw  q quit",
+        (ViewMode::Normal, _) => {
+            "Tab/←→ switch  0-9 jump  d diagnostic  ↑↓ scroll  End/f follow  ^L redraw  q quit"
+        }
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(dim)))),
@@ -2227,6 +2317,206 @@ mod tests {
             if w >= 2 {
                 assert!(out.ends_with('…'));
             }
+        }
+    }
+
+    // ---------------- TUI-005: full-clear decision + frame correctness --------
+    //
+    // These tests cover the plan's TUI-005 acceptance criteria using
+    // ratatui's TestBackend instead of a PTY. The full PTY end-to-end
+    // scenario (real monitor in a pseudo-terminal, 100 tab switches, two
+    // resizes, one Ctrl-L) is the plan's regression_test_plan; the unit
+    // tests here lock in the DECISION logic (when do we request a full
+    // clear) and the FRAME correctness (the rendered buffer has no stale
+    // cells and no control bytes), which is what the PTY scenario asserts
+    // at the byte level.
+
+    #[test]
+    fn ctrl_l_is_detected_both_modi() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        // The common form: Char('l') + CONTROL.
+        let k1 = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert!(is_ctrl_l(&k1), "Char('l') + CONTROL");
+        // The raw form-feed byte form (some terminals send 0x0C directly).
+        let k2 = KeyEvent::new(KeyCode::Char('\u{c}'), KeyModifiers::NONE);
+        assert!(is_ctrl_l(&k2), "raw form-feed Char('\\x0c')");
+        // Plain 'l' without CONTROL is NOT a redraw request.
+        let k3 = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
+        assert!(!is_ctrl_l(&k3));
+        // Control-something-else is NOT.
+        let k4 = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        assert!(!is_ctrl_l(&k4));
+    }
+
+    #[test]
+    fn resize_and_ctrl_l_request_full_clear_others_do_not() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        // Resize always requests a clear.
+        assert!(requests_full_clear(&Event::Resize(80, 24)));
+        // Ctrl-L requests a clear.
+        assert!(requests_full_clear(&Event::Key(KeyEvent::new(
+            KeyCode::Char('l'),
+            KeyModifiers::CONTROL
+        ))));
+        assert!(requests_full_clear(&Event::Key(KeyEvent::new(
+            KeyCode::Char('\u{c}'),
+            KeyModifiers::NONE
+        ))));
+        // A Tab key (tab switch) does NOT request a clear: the in-frame
+        // Clear widget makes tab switches exact without a full-terminal
+        // clear. This is the "do not clear every frame / every switch"
+        // invariant from the plan.
+        assert!(!requests_full_clear(&Event::Key(KeyEvent::new(
+            KeyCode::Tab,
+            KeyModifiers::NONE
+        ))));
+        // A quit key does NOT.
+        assert!(!requests_full_clear(&Event::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE
+        ))));
+        // Mouse/focus events do NOT.
+        assert!(!requests_full_clear(&Event::FocusGained));
+    }
+
+    #[test]
+    fn render_switches_from_dense_agent_tab_to_sparse_trelane_tab_without_stale_cells(
+    ) {
+        // Acceptance test 3 (normal tab switching correct without a timing
+        // delay): render a dense agent tab (many events), then switch to
+        // the sparse Trelane tab, and assert EVERY cell in the content
+        // rectangle holds the second frame's content -- i.e. no stale rows
+        // from the dense tab survive in the buffer. The in-frame Clear
+        // widget is what makes this exact; this test would fail without it.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let width: u16 = 60;
+        let height: u16 = 20;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        // Build state with one agent whose feed is dense.
+        let agents = vec!["alpha".to_string()];
+        let mut state = MonitorState::new(&agents);
+        let feed = state.feed_mut("alpha");
+        feed.status_line = "running -- working".to_string();
+        // Fill the feed with more events than the pane can show, so the
+        // dense tab truly fills the content area.
+        for i in 0..50 {
+            feed.push_events(vec![AgentEvent::Text(format!("dense line {i}"))]);
+        }
+        // Render the dense agent tab (tab 1).
+        state.jump_to(1);
+        terminal.draw(|f| render(f, &state)).unwrap();
+
+        // Switch to the sparse Trelane tab (tab 0) and render again.
+        state.jump_to(0);
+        terminal.draw(|f| render(f, &state)).unwrap();
+
+        // Inspect the buffer: no cell anywhere may still contain the dense
+        // tab's "dense line N" text. The buffer's cell symbols are joined
+        // row by row; a stale dense row would show up as that exact text.
+        let buf = terminal.backend().buffer();
+        let mut all_text = String::new();
+        for row in 0..height {
+            for col in 0..width {
+                all_text.push_str(buf[(col, row)].symbol());
+            }
+            all_text.push('\n');
+        }
+        assert!(
+            !all_text.contains("dense line"),
+            "stale dense-tab row survived the switch to the sparse Trelane tab:\n{all_text}"
+        );
+        // And the sparse tab's expected content IS present.
+        assert!(
+            all_text.contains("Trelane Monitor"),
+            "Trelane tab chrome missing after switch:\n{all_text}"
+        );
+    }
+
+    #[test]
+    fn render_poisoned_raw_event_emits_no_control_bytes() {
+        // The ratatui_test_backend part of the plan's regression plan:
+        // render poisoned Raw events and assert no Cell symbol contains ESC
+        // or control characters. parse_line sanitizes at ingestion, so a
+        // poisoned line's stored event body is already clean; this test
+        // verifies the full pipeline end-to-end at the buffer level.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let agents = vec!["alpha".to_string()];
+        let mut state = MonitorState::new(&agents);
+        // Feed a poisoned line through the PUBLIC parse path (the one the
+        // real feed uses), then push the resulting events.
+        let poisoned = "> build \x1b[36m\u{b7}\x1b[0m nvidia/nemotron\rHits\rHull\r\x07done";
+        let evs = parse_line(poisoned);
+        let feed = state.feed_mut("alpha");
+        feed.push_events(evs);
+        state.jump_to(1);
+        terminal.draw(|f| render(f, &state)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        for row in 0..24u16 {
+            for col in 0..80u16 {
+                let sym = buf[(col, row)].symbol();
+                for c in sym.chars() {
+                    assert!(
+                        !c.is_control() && c != '\u{1b}',
+                        "control byte {:#x} in cell ({col},{row}) symbol {sym:?}",
+                        c as u32
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn render_every_event_occupies_exactly_one_row_at_several_widths() {
+        // The plan's "render at several widths and assert no event occupies
+        // more than one logical row." Each feed line is one row by
+        // construction (truncate_to_width + no .wrap()); this asserts the
+        // invariant at the buffer level for a long event at several widths.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for (w, h) in [(40u16, 15u16), (80, 24), (120, 30)] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let agents = vec!["alpha".to_string()];
+            let mut state = MonitorState::new(&agents);
+            let feed = state.feed_mut("alpha");
+            // One very long event + a few short ones.
+            feed.push_events(vec![
+                AgentEvent::Text("x".repeat(500)),
+                AgentEvent::Text("short".to_string()),
+            ]);
+            state.jump_to(1);
+            terminal.draw(|f| render(f, &state)).unwrap();
+
+            // Count rows in the buffer that contain the long-event body.
+            // The long body is truncated to ONE row (with an ellipsis), so
+            // the run of 'x' characters appears on exactly one row; a wrap
+            // would put 'x' runs on 2+ rows.
+            let buf = terminal.backend().buffer();
+            let mut rows_with_x_run = 0;
+            for row in 0..h {
+                let mut line = String::new();
+                for col in 0..w {
+                    line.push_str(buf[(col, row)].symbol());
+                }
+                // A run of many x's marks the long event's row.
+                if line.matches('x').count() > 10 {
+                    rows_with_x_run += 1;
+                }
+            }
+            assert_eq!(
+                rows_with_x_run, 1,
+                "width {w}: long event wrapped onto {rows_with_x_run} rows"
+            );
         }
     }
 
