@@ -1363,6 +1363,18 @@ pub fn validate_description(desc: &ProjectDescription) -> Result<()> {
                 "project description: a domain has an empty name",
             ));
         }
+        // Domain names become agent IDs, which must match the agent-name
+        // charset (lowercase alnum, '-', '_', max 32 chars). Catching this
+        // at validation time (in the Biplane UI's save path) tells the user
+        // to rename BEFORE the description is saved, rather than failing
+        // silently at session-launch time with a cryptic apply error.
+        if !crate::commands::is_valid_agent_name(&d.name) {
+            return Err(TrelaneError::msg(format!(
+                "project description: domain name '{}' is not a valid agent id \
+                 (use lowercase letters, digits, '-', '_'; max 32 chars)",
+                d.name
+            )));
+        }
         if d.writable.is_empty() {
             return Err(TrelaneError::msg(format!(
                 "project description: domain '{}' has no writable globs",
@@ -2724,6 +2736,26 @@ mod tests {
         let d = desc(vec![domain("a", &["ghost"], 1)], None);
         let err = validate_description(&d).unwrap_err();
         assert!(format!("{err:?}").contains("unknown domain"));
+    }
+
+    #[test]
+    fn validate_rejects_uppercase_domain_name() {
+        // Domain names become agent IDs, which require lowercase alnum +
+        // '-'/'_'. The validator must catch this at save time (in the
+        // Biplane UI) rather than failing silently at session-launch time.
+        let d = desc(vec![domain("FrontEnd", &[], 1)], None);
+        let err = validate_description(&d).unwrap_err();
+        assert!(format!("{err:?}").contains("not a valid agent id"));
+        assert!(format!("{err:?}").contains("FrontEnd"));
+    }
+
+    #[test]
+    fn validate_accepts_valid_agent_name_chars() {
+        let d = desc(
+            vec![domain("front-end_2", &[], 1)],
+            None,
+        );
+        assert!(validate_description(&d).is_ok());
     }
 
     #[test]

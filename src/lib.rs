@@ -300,22 +300,34 @@ fn run_session_command(cli: Cli) -> Result<()> {
         }
     }
 
-    // Seed agents from an existing Biplane plan. If no agents are registered
-    // yet but a biplane-description.json exists (the common case after running
-    // `trelane biplane`), register its domains as the session's default agents
-    // and queue their planned work. Idempotent: agents that already exist are
-    // re-synced, not duplicated, so this is safe to run every launch.
+    // Seed/re-sync agents from an existing Biplane plan. If a
+    // biplane-description.json exists (the common case after running
+    // `trelane biplane`), register its domains as the session's default
+    // agents and queue their planned work. Idempotent: agents that already
+    // exist are re-synced (writable/model/description updated to match the
+    // current description), not duplicated, so this is safe to run every
+    // launch. New domains added to the description since the last launch
+    // are registered; domains removed from the description are NOT deleted
+    // from the DB (they may have history -- messages, tasks, claims).
+    //
+    // The previous `!has_agents` gate was a bug: it seeded agents only on
+    // the FIRST launch and then silently ignored every subsequent edit to
+    // the description, so a user who added a domain in the Biplane UI and
+    // saved saw nothing change on the next `trelane` run.
     {
         let ctx = Context::open(Some(&root))?;
-        let has_agents = !crate::store::list_agents(&ctx.conn)?.is_empty();
         let desc_path = root.join(TRELANE_DIR).join("biplane-description.json");
-        if !has_agents && desc_path.is_file() {
+        if desc_path.is_file() {
             match biplane::load_project_description(&desc_path) {
                 Ok(desc) => match biplane::apply_description_to_session(&ctx, &desc) {
-                    Ok(n) => eprintln!(
-                        "[trelane] launched {n} default agent(s) from {}",
+                    Ok(n) if n > 0 => eprintln!(
+                        "[trelane] registered {n} new agent(s) from {}",
                         desc_path.display()
                     ),
+                    Ok(_) => {
+                        // No new agents, but existing ones were re-synced
+                        // (apply_plan_to_session prints its own resync line).
+                    }
                     Err(e) => eprintln!(
                         "[trelane] warning: could not apply biplane-description.json: {e}"
                     ),

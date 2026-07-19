@@ -79,7 +79,7 @@ pub fn clear_all_stale_locks(conn: &Connection) -> Result<usize> {
     Ok(cleared)
 }
 
-fn is_valid_agent_name(name: &str) -> bool {
+pub fn is_valid_agent_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 32 {
         return false;
     }
