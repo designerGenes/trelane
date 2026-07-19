@@ -25,6 +25,7 @@ pub mod squire;
 pub mod store;
 pub mod telemetry;
 pub mod testing;
+pub mod text_input;
 
 use crate::cli::{Cli, Command};
 use crate::domain::find_root;

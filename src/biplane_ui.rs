@@ -15,7 +15,8 @@
 //! Trelane's teal so the two UIs are never confused at a glance -- both
 //! palettes live in `crate::diagnostic` as a single source of truth.
 
-use crate::biplane::{DomainSpec, ProjectDescription, validate_description};
+use crate::biplane::{DomainSpec, PlannedWork, ProjectDescription, validate_description};
+use crate::diagnostic::THEME_BIPLANE_ACCENT;
 use crate::error::Result;
 
 /// A single editable row: a domain plus whether it's currently included.
@@ -83,6 +84,94 @@ impl ProjectPane {
     }
 }
 
+/// The columns of a domain row, left to right. The column cursor lands on each
+/// of these; `e` enters edit mode on the focused one, and the edit behavior is
+/// determined by the column's kind (see `EditKind`). This is what makes
+/// left/right *navigate* columns instead of directly mutating a value -- a
+/// value only changes once its column is in edit mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Column {
+    /// Whether the domain is included in the plan (checkbox).
+    Include,
+    /// The domain's name (free text).
+    Name,
+    /// The AI model/launcher profile assigned to this domain (selector).
+    Model,
+    /// Requested agent count (numeric).
+    Agents,
+    /// Planned-work items (list — shown, not free-edited here).
+    Work,
+    /// Dependency domain names (list).
+    Deps,
+    /// Writable globs (list).
+    Writable,
+}
+
+/// How a column's value is edited once its column is in edit mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditKind {
+    /// Boolean flip (space / up / down toggles).
+    Toggle,
+    /// Free text via a TextInput (type to edit).
+    Text,
+    /// Cycle through a fixed catalog (up/down or left/right steps entries).
+    Selector,
+    /// Number adjusted by up/down / +/- and set by digit keys.
+    Numeric,
+    /// A list of strings, shown for reference (read/scroll only in this view).
+    List,
+}
+
+impl Column {
+    /// Left-to-right order the column cursor walks.
+    pub const ORDER: [Column; 7] = [
+        Column::Include,
+        Column::Name,
+        Column::Model,
+        Column::Agents,
+        Column::Work,
+        Column::Deps,
+        Column::Writable,
+    ];
+
+    /// Fixed render width (in cells) for this column. Fixed widths are what
+    /// keep the columns from bouncing as their contents change -- every cell
+    /// and the header are padded/truncated to exactly these.
+    pub fn width(self) -> usize {
+        match self {
+            Column::Include => 4,   // "[x]" + space
+            Column::Name => 14,
+            Column::Model => 20,
+            Column::Agents => 7,
+            Column::Work => 6,
+            Column::Deps => 12,
+            Column::Writable => 40,
+        }
+    }
+
+    pub fn kind(self) -> EditKind {
+        match self {
+            Column::Include => EditKind::Toggle,
+            Column::Name => EditKind::Text,
+            Column::Model => EditKind::Selector,
+            Column::Agents => EditKind::Numeric,
+            Column::Work | Column::Deps | Column::Writable => EditKind::List,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Column::Include => "include",
+            Column::Name => "name",
+            Column::Model => "model",
+            Column::Agents => "agents",
+            Column::Work => "work",
+            Column::Deps => "deps",
+            Column::Writable => "writable",
+        }
+    }
+}
+
 /// The full editor state. Every mutation goes through the pure methods below.
 #[derive(Debug, Clone)]
 pub struct BiplaneUiState {
@@ -114,6 +203,65 @@ pub struct BiplaneUiState {
     pub project_scroll: u16,
     /// Whether the `?` help overlay is currently shown.
     pub show_help: bool,
+    /// Index into Column::ORDER for the focused column (0 = Include).
+    pub col_cursor: usize,
+    /// True while the focused column is in edit mode. Left/right navigate
+    /// columns when false; when true they (and other keys) mutate the value.
+    pub editing: bool,
+    /// Live text buffer while editing a Text column (e.g. Name). Committed to
+    /// the row on exit; None when not editing a text column.
+    pub text_edit: Option<crate::text_input::TextInput>,
+    /// The catalog of assignable models for the Model selector: "(default)"
+    /// plus the model ids from `opencode models` (or launcher profiles as a
+    /// fallback).
+    pub models: Vec<String>,
+    /// Known free-model ids (mirror of `bench.free_models` from config). Used
+    /// by the "show only free models" toggle in the Model overlay to filter the
+    /// catalog down to entries that won't incur paid-model spend.
+    pub free_models: Vec<String>,
+    /// Live search query typed into the Model overlay's filter field. Empty
+    /// means "show all"; otherwise entries are kept on a case-insensitive
+    /// substring match. Reset every time the overlay opens.
+    pub model_query: String,
+    /// When true, the Model overlay hides any catalog entry that isn't in
+    /// `free_models` (the "(default)" override-clearing entry is always kept).
+    /// Toggled with `Tab` inside the overlay so it persists across opens.
+    pub model_free_only: bool,
+    /// When the Model overlay picker is open: (selected index, scroll offset).
+    /// The `selected` index is into the FILTERED view (query + free-only),
+    /// not the raw catalog -- `filtered_model_indices()` is the source of
+    /// truth for the mapping. None when closed.
+    pub model_overlay: Option<ModelOverlay>,
+    /// When the inline list editor is open (work/deps/writable). None closed.
+    pub list_editor: Option<ListEditor>,
+}
+
+/// State for the model-selection overlay: a paged, scrollable picker over the
+/// (potentially long) model catalog. Return selects, Esc cancels.
+#[derive(Debug, Clone)]
+pub struct ModelOverlay {
+    /// Index into the model catalog of the highlighted entry.
+    pub selected: usize,
+    /// Index of the first visible row (for paging through a long list).
+    pub scroll: usize,
+}
+
+/// State for the inline list editor over a List column's items (work/deps/
+/// writable). Items are edited as free-text lines: add, edit, remove.
+#[derive(Debug, Clone)]
+pub struct ListEditor {
+    /// Which column's list is being edited.
+    pub col: Column,
+    /// Working copy of the items; committed back to the row on close.
+    pub items: Vec<String>,
+    /// Focused item index.
+    pub cursor: usize,
+    /// Active text buffer when adding/editing an item; None when just
+    /// navigating.
+    pub text_edit: Option<crate::text_input::TextInput>,
+    /// True when the active text_edit is a NEW item being added (vs editing an
+    /// existing one).
+    pub adding: bool,
 }
 
 impl BiplaneUiState {
@@ -144,7 +292,70 @@ impl BiplaneUiState {
             report_json: None,
             project_scroll: 0,
             show_help: false,
+            col_cursor: 0,
+            editing: false,
+            text_edit: None,
+            // Populated by with_models() from config; "(default)" alone until
+            // then so the Model column always has at least the default entry.
+            models: vec!["(default)".to_string()],
+            // Populated by with_free_models() from config; empty until then so
+            // the "free only" toggle has nothing to filter on.
+            free_models: Vec::new(),
+            // Empty search: every catalog entry is visible until the user types.
+            model_query: String::new(),
+            // Off by default so the full catalog is shown; user toggles with
+            // Tab in the overlay when they want to avoid paid-model spend.
+            model_free_only: false,
+            model_overlay: None,
+            list_editor: None,
         }
+    }
+
+    /// Attach the model catalog (config launcher profiles) for the Model
+    /// column's selector. Chainable, mirroring with_report_json, so callers
+    /// without a config still get a working editor (just the "(default)"
+    /// entry). "(default)" is always first; profile names follow, sorted.
+    pub fn with_models(mut self, profile_names: &[String]) -> Self {
+        let mut names: Vec<String> = profile_names.to_vec();
+        names.sort();
+        let mut models = vec!["(default)".to_string()];
+        models.extend(names);
+        self.models = models;
+        self
+    }
+
+    /// Attach the known free-model allowlist (from `bench.free_models`).
+    /// Chainable, mirroring `with_models`, so callers without a config still
+    /// get a working editor (the "free only" toggle just has nothing to hide).
+    pub fn with_free_models(mut self, free: &[String]) -> Self {
+        self.free_models = free.to_vec();
+        self
+    }
+
+    /// The indices into `self.models` that pass the current overlay filter
+    /// (search query + free-only toggle). The "(default)" entry at index 0 is
+    /// always kept -- it clears the per-domain override rather than picking a
+    /// paid model, so the user can always escape the picker. Other entries are
+    /// kept on a case-insensitive substring match against the query, and (when
+    /// `model_free_only` is on) only if they appear in `free_models`.
+    pub fn filtered_model_indices(&self) -> Vec<usize> {
+        let q = self.model_query.trim().to_lowercase();
+        let mut out: Vec<usize> = Vec::new();
+        for (i, name) in self.models.iter().enumerate() {
+            if i == 0 {
+                // "(default)" is always visible.
+                out.push(i);
+                continue;
+            }
+            if self.model_free_only && !self.free_models.iter().any(|f| f == name) {
+                continue;
+            }
+            if !q.is_empty() && !name.to_lowercase().contains(&q) {
+                continue;
+            }
+            out.push(i);
+        }
+        out
     }
 
     /// Attach a pretty-printed report JSON for the Project view. Kept separate
@@ -231,6 +442,339 @@ impl BiplaneUiState {
         }
     }
 
+    /// The column the cursor is currently on.
+    pub fn focused_column(&self) -> Column {
+        Column::ORDER[self.col_cursor.min(Column::ORDER.len() - 1)]
+    }
+
+    /// Move the column cursor left/right. No-op while editing (arrows are
+    /// consumed by the value editor then). This is the fix for the reported
+    /// bug: left/right navigate columns; they don't mutate a value.
+    pub fn col_left(&mut self) {
+        if self.editing {
+            return;
+        }
+        if self.col_cursor > 0 {
+            self.col_cursor -= 1;
+        }
+    }
+
+    pub fn col_right(&mut self) {
+        if self.editing {
+            return;
+        }
+        if self.col_cursor + 1 < Column::ORDER.len() {
+            self.col_cursor += 1;
+        }
+    }
+
+    /// Toggle edit mode on the focused column. Model opens the overlay picker;
+    /// List columns open the inline list editor; Toggle/Text/Numeric edit
+    /// inline (entering a Text column seeds the buffer, leaving commits it).
+    pub fn toggle_edit(&mut self) {
+        let col = self.focused_column();
+        if self.editing {
+            if col.kind() == EditKind::Text {
+                self.commit_text_edit();
+            }
+            self.editing = false;
+            self.text_edit = None;
+            return;
+        }
+        match col.kind() {
+            EditKind::Selector => self.open_model_overlay(),
+            EditKind::List => self.open_list_editor(col),
+            EditKind::Text => {
+                let cur = self.text_value_for(col);
+                self.text_edit = Some(crate::text_input::TextInput::with_text(&cur));
+                self.editing = true;
+            }
+            _ => {
+                self.editing = true;
+            }
+        }
+    }
+
+    // ---------- model overlay picker ----------
+
+    /// Open the model overlay, positioned on the row's current model. The
+    /// search query is cleared each open (a fresh search per session) while the
+    /// `model_free_only` toggle is preserved (it's a standing preference).
+    /// `selected` is resolved against the FILTERED view so it points at the
+    /// current model if that model is still visible, or falls back to
+    /// "(default)" otherwise.
+    pub fn open_model_overlay(&mut self) {
+        self.model_query.clear();
+        let filtered = self.filtered_model_indices();
+        let cur = self.model_index();
+        let selected = filtered
+            .iter()
+            .position(|&i| i == cur)
+            .unwrap_or(0);
+        self.model_overlay = Some(ModelOverlay {
+            selected,
+            scroll: 0,
+        });
+    }
+
+    /// Move the overlay selection by `delta` rows within the FILTERED view
+    /// (clamped), keeping a `visible`-row window scrolled so the selection
+    /// stays on screen.
+    pub fn model_overlay_move(&mut self, delta: isize, visible: usize) {
+        let n = self.filtered_model_indices().len();
+        if n == 0 {
+            return;
+        }
+        if let Some(ov) = self.model_overlay.as_mut() {
+            let cur = ov.selected as isize;
+            let next = (cur + delta).clamp(0, n as isize - 1) as usize;
+            ov.selected = next;
+            // Keep the selection within [scroll, scroll+visible).
+            if visible > 0 {
+                if next < ov.scroll {
+                    ov.scroll = next;
+                } else if next >= ov.scroll + visible {
+                    ov.scroll = next + 1 - visible;
+                }
+            }
+        }
+    }
+
+    /// Commit the overlay selection to the focused row's model and close.
+    /// Resolves the FILTERED-view selection back to a catalog entry, then maps
+    /// "(default)" to `None` (clearing the per-domain override).
+    pub fn model_overlay_commit(&mut self) {
+        if let Some(ov) = self.model_overlay.take() {
+            let filtered = self.filtered_model_indices();
+            let picked = filtered.get(ov.selected).and_then(|&i| self.models.get(i).cloned());
+            if let (Some(picked), Some(row)) = (picked, self.rows.get_mut(self.cursor)) {
+                row.spec.model = if picked == "(default)" {
+                    None
+                } else {
+                    Some(picked)
+                };
+                self.dirty = true;
+            }
+        }
+    }
+
+    pub fn model_overlay_cancel(&mut self) {
+        self.model_overlay = None;
+    }
+
+    /// Append a printable character to the overlay's search query. Resets the
+    /// selection/scroll to the top so the first filtered match is highlighted.
+    pub fn model_overlay_type(&mut self, c: char) {
+        if c.is_control() {
+            return;
+        }
+        self.model_query.push(c);
+        if let Some(ov) = self.model_overlay.as_mut() {
+            ov.selected = 0;
+            ov.scroll = 0;
+        }
+    }
+
+    /// Delete the last character of the overlay's search query. No-op when the
+    /// query is already empty.
+    pub fn model_overlay_backspace(&mut self) {
+        if self.model_query.pop().is_some()
+            && let Some(ov) = self.model_overlay.as_mut()
+        {
+            ov.selected = 0;
+            ov.scroll = 0;
+        }
+    }
+
+    /// Toggle the "show only free models" filter. The selection/scroll are
+    /// reset so they stay in bounds of the new filtered view.
+    pub fn model_overlay_toggle_free_only(&mut self) {
+        self.model_free_only = !self.model_free_only;
+        if let Some(ov) = self.model_overlay.as_mut() {
+            ov.selected = 0;
+            ov.scroll = 0;
+        }
+    }
+
+    // ---------- inline list editor ----------
+
+    /// Open the list editor over the focused row's list for `col`.
+    pub fn open_list_editor(&mut self, col: Column) {
+        let items = self
+            .rows
+            .get(self.cursor)
+            .map(|r| match col {
+                Column::Writable => r.spec.writable.clone(),
+                Column::Deps => r.spec.depends_on.clone(),
+                Column::Work => r
+                    .spec
+                    .planned_work
+                    .iter()
+                    .map(|w| w.subject.clone())
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .unwrap_or_default();
+        self.list_editor = Some(ListEditor {
+            col,
+            items,
+            cursor: 0,
+            text_edit: None,
+            adding: false,
+        });
+    }
+
+    pub fn list_editor_up(&mut self) {
+        if let Some(le) = self.list_editor.as_mut()
+            && le.text_edit.is_none()
+            && le.cursor > 0
+        {
+            le.cursor -= 1;
+        }
+    }
+
+    pub fn list_editor_down(&mut self) {
+        if let Some(le) = self.list_editor.as_mut()
+            && le.text_edit.is_none()
+            && le.cursor + 1 < le.items.len()
+        {
+            le.cursor += 1;
+        }
+    }
+
+    /// Begin adding a new item (empty text buffer appended at the end).
+    pub fn list_editor_add(&mut self) {
+        if let Some(le) = self.list_editor.as_mut()
+            && le.text_edit.is_none()
+        {
+            le.adding = true;
+            le.text_edit = Some(crate::text_input::TextInput::new());
+        }
+    }
+
+    /// Begin editing the focused item (buffer seeded from it).
+    pub fn list_editor_edit(&mut self) {
+        if let Some(le) = self.list_editor.as_mut()
+            && le.text_edit.is_none()
+            && let Some(item) = le.items.get(le.cursor)
+        {
+            le.adding = false;
+            le.text_edit = Some(crate::text_input::TextInput::with_text(item));
+        }
+    }
+
+    /// Remove the focused item.
+    pub fn list_editor_remove(&mut self) {
+        if let Some(le) = self.list_editor.as_mut()
+            && le.text_edit.is_none()
+            && le.cursor < le.items.len()
+        {
+            le.items.remove(le.cursor);
+            if le.cursor > 0 && le.cursor >= le.items.len() {
+                le.cursor = le.items.len().saturating_sub(1);
+            }
+        }
+    }
+
+    /// Commit the active item text buffer (add appends; edit replaces). Empty
+    /// text is discarded.
+    pub fn list_editor_commit_item(&mut self) {
+        if let Some(le) = self.list_editor.as_mut()
+            && let Some(buf) = le.text_edit.take()
+        {
+            let val = buf.value().trim().to_string();
+            if !val.is_empty() {
+                if le.adding {
+                    le.items.push(val);
+                    le.cursor = le.items.len() - 1;
+                } else if let Some(slot) = le.items.get_mut(le.cursor) {
+                    *slot = val;
+                }
+            }
+            le.adding = false;
+        }
+    }
+
+    /// Discard the active item text buffer without committing.
+    pub fn list_editor_cancel_item(&mut self) {
+        if let Some(le) = self.list_editor.as_mut() {
+            le.text_edit = None;
+            le.adding = false;
+        }
+    }
+
+    /// Commit the whole edited list back to the row and close the editor.
+    pub fn list_editor_commit(&mut self) {
+        if let Some(le) = self.list_editor.take() {
+            if let Some(row) = self.rows.get_mut(self.cursor) {
+                match le.col {
+                    Column::Writable => row.spec.writable = le.items,
+                    Column::Deps => row.spec.depends_on = le.items,
+                    Column::Work => {
+                        // Preserve existing PlannedWork bodies where the subject
+                        // still exists; new subjects get a default work item.
+                        let existing = std::mem::take(&mut row.spec.planned_work);
+                        row.spec.planned_work = le
+                            .items
+                            .into_iter()
+                            .map(|subject| {
+                                existing
+                                    .iter()
+                                    .find(|w| w.subject == subject)
+                                    .cloned()
+                                    .unwrap_or_else(|| PlannedWork {
+                                        subject,
+                                        ..Default::default()
+                                    })
+                            })
+                            .collect();
+                    }
+                    _ => {}
+                }
+                self.dirty = true;
+            }
+        }
+    }
+
+    pub fn list_editor_cancel(&mut self) {
+        self.list_editor = None;
+    }
+
+    /// Cancel edit mode without committing (Esc). A text edit is discarded.
+    pub fn cancel_edit(&mut self) {
+        self.editing = false;
+        self.text_edit = None;
+    }
+
+    /// Current string value of a Text column, for seeding the edit buffer.
+    fn text_value_for(&self, col: Column) -> String {
+        match col {
+            Column::Name => self
+                .rows
+                .get(self.cursor)
+                .map(|r| r.spec.name.clone())
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    /// Write the live text buffer back to the focused row's field.
+    fn commit_text_edit(&mut self) {
+        let Some(buf) = self.text_edit.as_ref() else {
+            return;
+        };
+        let value = buf.value();
+        if self.focused_column() == Column::Name
+            && let Some(row) = self.rows.get_mut(self.cursor)
+        {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                row.spec.name = trimmed.to_string();
+                self.dirty = true;
+            }
+        }
+    }
+
     /// Toggle include/exclude on the focused domain.
     pub fn toggle_include(&mut self) {
         if let Some(row) = self.rows.get_mut(self.cursor) {
@@ -247,6 +791,53 @@ impl BiplaneUiState {
             } else {
                 row.spec.agents = row.spec.agents.saturating_sub(1).max(1);
             }
+            self.dirty = true;
+        }
+    }
+
+    /// Set the focused domain's agent count directly from a typed digit.
+    pub fn set_agents_digit(&mut self, d: u32) {
+        if let Some(row) = self.rows.get_mut(self.cursor) {
+            // Single-digit set, clamped to at least 1. Simple and predictable;
+            // multi-digit entry isn't needed for agent counts.
+            row.spec.agents = (d as usize).max(1);
+            self.dirty = true;
+        }
+    }
+
+    /// Index of the focused row's current model within the catalog.
+    fn model_index(&self) -> usize {
+        let cur = self
+            .rows
+            .get(self.cursor)
+            .and_then(|r| r.spec.model.clone())
+            .unwrap_or_else(|| "(default)".to_string());
+        self.models.iter().position(|m| *m == cur).unwrap_or(0)
+    }
+
+    /// Cycle the focused domain's assigned model to the next/previous catalog
+    /// entry. "(default)" maps to None on the spec (clears the override).
+    /// Superseded by the overlay picker for interactive use; retained for tests
+    /// and quick programmatic cycling.
+    #[allow(dead_code)]
+    pub fn cycle_model(&mut self, forward: bool) {
+        if self.models.is_empty() {
+            return;
+        }
+        let n = self.models.len();
+        let cur = self.model_index();
+        let next = if forward {
+            (cur + 1) % n
+        } else {
+            (cur + n - 1) % n
+        };
+        let picked = self.models[next].clone();
+        if let Some(row) = self.rows.get_mut(self.cursor) {
+            row.spec.model = if picked == "(default)" {
+                None
+            } else {
+                Some(picked)
+            };
             self.dirty = true;
         }
     }
@@ -318,6 +909,29 @@ pub fn run(root: &std::path::Path) -> Result<()> {
     run_with_includes(root, &[])
 }
 
+/// Fetch the list of models opencode knows about by running `opencode models`
+/// and taking each non-empty output line as a model id (e.g.
+/// "openrouter/z-ai/glm-5.2"). Returns an empty Vec on any failure (opencode
+/// missing, non-zero exit, timeout-ish hang avoided by the OS) so the caller
+/// can fall back to the launcher profiles. Run ONCE at UI startup, before the
+/// alternate screen is entered, so its output can't corrupt the TUI.
+pub fn fetch_opencode_models() -> Vec<String> {
+    use std::process::Command;
+    let output = match Command::new("opencode").arg("models").output() {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect()
+}
+
 /// Like `run`, but the `G` (generate) action inside the UI also gathers
 /// markdown from these extra include dirs (the `-i` folders), matching the CLI
 /// gather flow. `run` passes an empty slice.
@@ -343,6 +957,19 @@ pub fn run_with_includes(root: &std::path::Path, includes: &[std::path::PathBuf]
 
     let mut state = BiplaneUiState::from_description(&desc, source);
 
+    // Populate the Model column's selector catalog. Prefer the live list from
+    // `opencode models` (many models); fall back to the configured launcher
+    // profiles if opencode isn't available. Fetched once here, before the
+    // alternate screen, so the subprocess output can't corrupt the TUI.
+    let mut model_names = fetch_opencode_models();
+    let mut free_models: Vec<String> = Vec::new();
+    if let Ok(config) = crate::load_config() {
+        if model_names.is_empty() {
+            model_names = config.launcher.profiles.keys().cloned().collect();
+        }
+        free_models = config.bench.free_models.clone();
+    }
+    state = state.with_models(&model_names).with_free_models(&free_models);
     // Attach the stored report JSON if an analysis has produced one, so the
     // Project view's Report pane shows real content. Best-effort: absence just
     // means the pane shows its placeholder.
@@ -407,6 +1034,151 @@ fn run_loop(
                         }
                         continue;
                     }
+                    // Model overlay picker: captures all input. Up/Down (and
+                    // PageUp/PageDown) move the selection through the FILTERED
+                    // catalog (search query + free-only toggle), Enter selects,
+                    // Esc cancels. Typing a printable char refines the search;
+                    // Backspace deletes; Tab toggles "free models only".
+                    // `visible` is an estimate of the overlay's row window.
+                    if state.model_overlay.is_some() {
+                        let visible = 12usize;
+                        match key.code {
+                            KeyCode::Up => state.model_overlay_move(-1, visible),
+                            KeyCode::Down => state.model_overlay_move(1, visible),
+                            KeyCode::PageUp => {
+                                state.model_overlay_move(-(visible as isize), visible)
+                            }
+                            KeyCode::PageDown => {
+                                state.model_overlay_move(visible as isize, visible)
+                            }
+                            KeyCode::Enter => state.model_overlay_commit(),
+                            KeyCode::Esc => state.model_overlay_cancel(),
+                            KeyCode::Tab => state.model_overlay_toggle_free_only(),
+                            KeyCode::Backspace => state.model_overlay_backspace(),
+                            KeyCode::Char(c) => state.model_overlay_type(c),
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    // Inline list editor (work/deps/writable). Navigating items
+                    // with Up/Down; a/e add/edit (opens a text buffer), d/Del
+                    // remove; while a text buffer is open, type + Enter commits
+                    // the item / Esc cancels it; Esc with no buffer commits the
+                    // whole list and closes.
+                    if let Some(le_editing) = state.list_editor.as_ref().map(|le| le.text_edit.is_some()) {
+                        if le_editing {
+                            match key.code {
+                                KeyCode::Enter => state.list_editor_commit_item(),
+                                KeyCode::Esc => state.list_editor_cancel_item(),
+                                KeyCode::Backspace => {
+                                    if let Some(le) = state.list_editor.as_mut()
+                                        && let Some(b) = le.text_edit.as_mut()
+                                    {
+                                        b.backspace();
+                                    }
+                                }
+                                KeyCode::Left => {
+                                    if let Some(le) = state.list_editor.as_mut()
+                                        && let Some(b) = le.text_edit.as_mut()
+                                    {
+                                        b.move_left();
+                                    }
+                                }
+                                KeyCode::Right => {
+                                    if let Some(le) = state.list_editor.as_mut()
+                                        && let Some(b) = le.text_edit.as_mut()
+                                    {
+                                        b.move_right();
+                                    }
+                                }
+                                KeyCode::Char(c) => {
+                                    if let Some(le) = state.list_editor.as_mut()
+                                        && let Some(b) = le.text_edit.as_mut()
+                                    {
+                                        b.insert(c);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            match key.code {
+                                KeyCode::Up => state.list_editor_up(),
+                                KeyCode::Down => state.list_editor_down(),
+                                KeyCode::Char('a') => state.list_editor_add(),
+                                KeyCode::Char('e') | KeyCode::Enter => state.list_editor_edit(),
+                                KeyCode::Char('d') | KeyCode::Delete => state.list_editor_remove(),
+                                KeyCode::Esc => state.list_editor_commit(),
+                                _ => {}
+                            }
+                        }
+                        continue;
+                    }
+                    // Edit-mode intercept: when a column is being edited, the
+                    // value editor captures input BEFORE any global key, so
+                    // typing into a text field (or adjusting a value) never
+                    // triggers q/s/G/T/?. 'e' commits and exits; Esc cancels.
+                    if state.editing && state.view == BiplaneView::Domains {
+                        match state.focused_column().kind() {
+                            EditKind::Text => match key.code {
+                                // 'e' commits and exits (matched before the
+                                // catch-all Char arm so it isn't typed).
+                                KeyCode::Char('e') => state.toggle_edit(),
+                                KeyCode::Esc => state.cancel_edit(),
+                                KeyCode::Enter => state.toggle_edit(), // commit
+                                KeyCode::Backspace => {
+                                    if let Some(b) = state.text_edit.as_mut() {
+                                        b.backspace();
+                                    }
+                                }
+                                KeyCode::Left => {
+                                    if let Some(b) = state.text_edit.as_mut() {
+                                        b.move_left();
+                                    }
+                                }
+                                KeyCode::Right => {
+                                    if let Some(b) = state.text_edit.as_mut() {
+                                        b.move_right();
+                                    }
+                                }
+                                KeyCode::Char(c) => {
+                                    if let Some(b) = state.text_edit.as_mut() {
+                                        b.insert(c);
+                                    }
+                                }
+                                _ => {}
+                            },
+                            EditKind::Toggle => match key.code {
+                                KeyCode::Char('e') | KeyCode::Esc => state.toggle_edit(),
+                                KeyCode::Char(' ')
+                                | KeyCode::Enter
+                                | KeyCode::Up
+                                | KeyCode::Down
+                                | KeyCode::Left
+                                | KeyCode::Right => state.toggle_include(),
+                                _ => {}
+                            },
+                            EditKind::Numeric => match key.code {
+                                KeyCode::Char('e') => state.toggle_edit(),
+                                KeyCode::Esc => state.cancel_edit(),
+                                KeyCode::Up | KeyCode::Char('+') => state.adjust_agents(true),
+                                KeyCode::Down | KeyCode::Char('-') => state.adjust_agents(false),
+                                KeyCode::Char(c) if c.is_ascii_digit() => {
+                                    state.set_agents_digit(c.to_digit(10).unwrap_or(1));
+                                }
+                                _ => {}
+                            },
+                            // Selector (Model) and List columns don't use inline
+                            // edit mode -- toggle_edit routes them to overlays,
+                            // so state.editing is never true for them. These
+                            // arms are unreachable but keep the match total.
+                            EditKind::Selector | EditKind::List => {
+                                if matches!(key.code, KeyCode::Char('e') | KeyCode::Esc) {
+                                    state.cancel_edit();
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     // Keys common to every view come first; view-specific keys
                     // are dispatched by the active sub-screen. This is the one
                     // place that knows which view is active, so the pure state
@@ -425,7 +1197,12 @@ fn run_loop(
                             match generate_via_model(&mut terminal, root, includes) {
                                 Ok(new_state) => {
                                     let report = state.report_json.clone();
+                                    // Preserve the standing free-only preference so
+                                    // the user doesn't have to re-toggle it after
+                                    // generating new domains.
+                                    let free_only = state.model_free_only;
                                     *state = new_state;
+                                    state.model_free_only = free_only;
                                     // Preserve any report already shown if the
                                     // regen didn't produce one.
                                     if state.report_json.is_none() {
@@ -453,9 +1230,15 @@ fn run_loop(
                             BiplaneView::Domains => match other {
                                 KeyCode::Up => state.cursor_up(),
                                 KeyCode::Down => state.cursor_down(),
-                                KeyCode::Char(' ') | KeyCode::Enter => state.toggle_include(),
-                                KeyCode::Left => state.adjust_agents(false),
-                                KeyCode::Right => state.adjust_agents(true),
+                                // Left/Right now NAVIGATE columns (the fix); a
+                                // value only changes once its column is edited.
+                                KeyCode::Left => state.col_left(),
+                                KeyCode::Right => state.col_right(),
+                                // 'e' enters edit mode on the focused column.
+                                KeyCode::Char('e') => state.toggle_edit(),
+                                // space is a convenience quick-toggle for the
+                                // include checkbox regardless of focused column.
+                                KeyCode::Char(' ') => state.toggle_include(),
                                 KeyCode::Char('[') => state.adjust_budget(false),
                                 KeyCode::Char(']') => state.adjust_budget(true),
                                 KeyCode::Char('K') => state.move_up(),
@@ -531,6 +1314,17 @@ fn generate_via_model(
         std::fs::write(&desc_path, serde_json::to_string_pretty(&desc)?)?;
 
         let mut new_state = BiplaneUiState::from_description(&desc, "generated by AI analysis");
+        let mut model_names = fetch_opencode_models();
+        let mut free_models: Vec<String> = Vec::new();
+        if let Ok(config) = crate::load_config() {
+            if model_names.is_empty() {
+                model_names = config.launcher.profiles.keys().cloned().collect();
+            }
+            free_models = config.bench.free_models.clone();
+        }
+        new_state = new_state
+            .with_models(&model_names)
+            .with_free_models(&free_models);
         if let Ok(json) = serde_json::to_string_pretty(&plan) {
             new_state = new_state.with_report_json(json);
         }
@@ -548,6 +1342,44 @@ fn generate_via_model(
 
 fn tc(rgb: (u8, u8, u8)) -> ratatui::style::Color {
     ratatui::style::Color::Rgb(rgb.0, rgb.1, rgb.2)
+}
+
+/// Style for a column header: the focused column's label is highlighted
+/// (bold + accent) so it's clear which column the cursor is on even before
+/// looking at the row.
+fn col_header_style(
+    state: &BiplaneUiState,
+    col: Column,
+    dim: ratatui::style::Color,
+) -> ratatui::style::Style {
+    use ratatui::style::{Modifier, Style};
+    if state.focused_column() == col {
+        Style::default()
+            .fg(tc(THEME_BIPLANE_ACCENT))
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    } else {
+        Style::default().fg(dim).add_modifier(Modifier::BOLD)
+    }
+}
+
+/// Fit a string to exactly `w` display cells: right-pad with spaces if short,
+/// or truncate with a trailing ellipsis if long. This is what makes every
+/// column a fixed width regardless of content, so nothing shifts as values
+/// change. Counts by chars (adequate for the ASCII-ish content here).
+fn fit(s: &str, w: usize) -> String {
+    let len = s.chars().count();
+    if len == w {
+        s.to_string()
+    } else if len < w {
+        format!("{s}{}", " ".repeat(w - len))
+    } else if w == 0 {
+        String::new()
+    } else if w == 1 {
+        "…".to_string()
+    } else {
+        let keep: String = s.chars().take(w - 1).collect();
+        format!("{keep}…")
+    }
 }
 
 fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
@@ -617,55 +1449,158 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
     );
     f.render_widget(header, chunks[0]);
 
-    // Domain list
+    // Domain list. Each cell is a bare value fitted to its column's fixed
+    // width (no "agents:"/"model:" prefixes -- those move to the header row),
+    // so columns never shift as content changes.
     let items: Vec<ListItem> = state
         .rows
         .iter()
         .enumerate()
         .map(|(i, row)| {
-            let marker = if i == state.cursor { "▶ " } else { "  " };
-            let check = if row.include {
-                Span::styled("[x]", Style::default().fg(tc(THEME_OK)))
-            } else {
-                Span::styled("[ ]", Style::default().fg(dim))
+            let on_cursor_row = i == state.cursor;
+            let marker = if on_cursor_row { "▶ " } else { "  " };
+
+            // Style a column's span: the focused column of the cursor row is
+            // highlighted -- reversed while editing, bold+underlined when just
+            // focused.
+            let col_style = |col: Column, base: Style| -> Style {
+                if on_cursor_row && state.focused_column() == col {
+                    if state.editing {
+                        base.add_modifier(Modifier::REVERSED)
+                    } else {
+                        base.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                    }
+                } else {
+                    base
+                }
             };
+
+            let check_base = if row.include {
+                Style::default().fg(tc(THEME_OK))
+            } else {
+                Style::default().fg(dim)
+            };
+            let check_txt = if row.include { "[x]" } else { "[ ]" };
+
+            // Name: show the live edit buffer when this row's Name is editing.
+            let name_txt = if on_cursor_row
+                && state.editing
+                && state.focused_column() == Column::Name
+            {
+                state
+                    .text_edit
+                    .as_ref()
+                    .map(|b| b.value())
+                    .unwrap_or_else(|| row.spec.name.clone())
+            } else {
+                row.spec.name.clone()
+            };
+            let name_base = if row.include {
+                Style::default().fg(accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(dim)
+            };
+
+            let model_txt = row.spec.model.clone().unwrap_or_else(|| "(default)".to_string());
             let deps = if row.spec.depends_on.is_empty() {
                 "-".to_string()
             } else {
                 row.spec.depends_on.join(",")
             };
-            let name_style = if row.include {
-                Style::default().fg(accent).add_modifier(Modifier::BOLD)
+            let writable = if row.spec.writable.is_empty() {
+                "-".to_string()
             } else {
-                Style::default().fg(dim)
+                row.spec.writable.join(",")
             };
+
             ListItem::new(Line::from(vec![
                 Span::raw(marker),
-                check,
-                Span::styled(format!(" {:<16}", row.spec.name), name_style),
                 Span::styled(
-                    format!("agents:{:<3} ", row.spec.agents),
-                    Style::default().fg(dim),
+                    fit(check_txt, Column::Include.width()),
+                    col_style(Column::Include, check_base),
                 ),
                 Span::styled(
-                    format!("work:{:<3} ", row.spec.planned_work.len()),
-                    Style::default().fg(dim),
+                    fit(&name_txt, Column::Name.width()),
+                    col_style(Column::Name, name_base),
                 ),
-                Span::styled(format!("deps:{:<12} ", deps), Style::default().fg(dim)),
-                Span::styled(row.spec.writable.join(","), Style::default().fg(dim)),
+                Span::styled(
+                    fit(&model_txt, Column::Model.width()),
+                    col_style(Column::Model, Style::default().fg(dim)),
+                ),
+                Span::styled(
+                    fit(&row.spec.agents.to_string(), Column::Agents.width()),
+                    col_style(Column::Agents, Style::default().fg(dim)),
+                ),
+                Span::styled(
+                    fit(&row.spec.planned_work.len().to_string(), Column::Work.width()),
+                    col_style(Column::Work, Style::default().fg(dim)),
+                ),
+                Span::styled(
+                    fit(&deps, Column::Deps.width()),
+                    col_style(Column::Deps, Style::default().fg(dim)),
+                ),
+                Span::styled(
+                    fit(&writable, Column::Writable.width()),
+                    col_style(Column::Writable, Style::default().fg(dim)),
+                ),
             ]))
         })
         .collect();
     // Content area (chunks[1]) depends on the active sub-screen.
     match state.view {
         BiplaneView::Domains => {
-            let list = List::new(items).block(
+            // A header row above the list, using the SAME fixed widths so the
+            // labels sit exactly over their columns. The focused column's
+            // header is highlighted so it's obvious which column is active.
+            let header_row = Line::from(vec![
+                Span::raw("  "), // aligns under the ▶ marker gutter
+                Span::styled(
+                    fit("inc", Column::Include.width()),
+                    col_header_style(state, Column::Include, dim),
+                ),
+                Span::styled(
+                    fit("name", Column::Name.width()),
+                    col_header_style(state, Column::Name, dim),
+                ),
+                Span::styled(
+                    fit("model", Column::Model.width()),
+                    col_header_style(state, Column::Model, dim),
+                ),
+                Span::styled(
+                    fit("agents", Column::Agents.width()),
+                    col_header_style(state, Column::Agents, dim),
+                ),
+                Span::styled(
+                    fit("work", Column::Work.width()),
+                    col_header_style(state, Column::Work, dim),
+                ),
+                Span::styled(
+                    fit("deps", Column::Deps.width()),
+                    col_header_style(state, Column::Deps, dim),
+                ),
+                Span::styled(
+                    fit("writable", Column::Writable.width()),
+                    col_header_style(state, Column::Writable, dim),
+                ),
+            ]);
+            // Split the domains area into a 1-line header and the list below.
+            let dom_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(2), Constraint::Min(1)])
+                .split(chunks[1]);
+            let header_para = Paragraph::new(header_row).block(
                 Block::default()
-                    .borders(Borders::ALL)
+                    .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
                     .title(" Domains ")
                     .border_style(Style::default().fg(accent)),
             );
-            f.render_widget(list, chunks[1]);
+            f.render_widget(header_para, dom_chunks[0]);
+            let list = List::new(items).block(
+                Block::default()
+                    .borders(Borders::BOTTOM | Borders::LEFT | Borders::RIGHT)
+                    .border_style(Style::default().fg(accent)),
+            );
+            f.render_widget(list, dom_chunks[1]);
         }
         BiplaneView::Project => {
             let (title, body): (&str, String) = match state.project_pane {
@@ -700,7 +1635,15 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
     // Footer — hint depends on the active view so keys shown are the live ones.
     let default_hint = match state.view {
         BiplaneView::Domains => {
-            "↑↓ move  space include  ←→ agents  [ ] budget  K/J reorder  G generate  T project  s save  ? help  q quit"
+            if state.model_overlay.is_some() {
+                "picking model — type to filter   Tab free-only   ↑↓ PgUp/PgDn move   Enter select   Esc cancel"
+            } else if state.list_editor.is_some() {
+                "list editor — ↑↓ move   a add   e edit   d delete   Esc save & close"
+            } else if state.editing {
+                "editing — type/adjust value   e/Enter commit   Esc cancel"
+            } else {
+                "↑↓ row  ←→ column  e edit  [ ] budget  K/J reorder  G generate  T project  s save  ? help  q quit"
+            }
         }
         BiplaneView::Project => "↑↓ scroll  V switch pane  G generate  T domains  s save  ? help  q quit",
     };
@@ -718,6 +1661,13 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
     // Help overlay: drawn last so it sits on top of everything.
     if state.show_help {
         render_help_overlay(f, accent, dim);
+    }
+    // Model picker overlay and list editor sit on top of the domain view.
+    if state.model_overlay.is_some() {
+        render_model_overlay(f, state, accent, dim);
+    }
+    if state.list_editor.is_some() {
+        render_list_editor(f, state, accent, dim);
     }
 }
 
@@ -760,8 +1710,12 @@ fn render_help_overlay(
         Line::from(""),
         Line::from(Span::styled("Domains view", Style::default().fg(accent))),
         key("↑ ↓", "move the row cursor"),
-        key("space / Enter", "toggle whether the domain is included"),
-        key("← →", "decrease / increase this domain's agent count"),
+        key("← →", "move the COLUMN cursor (include/name/model/agents/...)"),
+        key("e", "edit the focused column"),
+        key("  toggle/name/agents", "edit inline (space, type, or ↑↓/digits)"),
+        key("  model", "opens a picker — type to filter, Tab free-only, ↑↓/PgUp/PgDn, Enter, Esc"),
+        key("  work/deps/writable", "opens a list editor — a add, e edit, d delete"),
+        key("space", "quick-toggle the include checkbox"),
         key("[ ]", "decrease / increase the overall agent budget"),
         key("K / J", "reorder the focused domain up / down"),
         Line::from(""),
@@ -787,6 +1741,218 @@ fn render_help_overlay(
         Block::default()
             .borders(Borders::ALL)
             .title(" Help ")
+            .border_style(Style::default().fg(accent)),
+    );
+    f.render_widget(para, popup);
+}
+
+/// The model picker overlay: a centered, scrollable window over the model
+/// catalog, filtered by the live search query and the "free models only"
+/// toggle. Shows a fixed window of entries around the selection with a scroll
+/// indicator, a search field at the top, and a free-only status line, so a
+/// long list (many opencode models) stays navigable.
+fn render_model_overlay(
+    f: &mut ratatui::Frame,
+    state: &BiplaneUiState,
+    accent: ratatui::style::Color,
+    dim: ratatui::style::Color,
+) {
+    use ratatui::layout::Rect;
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+
+    let Some(ov) = state.model_overlay.as_ref() else {
+        return;
+    };
+    let area = f.area();
+    let w = 60u16.min(area.width.saturating_sub(4));
+    let h = 18u16.min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+
+    // Resolve the FILTERED view (indices into the raw catalog). The overlay's
+    // selection/scroll live in this filtered coordinate space.
+    let filtered = state.filtered_model_indices();
+    let total = filtered.len();
+    // visible rows: subtract top search field + free-only line + bottom hint
+    // (3 fixed lines) and the 2 border rows.
+    let visible = (h as usize).saturating_sub(5).max(1);
+    let start = ov.scroll.min(total.saturating_sub(1));
+    let end = (start + visible).min(total);
+
+    // Top: the live search field, with a caret so the user can see input focus.
+    let query_display = if state.model_query.is_empty() {
+        "(type to filter)".to_string()
+    } else {
+        format!("{}▏", state.model_query)
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("  filter: ", Style::default().fg(dim)),
+        Span::styled(
+            query_display,
+            if state.model_query.is_empty() {
+                Style::default().fg(dim)
+            } else {
+                Style::default().fg(accent).add_modifier(Modifier::BOLD)
+            },
+        ),
+    ]));
+    // Free-only toggle status: shows ON/OFF and the size of the allowlist so
+    // the user knows whether the filter has teeth.
+    let free_label = if state.model_free_only {
+        "ON"
+    } else {
+        "OFF"
+    };
+    let free_style = if state.model_free_only {
+        Style::default().fg(accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(dim)
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  free-only: ", Style::default().fg(dim)),
+        Span::styled(format!("{free_label} "), free_style),
+        Span::styled(
+            format!("(Tab to toggle, {} known free)", state.free_models.len()),
+            Style::default().fg(dim),
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    let mut shown = 0;
+    for (idx, &real) in filtered[start..end].iter().enumerate() {
+        let real_idx = start + idx;
+        let name = state.models.get(real).map(|s| s.as_str()).unwrap_or("");
+        let selected = real_idx == ov.selected;
+        // Mark free models with a leading sigil so the user can spot them at a
+        // glance even when the free-only filter is off.
+        let is_free = state.free_models.iter().any(|f| f == name);
+        let tag = if real == 0 {
+            " " // "(default)" isn't a model entry, no free/paid marking
+        } else if is_free {
+            "✓"
+        } else {
+            " "
+        };
+        let style = if selected {
+            Style::default().fg(accent).add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(dim)
+        };
+        let marker = if selected { "›" } else { " " };
+        lines.push(Line::from(Span::styled(
+            format!("{marker} {tag} {name}"),
+            style,
+        )));
+        shown += 1;
+    }
+    if shown == 0 {
+        lines.push(Line::from(Span::styled(
+            "  (no matches — refine the filter or toggle free-only off)",
+            Style::default().fg(dim),
+        )));
+    }
+
+    lines.push(Line::from(Span::styled(
+        format!(
+            "  {}/{}   ↑↓ PgUp/PgDn move   Tab free-only   Enter select   Esc cancel",
+            if total == 0 { 0 } else { ov.selected + 1 },
+            total
+        ),
+        Style::default().fg(dim),
+    )));
+
+    f.render_widget(Clear, popup);
+    let para = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Select model ")
+            .border_style(Style::default().fg(accent)),
+    );
+    f.render_widget(para, popup);
+}
+
+/// The inline list editor overlay: shows the items of a work/deps/writable
+/// list with add/edit/remove, and a live text field while adding or editing an
+/// item.
+fn render_list_editor(
+    f: &mut ratatui::Frame,
+    state: &BiplaneUiState,
+    accent: ratatui::style::Color,
+    dim: ratatui::style::Color,
+) {
+    use ratatui::layout::Rect;
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+
+    let Some(le) = state.list_editor.as_ref() else {
+        return;
+    };
+    let area = f.area();
+    let w = 70u16.min(area.width.saturating_sub(4));
+    let h = 18u16.min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    if le.items.is_empty() && le.text_edit.is_none() {
+        lines.push(Line::from(Span::styled(
+            "  (no items — press a to add)",
+            Style::default().fg(dim),
+        )));
+    }
+    for (idx, item) in le.items.iter().enumerate() {
+        let focused = idx == le.cursor && le.text_edit.is_none();
+        // If editing THIS existing item, show the live buffer instead.
+        let text = if idx == le.cursor
+            && !le.adding
+            && let Some(b) = le.text_edit.as_ref()
+        {
+            format!("{}▏", b.value())
+        } else {
+            item.clone()
+        };
+        let style = if focused {
+            Style::default().fg(accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(dim)
+        };
+        let marker = if focused { "› " } else { "  " };
+        lines.push(Line::from(Span::styled(format!("{marker}{text}"), style)));
+    }
+    // A new item being added shows as a trailing live line.
+    if le.adding
+        && let Some(b) = le.text_edit.as_ref()
+    {
+        lines.push(Line::from(Span::styled(
+            format!("› {}▏", b.value()),
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::from(""));
+    let hint = if le.text_edit.is_some() {
+        "  type   Enter save item   Esc cancel item"
+    } else {
+        "  ↑↓ move   a add   e edit   d delete   Esc save & close"
+    };
+    lines.push(Line::from(Span::styled(hint, Style::default().fg(dim))));
+
+    f.render_widget(Clear, popup);
+    let para = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Edit {} ", le.col.label()))
             .border_style(Style::default().fg(accent)),
     );
     f.render_widget(para, popup);
@@ -845,6 +2011,392 @@ mod tests {
         // The `?` help overlay starts hidden; the input loop flips show_help.
         let s = state();
         assert!(!s.show_help);
+    }
+
+    // ---------------- column navigation + edit mode ----------------
+
+    #[test]
+    fn column_cursor_starts_on_include_and_navigates() {
+        let mut s = state();
+        assert_eq!(s.focused_column(), Column::Include);
+        s.col_right();
+        assert_eq!(s.focused_column(), Column::Name);
+        s.col_right();
+        assert_eq!(s.focused_column(), Column::Model);
+        s.col_left();
+        assert_eq!(s.focused_column(), Column::Name);
+    }
+
+    #[test]
+    fn column_cursor_clamps_at_ends() {
+        let mut s = state();
+        s.col_left(); // already at 0
+        assert_eq!(s.focused_column(), Column::Include);
+        for _ in 0..20 {
+            s.col_right();
+        }
+        assert_eq!(s.focused_column(), Column::Writable); // last column
+    }
+
+    #[test]
+    fn left_right_do_not_change_value_when_not_editing() {
+        // The reported bug: left/right must NOT change the agents count.
+        let mut s = state();
+        // Move column cursor to Agents.
+        while s.focused_column() != Column::Agents {
+            s.col_right();
+        }
+        let before = s.rows[s.cursor].spec.agents;
+        s.col_left();
+        s.col_right();
+        assert_eq!(
+            s.rows[s.cursor].spec.agents, before,
+            "navigating columns must not mutate the agent count"
+        );
+    }
+
+    #[test]
+    fn col_nav_is_inert_while_editing() {
+        let mut s = state();
+        while s.focused_column() != Column::Agents {
+            s.col_right();
+        }
+        s.toggle_edit();
+        assert!(s.editing);
+        let col = s.focused_column();
+        s.col_left();
+        s.col_right();
+        assert_eq!(s.focused_column(), col, "column cursor frozen while editing");
+    }
+
+    #[test]
+    fn edit_mode_agents_numeric() {
+        let mut s = state();
+        while s.focused_column() != Column::Agents {
+            s.col_right();
+        }
+        s.toggle_edit();
+        let start = s.rows[s.cursor].spec.agents;
+        s.adjust_agents(true);
+        assert_eq!(s.rows[s.cursor].spec.agents, start + 1);
+        s.set_agents_digit(5);
+        assert_eq!(s.rows[s.cursor].spec.agents, 5);
+        s.set_agents_digit(0); // clamps to at least 1
+        assert_eq!(s.rows[s.cursor].spec.agents, 1);
+    }
+
+    #[test]
+    fn edit_mode_model_selector_cycles_and_clears() {
+        let mut s = state().with_models(&["glm".to_string(), "opencode".to_string()]);
+        while s.focused_column() != Column::Model {
+            s.col_right();
+        }
+        s.toggle_edit();
+        // Catalog: ["(default)", "glm", "opencode"]. Start at (default) -> None.
+        assert!(s.rows[s.cursor].spec.model.is_none());
+        s.cycle_model(true);
+        assert_eq!(s.rows[s.cursor].spec.model.as_deref(), Some("glm"));
+        s.cycle_model(true);
+        assert_eq!(s.rows[s.cursor].spec.model.as_deref(), Some("opencode"));
+        s.cycle_model(true); // wraps to "(default)" -> None
+        assert!(s.rows[s.cursor].spec.model.is_none());
+    }
+
+    #[test]
+    fn edit_mode_name_text_commits_on_exit() {
+        let mut s = state();
+        while s.focused_column() != Column::Name {
+            s.col_right();
+        }
+        s.toggle_edit();
+        // Simulate typing a new name.
+        if let Some(b) = s.text_edit.as_mut() {
+            *b = crate::text_input::TextInput::with_text("renamed");
+        }
+        s.toggle_edit(); // commit
+        assert!(!s.editing);
+        assert_eq!(s.rows[s.cursor].spec.name, "renamed");
+    }
+
+    #[test]
+    fn edit_mode_name_cancel_discards() {
+        let mut s = state();
+        let original = s.rows[s.cursor].spec.name.clone();
+        while s.focused_column() != Column::Name {
+            s.col_right();
+        }
+        s.toggle_edit();
+        if let Some(b) = s.text_edit.as_mut() {
+            *b = crate::text_input::TextInput::with_text("throwaway");
+        }
+        s.cancel_edit();
+        assert!(!s.editing);
+        assert_eq!(s.rows[s.cursor].spec.name, original, "cancel discards edit");
+    }
+
+    #[test]
+    fn list_columns_are_not_inline_editable() {
+        // Landing on a List column and pressing 'e' opens the LIST EDITOR now
+        // (not inline editing) -- so state.editing stays false but the editor
+        // is open.
+        let mut s = state();
+        while s.focused_column() != Column::Writable {
+            s.col_right();
+        }
+        s.toggle_edit();
+        assert!(!s.editing, "list columns don't use inline edit mode");
+        assert!(s.list_editor.is_some(), "list editor opens instead");
+    }
+
+    // ---------------- model overlay picker ----------------
+
+    #[test]
+    fn model_overlay_opens_on_current_and_commits() {
+        let mut s = state().with_models(&["glm".to_string(), "opencode".to_string()]);
+        while s.focused_column() != Column::Model {
+            s.col_right();
+        }
+        s.toggle_edit();
+        assert!(s.model_overlay.is_some(), "e opens the overlay on Model");
+        // Catalog: ["(default)","glm","opencode"], starts at (default)=index 0.
+        s.model_overlay_move(1, 10);
+        s.model_overlay_move(1, 10); // -> "opencode"
+        s.model_overlay_commit();
+        assert!(s.model_overlay.is_none(), "commit closes the overlay");
+        assert_eq!(s.rows[s.cursor].spec.model.as_deref(), Some("opencode"));
+    }
+
+    #[test]
+    fn model_overlay_cancel_leaves_value_unchanged() {
+        let mut s = state().with_models(&["glm".to_string()]);
+        while s.focused_column() != Column::Model {
+            s.col_right();
+        }
+        s.toggle_edit();
+        s.model_overlay_move(1, 10); // would pick glm
+        s.model_overlay_cancel();
+        assert!(s.model_overlay.is_none());
+        assert!(s.rows[s.cursor].spec.model.is_none(), "cancel keeps default");
+    }
+
+    #[test]
+    fn model_overlay_move_clamps_and_scrolls() {
+        let many: Vec<String> = (0..30).map(|i| format!("m{i}")).collect();
+        let mut s = state().with_models(&many);
+        while s.focused_column() != Column::Model {
+            s.col_right();
+        }
+        s.toggle_edit();
+        // Move way down; selection clamps to last, scroll follows.
+        s.model_overlay_move(1000, 10);
+        let ov = s.model_overlay.as_ref().unwrap();
+        assert_eq!(ov.selected, s.models.len() - 1);
+        assert!(ov.scroll <= ov.selected);
+        assert!(ov.selected < ov.scroll + 10, "selection within window");
+    }
+
+    #[test]
+    fn model_overlay_search_filters_and_keeps_default() {
+        // Catalog: ["(default)", "openrouter/glm", "openrouter/llama", "anthropic/claude"]
+        let mut s = state().with_models(&[
+            "openrouter/glm".to_string(),
+            "openrouter/llama".to_string(),
+            "anthropic/claude".to_string(),
+        ]);
+        while s.focused_column() != Column::Model {
+            s.col_right();
+        }
+        s.toggle_edit();
+        // No query: all four entries visible (default + 3 models).
+        assert_eq!(s.filtered_model_indices().len(), 4);
+        // Type "llama": only "(default)" and "openrouter/llama" remain
+        // ("(default)" is always kept so the user can clear the override).
+        s.model_overlay_type('l');
+        s.model_overlay_type('l');
+        s.model_overlay_type('a');
+        s.model_overlay_type('m');
+        s.model_overlay_type('a');
+        let filtered = s.filtered_model_indices();
+        assert_eq!(filtered.len(), 2, "query keeps default + matching model");
+        assert_eq!(filtered[0], 0, "default always first");
+        assert_eq!(s.models[filtered[1]], "openrouter/llama");
+        // Selection reset to 0 when the query changed.
+        assert_eq!(s.model_overlay.as_ref().unwrap().selected, 0);
+        // Committing picks the match.
+        s.model_overlay_move(1, 10);
+        s.model_overlay_commit();
+        assert_eq!(s.rows[s.cursor].spec.model.as_deref(), Some("openrouter/llama"));
+    }
+
+    #[test]
+    fn model_overlay_search_is_case_insensitive() {
+        let mut s = state().with_models(&["OpenRouter/GLM".to_string()]);
+        while s.focused_column() != Column::Model {
+            s.col_right();
+        }
+        s.toggle_edit();
+        s.model_overlay_type('g');
+        s.model_overlay_type('l');
+        s.model_overlay_type('m');
+        assert_eq!(s.filtered_model_indices().len(), 2); // default + match
+        s.model_overlay_move(1, 10);
+        s.model_overlay_commit();
+        assert_eq!(s.rows[s.cursor].spec.model.as_deref(), Some("OpenRouter/GLM"));
+    }
+
+    #[test]
+    fn model_overlay_backspace_shortens_query() {
+        let mut s = state().with_models(&["alpha".to_string(), "zeta".to_string()]);
+        while s.focused_column() != Column::Model {
+            s.col_right();
+        }
+        s.toggle_edit();
+        // Catalog: ["(default)", "alpha", "zeta"]. Query "z" matches only
+        // "zeta" (plus the always-kept default) -> 2 visible.
+        s.model_overlay_type('z');
+        assert_eq!(s.filtered_model_indices().len(), 2);
+        s.model_overlay_backspace(); // query empty again -> all visible
+        assert_eq!(s.filtered_model_indices().len(), 3);
+    }
+
+    #[test]
+    fn model_overlay_free_only_toggle_hides_paid() {
+        // Catalog: ["(default)", "free-a", "paid-b"]; free_models = ["free-a"].
+        let mut s = state()
+            .with_models(&["free-a".to_string(), "paid-b".to_string()])
+            .with_free_models(&["free-a".to_string()]);
+        while s.focused_column() != Column::Model {
+            s.col_right();
+        }
+        s.toggle_edit();
+        // Off: everything visible.
+        assert_eq!(s.filtered_model_indices().len(), 3);
+        s.model_overlay_toggle_free_only();
+        // On: "(default)" still shown, "paid-b" hidden, "free-a" kept.
+        let filtered = s.filtered_model_indices();
+        assert_eq!(filtered.len(), 2, "free-only hides paid models, keeps default");
+        assert_eq!(filtered[0], 0);
+        assert_eq!(s.models[filtered[1]], "free-a");
+        // Selection reset to 0 on the toggle.
+        assert_eq!(s.model_overlay.as_ref().unwrap().selected, 0);
+        // Select "free-a" and commit.
+        s.model_overlay_move(1, 10);
+        s.model_overlay_commit();
+        assert_eq!(s.rows[s.cursor].spec.model.as_deref(), Some("free-a"));
+    }
+
+    #[test]
+    fn model_overlay_open_clears_query_but_preserves_free_only() {
+        let mut s = state()
+            .with_models(&["free-a".to_string(), "paid-b".to_string()])
+            .with_free_models(&["free-a".to_string()]);
+        while s.focused_column() != Column::Model {
+            s.col_right();
+        }
+        s.toggle_edit();
+        s.model_overlay_toggle_free_only(); // ON
+        s.model_overlay_type('x'); // no matches
+        s.model_overlay_cancel();
+        // Reopen: query should be cleared, but free-only preference persists.
+        s.toggle_edit();
+        assert_eq!(s.model_query, "", "query cleared on reopen");
+        assert!(s.model_free_only, "free-only preference persists");
+        // With free-only on and empty query, "(default)" + "free-a" visible.
+        assert_eq!(s.filtered_model_indices().len(), 2);
+    }
+
+    #[test]
+    fn model_overlay_open_resolves_current_model_in_filtered_view() {
+        // Row already has a free model assigned; with free_only on, the overlay
+        // should still open on that model (it's visible in the filtered view).
+        let mut s = state()
+            .with_models(&["free-a".to_string(), "paid-b".to_string()])
+            .with_free_models(&["free-a".to_string()]);
+        s.model_free_only = true;
+        s.rows[s.cursor].spec.model = Some("free-a".to_string());
+        while s.focused_column() != Column::Model {
+            s.col_right();
+        }
+        s.toggle_edit();
+        // filtered = [0="(default)", 1="free-a"]; "free-a" is at filtered idx 1.
+        assert_eq!(s.filtered_model_indices(), vec![0, 1]);
+        assert_eq!(s.model_overlay.as_ref().unwrap().selected, 1);
+    }
+
+    #[test]
+    fn model_overlay_no_matches_still_commits_default() {
+        let mut s = state().with_models(&["alpha".to_string()]);
+        while s.focused_column() != Column::Model {
+            s.col_right();
+        }
+        s.toggle_edit();
+        // Type a query that matches nothing (except "(default)" which is always
+        // kept). Selection stays at 0 -> "(default)" -> clears the override.
+        s.model_overlay_type('z');
+        assert_eq!(s.filtered_model_indices(), vec![0]);
+        s.model_overlay_commit();
+        assert!(s.rows[s.cursor].spec.model.is_none(), "default clears override");
+    }
+
+    // ---------------- inline list editor ----------------
+
+    #[test]
+    fn list_editor_add_edit_remove_commit() {
+        let mut s = state();
+        while s.focused_column() != Column::Writable {
+            s.col_right();
+        }
+        let before = s.rows[s.cursor].spec.writable.clone();
+        s.toggle_edit(); // opens list editor with existing writable globs
+        // Add a new item.
+        s.list_editor_add();
+        if let Some(le) = s.list_editor.as_mut() {
+            *le.text_edit.as_mut().unwrap() =
+                crate::text_input::TextInput::with_text("newdir/**");
+        }
+        s.list_editor_commit_item();
+        // Commit the whole list back.
+        s.list_editor_commit();
+        assert!(s.list_editor.is_none());
+        assert_eq!(
+            s.rows[s.cursor].spec.writable.len(),
+            before.len() + 1,
+            "added one writable glob"
+        );
+        assert!(s.rows[s.cursor].spec.writable.contains(&"newdir/**".to_string()));
+    }
+
+    #[test]
+    fn list_editor_remove_item() {
+        let mut s = state();
+        while s.focused_column() != Column::Writable {
+            s.col_right();
+        }
+        s.toggle_edit();
+        let n = s.list_editor.as_ref().unwrap().items.len();
+        if n > 0 {
+            s.list_editor_remove();
+            assert_eq!(s.list_editor.as_ref().unwrap().items.len(), n - 1);
+        }
+    }
+
+    #[test]
+    fn list_editor_edits_deps_from_domain_column() {
+        let mut s = state();
+        while s.focused_column() != Column::Deps {
+            s.col_right();
+        }
+        s.toggle_edit();
+        assert!(s.list_editor.is_some());
+        assert_eq!(s.list_editor.as_ref().unwrap().col, Column::Deps);
+    }
+
+    #[test]
+    fn fit_pads_and_truncates() {
+        assert_eq!(fit("ab", 5), "ab   ");
+        assert_eq!(fit("abcde", 5), "abcde");
+        assert_eq!(fit("abcdef", 5), "abcd…");
+        assert_eq!(fit("", 3), "   ");
     }
 
     #[test]

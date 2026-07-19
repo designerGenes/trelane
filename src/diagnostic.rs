@@ -22,21 +22,28 @@ pub const THEME_DIM: (u8, u8, u8) = (0x6b, 0x72, 0x80);
 pub const THEME_OK: (u8, u8, u8) = (0x22, 0xc5, 0x5e);
 pub const THEME_WARN: (u8, u8, u8) = (0xef, 0x44, 0x44);
 
+/// Maximum number of messages rendered in the Messages tab. The full log is
+/// queryable via the CLI; this cap keeps the TUI responsive on sessions with
+/// thousands of messages (each row is a `Line` allocation per frame).
+pub const MESSAGES_MAX_DISPLAY: usize = 500;
+
 /// Which top-level panel is focused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Overview,
     Agents,
+    Messages,
     Config,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 3] = [Tab::Overview, Tab::Agents, Tab::Config];
+    pub const ALL: [Tab; 4] = [Tab::Overview, Tab::Agents, Tab::Messages, Tab::Config];
 
     pub fn title(&self) -> &'static str {
         match self {
             Tab::Overview => "Overview",
             Tab::Agents => "Agents",
+            Tab::Messages => "Messages",
             Tab::Config => "Config",
         }
     }
@@ -82,6 +89,12 @@ pub struct DiagnosticState {
     /// Agent name -> its edited model, for agents whose model was changed in
     /// this session but not yet saved. Empty when nothing is pending.
     pub pending_models: std::collections::HashMap<String, String>,
+    /// Live snapshot of the project's message queue, newest first. Refreshed
+    /// by `refresh_messages` on each poll of the run loop so new submissions
+    /// appear without a reload. Capped at `MESSAGES_MAX_DISPLAY` rows to keep
+    /// rendering snappy on long-lived sessions; the full log is available via
+    /// the CLI.
+    pub messages: Vec<crate::models::Message>,
     /// Cursor row within the currently focused list/form.
     pub cursor: usize,
     /// True once any config field has been edited since load.
@@ -183,6 +196,7 @@ impl DiagnosticState {
             fields: Self::fields_from_config(config),
             models,
             pending_models: std::collections::HashMap::new(),
+            messages: Vec::new(),
             cursor: 0,
             dirty: false,
             models_dirty: false,
@@ -198,6 +212,26 @@ impl DiagnosticState {
     pub fn with_health(mut self, health: SessionHealth) -> Self {
         self.health = Some(health);
         self
+    }
+
+    /// Attach the initial message-queue snapshot for the Messages tab. Kept
+    /// separate from `new` so callers without a live connection (e.g. unit
+    /// tests) still compile. Chainable. `refresh_messages` is the live-update
+    /// counterpart used by the run loop.
+    pub fn with_messages(mut self, messages: Vec<crate::models::Message>) -> Self {
+        self.messages = cap_newest_first(messages);
+        self
+    }
+
+    /// Refresh `self.messages` from the database, newest first. Preserves the
+    /// cursor when possible (clamps if the list shrank). Called by the run
+    /// loop on every poll so new submissions appear live without a reload.
+    /// Pure with respect to the `Connection` — no terminal I/O.
+    pub fn refresh_messages(&mut self, conn: &rusqlite::Connection) -> Result<()> {
+        let all = crate::store::get_history(conn, None, false)?;
+        self.messages = cap_newest_first(all);
+        self.clamp_cursor();
+        Ok(())
     }
 
     /// Index of a model name in the catalog, defaulting to 0 ("(default)")
@@ -255,6 +289,7 @@ impl DiagnosticState {
         match self.tab {
             Tab::Overview => 0,
             Tab::Agents => self.agents.len(),
+            Tab::Messages => self.messages.len(),
             Tab::Config => self.fields.len(),
         }
     }
@@ -295,6 +330,7 @@ impl DiagnosticState {
     /// - Config: adjust the focused field's value
     /// - Agents: cycle the focused agent's model
     /// - Overview: switch tabs (a common TUI convenience)
+    /// - Messages: no-op (navigation is up/down only)
     pub fn adjust_left(&mut self) {
         match self.tab {
             Tab::Config => {
@@ -306,6 +342,7 @@ impl DiagnosticState {
             }
             Tab::Agents => self.cycle_agent_model(false),
             Tab::Overview => self.prev_tab(),
+            Tab::Messages => {}
         }
     }
 
@@ -320,6 +357,7 @@ impl DiagnosticState {
             }
             Tab::Agents => self.cycle_agent_model(true),
             Tab::Overview => self.next_tab(),
+            Tab::Messages => {}
         }
     }
 
@@ -445,9 +483,14 @@ fn gather_state(ctx: &crate::Context) -> Result<DiagnosticState> {
     };
     let health = SessionHealth::from_rows(&rows, entropy);
 
+    // Load the initial message-queue snapshot so the Messages tab has content
+    // on first render. The run loop refreshes it on every poll thereafter.
+    let messages = crate::store::get_history(&ctx.conn, None, false).unwrap_or_default();
+
     Ok(
         DiagnosticState::new(project, session_line, rows, deadlock, &ctx.config)
-            .with_health(health),
+            .with_health(health)
+            .with_messages(messages),
     )
 }
 
@@ -468,6 +511,11 @@ fn run_loop(ctx: &crate::Context, state: &mut DiagnosticState) -> Result<()> {
 
     let outcome = (|| -> Result<()> {
         loop {
+            // Live refresh: pull the latest message queue from the DB on every
+            // poll cycle so new submissions appear without a reload. Best-effort
+            // -- a transient DB error just leaves the stale snapshot in place
+            // rather than killing the TUI.
+            let _ = state.refresh_messages(&ctx.conn);
             terminal.draw(|f| render(f, state))?;
             if event::poll(Duration::from_millis(250))? {
                 if let Event::Key(key) = event::read()? {
@@ -576,6 +624,17 @@ fn confirm_and_kill<B: ratatui::backend::Backend>(
 
 pub fn theme_color(rgb: (u8, u8, u8)) -> ratatui::style::Color {
     ratatui::style::Color::Rgb(rgb.0, rgb.1, rgb.2)
+}
+
+/// Reverse to newest-first and cap at `MESSAGES_MAX_DISPLAY`. `get_history`
+/// returns ascending (oldest first); the Messages tab shows the most recent
+/// activity at the top, so we reverse and then trim to the cap. Pure.
+fn cap_newest_first(mut messages: Vec<crate::models::Message>) -> Vec<crate::models::Message> {
+    messages.reverse();
+    if messages.len() > MESSAGES_MAX_DISPLAY {
+        messages.truncate(MESSAGES_MAX_DISPLAY);
+    }
+    messages
 }
 
 fn render(f: &mut ratatui::Frame, state: &DiagnosticState) {
@@ -741,6 +800,9 @@ fn render(f: &mut ratatui::Frame, state: &DiagnosticState) {
             );
             f.render_widget(list, chunks[1]);
         }
+        Tab::Messages => {
+            render_messages_tab(f, state, chunks[1], accent, dim);
+        }
         Tab::Config => {
             let items: Vec<ListItem> = state
                 .fields
@@ -776,6 +838,7 @@ fn render(f: &mut ratatui::Frame, state: &DiagnosticState) {
     let status = state.status.clone().unwrap_or_else(|| match state.tab {
         Tab::Config => "←→ adjust   space toggle   s save".to_string(),
         Tab::Agents => "↑↓ select   ←→ change model   s save".to_string(),
+        Tab::Messages => "↑↓ scroll   Tab to switch views   live refresh".to_string(),
         Tab::Overview => "Tab to switch views".to_string(),
     });
     let footer = Paragraph::new(Line::from(Span::styled(status, Style::default().fg(dim)))).block(
@@ -784,6 +847,226 @@ fn render(f: &mut ratatui::Frame, state: &DiagnosticState) {
             .border_style(Style::default().fg(dim)),
     );
     f.render_widget(footer, chunks[2]);
+}
+
+/// Render the Messages tab: a scrollable list of message rows (newest first)
+/// on top, and a detail pane for the focused message below. The list shows a
+/// compact one-line summary per message; the detail pane shows the full body,
+/// paths, threading, and timestamps.
+fn render_messages_tab(
+    f: &mut ratatui::Frame,
+    state: &DiagnosticState,
+    area: ratatui::layout::Rect,
+    accent: ratatui::style::Color,
+    dim: ratatui::style::Color,
+) {
+    use ratatui::prelude::*;
+    use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+
+    // Split the body into a list (top ~60%) and a detail pane (bottom ~40%).
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(60), Constraint::Min(8)])
+        .split(area);
+
+    let warn = theme_color(THEME_WARN);
+    let ok = theme_color(THEME_OK);
+
+    // ---- message list ----
+    let items: Vec<ListItem> = if state.messages.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "  (no messages — the queue is empty)",
+            Style::default().fg(dim),
+        )))]
+    } else {
+        state
+            .messages
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let focused = i == state.cursor;
+                let marker = if focused { "▶ " } else { "  " };
+                // ● = unprocessed (pending action), ○ = processed (done).
+                let dot = if m.processed_at.is_some() {
+                    Span::styled("○", Style::default().fg(dim))
+                } else {
+                    Span::styled("●", Style::default().fg(ok))
+                };
+                let time = format_time(&m.created_at);
+                // Bulletin messages show the scope as the destination; direct
+                // messages show the recipient agent.
+                let dest = if m.channel == "bulletin" {
+                    m.scope
+                        .as_deref()
+                        .map(|s| format!("▾{s}"))
+                        .unwrap_or_else(|| "▾bulletin".to_string())
+                } else {
+                    m.to.clone()
+                };
+                let urgency_style = if m.urgency == "high" || m.urgency == "critical" {
+                    Style::default().fg(warn).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(dim)
+                };
+                let row_style = if focused {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                let line = Line::from(vec![
+                    Span::styled(marker, row_style),
+                    dot,
+                    Span::raw(format!(" {time} ")),
+                    Span::styled(format!("{:>10}", &m.from), Style::default().fg(accent)),
+                    Span::raw(" → "),
+                    Span::styled(format!("{:<14}", dest), Style::default().fg(accent)),
+                    Span::styled(format!(" {:<7}", &m.msg_type), urgency_style),
+                    Span::raw(truncate(&m.subject, 40)),
+                ]);
+                ListItem::new(line).style(row_style)
+            })
+            .collect()
+    };
+    let title = format!(
+        " Messages ({} — newest first, live) ",
+        state.messages.len()
+    );
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(accent)),
+    );
+    f.render_widget(list, body[0]);
+
+    // ---- detail pane ----
+    let detail_lines = match state.messages.get(state.cursor) {
+        None => vec![Line::from(Span::styled(
+            "  (select a message above to see its details)",
+            Style::default().fg(dim),
+        ))],
+        Some(m) => {
+            let dest = if m.channel == "bulletin" {
+                format!("bulletin:{}", m.scope.as_deref().unwrap_or("?"))
+            } else {
+                m.to.clone()
+            };
+            let processed = m
+                .processed_at
+                .clone()
+                .unwrap_or_else(|| "— (pending)".to_string());
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled("From:        ", Style::default().fg(dim)),
+                    Span::styled(m.from.clone(), Style::default().fg(accent)),
+                    Span::raw("    "),
+                    Span::styled("To: ", Style::default().fg(dim)),
+                    Span::styled(dest, Style::default().fg(accent)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Type:        ", Style::default().fg(dim)),
+                    Span::raw(&m.msg_type),
+                    Span::raw("    "),
+                    Span::styled("Urgency: ", Style::default().fg(dim)),
+                    Span::styled(&m.urgency, Style::default().fg(accent)),
+                    Span::raw("    "),
+                    Span::styled("Channel: ", Style::default().fg(dim)),
+                    Span::raw(&m.channel),
+                ]),
+                Line::from(vec![
+                    Span::styled("Created:     ", Style::default().fg(dim)),
+                    Span::raw(&m.created_at),
+                ]),
+                Line::from(vec![
+                    Span::styled("Processed:   ", Style::default().fg(dim)),
+                    Span::raw(processed),
+                ]),
+                Line::from(vec![
+                    Span::styled("ID:          ", Style::default().fg(dim)),
+                    Span::raw(&m.id),
+                ]),
+            ];
+            if let Some(re) = &m.re {
+                lines.push(Line::from(vec![
+                    Span::styled("Re:          ", Style::default().fg(dim)),
+                    Span::raw(re),
+                ]));
+            }
+            if let Some(task) = &m.task {
+                lines.push(Line::from(vec![
+                    Span::styled("Task:        ", Style::default().fg(dim)),
+                    Span::raw(task),
+                ]));
+            }
+            if let Some(sup) = &m.supersedes {
+                lines.push(Line::from(vec![
+                    Span::styled("Supersedes:  ", Style::default().fg(dim)),
+                    Span::raw(sup),
+                ]));
+            }
+            if !m.paths.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("Paths:       ", Style::default().fg(dim)),
+                    Span::raw(m.paths.join(", ")),
+                ]));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "Subject:",
+                Style::default().fg(dim),
+            )));
+            lines.push(Line::from(m.subject.clone()));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("Body:", Style::default().fg(dim))));
+            // Split the body into one Line per source line so wrapping looks
+            // right for multi-paragraph messages; empty body gets a hint.
+            if m.body.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  (empty)",
+                    Style::default().fg(dim),
+                )));
+            } else {
+                for src_line in m.body.lines() {
+                    lines.push(Line::from(src_line.to_string()));
+                }
+            }
+            lines
+        }
+    };
+    let detail = Paragraph::new(detail_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Message Detail ")
+                .border_style(Style::default().fg(accent)),
+        )
+        .wrap(ratatui::widgets::Wrap { trim: false });
+    f.render_widget(detail, body[1]);
+}
+
+/// Extract the time portion (HH:MM:SS) from an ISO-8601 timestamp for compact
+/// row display. Falls back to the raw string (trimmed) if parsing fails, so
+/// non-standard timestamps still render without panicking.
+fn format_time(iso: &str) -> String {
+    // ISO-8601: 2025-07-18T10:32:15Z (or with offset). Take the 'T' as the
+    // separator; the time is what follows up to the timezone marker.
+    if let Some(rest) = iso.split('T').nth(1) {
+        let time = rest
+            .split(['+', '-', 'Z', '.'])
+            .next()
+            .unwrap_or(rest);
+        return time.to_string();
+    }
+    iso.chars().take(8).collect()
+}
+
+/// Truncate `s` to at most `max` chars, appending an ellipsis if it was cut.
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max.saturating_sub(1)])
+    }
 }
 
 fn render_kill_confirm(f: &mut ratatui::Frame) {
@@ -869,11 +1152,15 @@ mod tests {
         s.next_tab();
         assert_eq!(s.tab, Tab::Agents);
         s.next_tab();
+        assert_eq!(s.tab, Tab::Messages);
+        s.next_tab();
         assert_eq!(s.tab, Tab::Config);
         s.next_tab();
         assert_eq!(s.tab, Tab::Overview);
         s.prev_tab();
         assert_eq!(s.tab, Tab::Config);
+        s.prev_tab();
+        assert_eq!(s.tab, Tab::Messages);
     }
 
     #[test]
@@ -1198,5 +1485,186 @@ mod tests {
         let s = s.with_health(h);
         assert!(s.health.is_some());
         assert_eq!(s.health.as_ref().unwrap().running, 1); // alpha running, beta not
+    }
+
+    // --------------------------------------------------------- Messages tab
+
+    fn sample_messages() -> Vec<crate::models::Message> {
+        vec![
+            crate::models::Message {
+                id: "m1".into(),
+                from: "alpha".into(),
+                to: "beta".into(),
+                msg_type: "task".into(),
+                urgency: "normal".into(),
+                subject: "implement auth".into(),
+                body: "Please implement the auth module.".into(),
+                re: None,
+                task: Some("auth-module".into()),
+                paths: vec![],
+                created_at: "2025-07-18T10:30:00Z".into(),
+                schema: 1,
+                sig: "sig1".into(),
+                processed_at: None,
+                channel: "direct".into(),
+                scope: None,
+                supersedes: None,
+                tmp_version: "1.0".into(),
+                last_touched_at: "2025-07-18T10:30:00Z".into(),
+                archived_at: None,
+            },
+            crate::models::Message {
+                id: "m2".into(),
+                from: "beta".into(),
+                to: "alpha".into(),
+                msg_type: "reply".into(),
+                urgency: "high".into(),
+                subject: "re: implement auth".into(),
+                body: "Done — see PR #42.".into(),
+                re: Some("m1".into()),
+                task: None,
+                paths: vec!["src/auth/**".into()],
+                created_at: "2025-07-18T10:32:15Z".into(),
+                schema: 1,
+                sig: "sig2".into(),
+                processed_at: Some("2025-07-18T10:33:00Z".into()),
+                channel: "direct".into(),
+                scope: None,
+                supersedes: None,
+                tmp_version: "1.0".into(),
+                last_touched_at: "2025-07-18T10:33:00Z".into(),
+                archived_at: None,
+            },
+            crate::models::Message {
+                id: "m3".into(),
+                from: "gamma".into(),
+                to: "bulletin-board".into(),
+                msg_type: "note".into(),
+                urgency: "normal".into(),
+                subject: "status update".into(),
+                body: "API domain is unblocked.".into(),
+                re: None,
+                task: None,
+                paths: vec![],
+                created_at: "2025-07-18T10:35:00Z".into(),
+                schema: 1,
+                sig: "sig3".into(),
+                processed_at: None,
+                channel: "bulletin".into(),
+                scope: Some("api".into()),
+                supersedes: None,
+                tmp_version: "1.0".into(),
+                last_touched_at: "2025-07-18T10:35:00Z".into(),
+                archived_at: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn messages_tab_has_navigable_rows() {
+        let s = state_with_defaults().with_messages(sample_messages());
+        let mut s2 = s.clone();
+        s2.tab = Tab::Messages;
+        assert_eq!(s2.row_count(), 3, "3 messages -> 3 navigable rows");
+    }
+
+    #[test]
+    fn with_messages_reverses_to_newest_first() {
+        // get_history returns oldest-first (m1, m2, m3). The Messages tab
+        // shows newest-first, so with_messages should reverse to (m3, m2, m1).
+        let s = state_with_defaults().with_messages(sample_messages());
+        assert_eq!(s.messages.len(), 3);
+        assert_eq!(s.messages[0].id, "m3", "newest (m3) should be first");
+        assert_eq!(s.messages[2].id, "m1", "oldest (m1) should be last");
+    }
+
+    #[test]
+    fn messages_cursor_clamps_after_refresh_shrinks() {
+        let mut s = state_with_defaults().with_messages(sample_messages());
+        s.tab = Tab::Messages;
+        s.cursor = 2; // last row
+        // Simulate a refresh that returns fewer messages (e.g. archival).
+        s.messages = cap_newest_first(vec![sample_messages()[0].clone()]);
+        s.clamp_cursor();
+        assert_eq!(s.cursor, 0, "cursor clamped to 0 when list shrinks to 1");
+    }
+
+    #[test]
+    fn messages_cursor_preserved_when_refresh_grows() {
+        let mut s = state_with_defaults();
+        s.tab = Tab::Messages;
+        s.messages = cap_newest_first(vec![sample_messages()[0].clone()]);
+        s.cursor = 0;
+        // Refresh with the full set: cursor should stay at 0 (not reset).
+        s.messages = cap_newest_first(sample_messages());
+        s.clamp_cursor();
+        assert_eq!(s.cursor, 0, "cursor preserved across refresh");
+    }
+
+    #[test]
+    fn messages_cap_truncates_to_max_display() {
+        // Build MESSAGES_MAX_DISPLAY + 5 messages; the cap should trim to
+        // exactly MESSAGES_MAX_DISPLAY, keeping the newest ones.
+        let overflow: Vec<crate::models::Message> = (0..(MESSAGES_MAX_DISPLAY + 5))
+            .map(|i| crate::models::Message {
+                id: format!("m{i}"),
+                from: "x".into(),
+                to: "y".into(),
+                msg_type: "note".into(),
+                urgency: "normal".into(),
+                subject: format!("s{i}"),
+                body: String::new(),
+                re: None,
+                task: None,
+                paths: vec![],
+                created_at: format!("2025-07-18T10:{i:02}:00Z"),
+                schema: 1,
+                sig: "s".into(),
+                processed_at: None,
+                channel: "direct".into(),
+                scope: None,
+                supersedes: None,
+                tmp_version: "1.0".into(),
+                last_touched_at: String::new(),
+                archived_at: None,
+            })
+            .collect();
+        let s = state_with_defaults().with_messages(overflow);
+        assert_eq!(
+            s.messages.len(),
+            MESSAGES_MAX_DISPLAY,
+            "capped to MESSAGES_MAX_DISPLAY"
+        );
+        // Newest-first: the first entry should be the highest-numbered message.
+        assert_eq!(
+            s.messages[0].id,
+            format!("m{}", MESSAGES_MAX_DISPLAY + 4),
+            "newest message is first after cap"
+        );
+    }
+
+    #[test]
+    fn format_time_extracts_hms_from_iso() {
+        assert_eq!(format_time("2025-07-18T10:32:15Z"), "10:32:15");
+        assert_eq!(format_time("2025-07-18T10:32:15+02:00"), "10:32:15");
+        assert_eq!(format_time("2025-07-18T10:32:15.123Z"), "10:32:15");
+        // Non-ISO input falls back gracefully (first 8 chars).
+        assert_eq!(format_time("no-time-here"), "no-time-");
+    }
+
+    #[test]
+    fn truncate_shortens_with_ellipsis() {
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("exactly10!", 10), "exactly10!");
+        assert_eq!(truncate("this is too long", 10), "this is t…");
+    }
+
+    #[test]
+    fn messages_default_empty() {
+        let s = state_with_defaults();
+        assert!(s.messages.is_empty(), "no messages until attached");
+        let mut s2 = s.clone();
+        s2.tab = Tab::Messages;
+        assert_eq!(s2.row_count(), 0, "empty messages -> 0 rows");
     }
 }
