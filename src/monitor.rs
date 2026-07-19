@@ -85,55 +85,129 @@ impl AgentEvent {
 /// screen (fragmented, overlapping text -- exactly what a raw spinner replay
 /// looks like once it reaches a terminal that isn't expecting it).
 ///
-/// Recognized ANSI CSI (`ESC [ ... letter`) and OSC (`ESC ] ... BEL`)
-/// sequences are dropped in full, not left as visible bracket/digit debris.
-/// Any other C0 control byte (bare CR, stray NL, bell, etc.) becomes a
-/// single space, which preserves spacing without ever emitting a byte that
-/// can move a cursor.
+/// (TUI-001) This is a complete ANSI/VT state machine, not the partial
+/// ad-hoc parser that shipped before. It removes, per the remediation plan's
+/// boundary invariant:
+///   * CSI sequences (`ESC [ <params/intermediates> <final byte in
+///     0x40..=0x7E>`), e.g. `ESC [ 2 ~`, `ESC [ 1 @`, `ESC [ 32 m`.
+///   * OSC sequences (`ESC ] ...`), terminated by either BEL (`0x07`) or ST
+///     (`ESC \`) -- both terminators are fully consumed, not left as
+///     visible debris.
+///   * DCS / SOS / PM / APC string sequences (`ESC P`, `ESC X`, `ESC ^`,
+///     `ESC _`), each terminated by ST (`ESC \`).
+///   * Two-byte ESC sequences (`ESC <any other byte>`) -- cursor saves,
+///     index/next-line, charset shifts, etc. Both bytes are dropped.
+///   * C0 controls (`U+0000..U+001F`), DEL (`U+007F`), and C1 controls
+///     (`U+0080..U+009F`) -- every remaining `char::is_control()` byte --
+///     are replaced with a single space so spacing is preserved without
+///     ever emitting a byte that can move a cursor.
+///
+/// The output is guaranteed to contain only printable Unicode plus ordinary
+/// spaces: `sanitize(s).chars().all(|c| !c.is_control() && c != '\u{1b}')`.
 fn sanitize(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
         if c == '\u{1b}' {
-            match chars.peek() {
-                Some('[') => {
-                    // CSI: ESC [ <params/intermediates> <final-letter>.
-                    chars.next();
-                    for next in chars.by_ref() {
-                        if next.is_ascii_alphabetic() {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    // OSC: ESC ] ... terminated by BEL (or a following ESC,
-                    // left for the outer loop to consume on its own turn).
-                    chars.next();
-                    while let Some(&next) = chars.peek() {
-                        if next == '\u{7}' {
-                            chars.next();
-                            break;
-                        }
-                        if next == '\u{1b}' {
-                            break;
-                        }
-                        chars.next();
-                    }
-                }
-                _ => {
-                    // Unrecognized escape form: drop just the ESC byte so we
-                    // never silently swallow real content after it.
-                }
-            }
+            i = consume_escape(&chars, i, &mut out);
             continue;
         }
-        if (c as u32) < 0x20 || c as u32 == 0x7f {
+        if c.is_control() {
+            // C0 (incl. CR, LF, BEL), DEL, and C1 (U+0080..U+009F) all become
+            // a single space. char::is_control() covers all three ranges.
             out.push(' ');
+            i += 1;
             continue;
         }
         out.push(c);
+        i += 1;
     }
     out
+}
+
+/// Advance past one escape sequence starting at `chars[start]` (which is
+/// `ESC`). Returns the index of the next character to process. Any
+/// recognized sequence appends nothing to `out`; unrecognized forms drop
+/// only the ESC byte so real content after it is not silently swallowed.
+fn consume_escape(chars: &[char], start: usize, out: &mut String) -> usize {
+    let mut i = start;
+    // ESC alone at end of input: drop it.
+    if i + 1 >= chars.len() {
+        return i + 1;
+    }
+    let next = chars[i + 1];
+    i += 2; // past ESC and the introducer
+    match next {
+        // CSI: ESC [ <parameter/intermediate bytes> <final byte 0x40..0x7E>.
+        '[' => {
+            while i < chars.len() {
+                let b = chars[i];
+                i += 1;
+                let code = b as u32;
+                if (0x40..=0x7E).contains(&code) {
+                    break; // final byte consumed
+                }
+                if b == '\u{1b}' {
+                    // Embedded ESC: a new sequence is starting before the
+                    // CSI got its final byte. Back up so the outer loop
+                    // handles the ESC.
+                    i -= 1;
+                    break;
+                }
+                // Parameter (0x30..0x3F) and intermediate (0x20..0x2F)
+                // bytes are consumed silently. Anything else (e.g. an
+                // unexpected control) is consumed and the loop continues
+                // until a final byte or end of input.
+            }
+        }
+        // OSC: ESC ] ... terminated by BEL (0x07) or ST (ESC \).
+        ']' => {
+            while i < chars.len() {
+                let b = chars[i];
+                if b == '\u{7}' {
+                    i += 1; // consume BEL terminator
+                    break;
+                }
+                if b == '\u{1b}' {
+                    // Either ST (ESC \) or an embedded ESC starting a new
+                    // sequence.
+                    if i + 1 < chars.len() && chars[i + 1] == '\\' {
+                        i += 2; // consume ST
+                        break;
+                    }
+                    // ESC alone: leave it for the outer loop.
+                    break;
+                }
+                i += 1;
+            }
+        }
+        // DCS / SOS / PM / APC: terminated ONLY by ST (ESC \). Unlike OSC,
+        // BEL does NOT terminate these.
+        'P' | 'X' | '^' | '_' => {
+            while i < chars.len() {
+                let b = chars[i];
+                if b == '\u{1b}' {
+                    if i + 1 < chars.len() && chars[i + 1] == '\\' {
+                        i += 2; // consume ST
+                        break;
+                    }
+                    // ESC alone: leave it for the outer loop.
+                    break;
+                }
+                i += 1;
+            }
+        }
+        // Any other byte after ESC is a two-byte escape sequence
+        // (ESC =, ESC >, ESC D, ESC M, ESC E, ESC 7, ESC 8, ESC c, ...).
+        // Both bytes are already consumed by the initial `i += 2` above;
+        // nothing is appended.
+        _ => {}
+    }
+    // `out` is unchanged -- escape sequences produce no visible output.
+    let _ = out;
+    i
 }
 
 impl AgentEvent {
@@ -1029,40 +1103,17 @@ pub fn run_monitor(ctx: &Context) -> Result<()> {
     outcome
 }
 
-/// Redirect process stdout (fd 1) to a file for this guard's lifetime,
-/// restoring it on drop. Used so a background squire tick-loop's progress
-/// prints land in a session log instead of corrupting the monitor's screen
-/// (the monitor draws to /dev/tty, so it's unaffected by this redirect). Same
-/// technique as bench_ui's capture; see run_session.
-struct StdoutCapture {
-    saved_fd: i32,
-}
-
-impl StdoutCapture {
-    fn to_file(path: &std::path::Path) -> Self {
-        use std::os::unix::io::IntoRawFd;
-        let saved_fd = unsafe { libc::dup(libc::STDOUT_FILENO) };
-        if let Ok(file) = std::fs::File::create(path) {
-            let file_fd = file.into_raw_fd();
-            unsafe {
-                libc::dup2(file_fd, libc::STDOUT_FILENO);
-                libc::close(file_fd);
-            }
-        }
-        StdoutCapture { saved_fd }
-    }
-}
-
-impl Drop for StdoutCapture {
-    fn drop(&mut self) {
-        if self.saved_fd >= 0 {
-            unsafe {
-                libc::dup2(self.saved_fd, libc::STDOUT_FILENO);
-                libc::close(self.saved_fd);
-            }
-        }
-    }
-}
+/// Redirect process stdout (fd 1) AND stderr (fd 2) to a file for this
+/// guard's lifetime, restoring both on drop. Used so a background squire
+/// tick-loop's output lands in a session log instead of corrupting the
+/// monitor's screen (the monitor draws to /dev/tty, so it's unaffected by
+/// this redirect). See `tui_session::StdCapture` for the full rationale
+/// (TUI-003: exclusive terminal ownership).
+///
+/// This re-export exists so the call site stays readable; the actual
+/// implementation is shared with `bench_ui` so both entry points get the
+/// same flush-both, restore-both, fail-before-alt-screen semantics.
+pub(crate) use crate::tui_session::StdCapture;
 
 /// Run the squire tick-loop until `stop` is set. This is the ticking engine
 /// that launches agents on `interval_s`; it runs on a background thread under
@@ -1130,10 +1181,19 @@ pub fn run_session(ctx: &Context, launcher: Option<String>, verbose: bool) -> Re
     let interval_s = ctx.config.squire.interval_s;
     let stop = Arc::new(AtomicBool::new(false));
 
-    // Capture the squire thread's stdout to a session log for the UI's
-    // lifetime. The monitor is on /dev/tty, so this can't blank its screen.
+    // Capture the squire thread's stdout AND stderr to a session log for
+    // the UI's lifetime. The monitor is on /dev/tty, so this can't blank
+    // its screen -- and capturing stderr too stops the squire's eprintln!
+    // wake/skip lines from bleeding onto the TUI.
+    //
+    // TUI-003: capture setup must succeed BEFORE run_monitor enters the
+    // alternate screen. If the log can't be opened or either fd can't be
+    // dup'd we return the error here rather than continuing with a
+    // half-redirected terminal -- a partially-captured terminal leaves
+    // the background squire thread's writes able to corrupt the screen,
+    // which is exactly the bug this guard exists to prevent.
     let log_path = ctx.trelane_dir().join("session.log");
-    let capture = StdoutCapture::to_file(&log_path);
+    let capture = StdCapture::to_file(&log_path)?;
 
     // The squire loop needs its own Context (Connection isn't Sync). Open a
     // second one against the same root; SQLite handles the concurrent access.
@@ -1299,6 +1359,20 @@ fn render(f: &mut ratatui::Frame, state: &MonitorState) {
                     Span::styled(format!("{:<6}", ev.tag()), Style::default().fg(tag_color)),
                     Span::styled(truncate_to_width(&ev.body(), body_width), body_style),
                 ]));
+                // TUI-001 boundary assertion: the body of every rendered
+                // event must be free of ESC and other control bytes. This
+                // catches a regression where a new AgentEvent variant or a
+                // new parser path forgets to route through `sanitize` at
+                // ingestion time. Cheap (the slice is already truncated)
+                // and never trips in practice -- when it does, it means a
+                // bug, not a runtime condition, so `debug_assert!` is the
+                // right level.
+                debug_assert!(
+                    !ev.body().contains('\u{1b}')
+                        && ev.body().chars().all(|c| !c.is_control()),
+                    "rendered event body still contains control bytes: {:?}",
+                    ev.body()
+                );
             }
             if events.is_empty() {
                 lines.push(Line::from(Span::styled(
@@ -1650,6 +1724,131 @@ mod tests {
     fn sanitize_strips_osc_sequences() {
         // OSC 0 sets a terminal title, terminated by BEL.
         assert_eq!(sanitize("\x1b]0;window title\x07visible"), "visible");
+    }
+
+    // -------- TUI-001: extended coverage from the remediation plan --------
+
+    #[test]
+    fn sanitize_strips_csi_with_tilde_final() {
+        // ESC [ 2 ~ is the Insert key; the plan explicitly names it as a case
+        // the old parser mishandled (the `~` was left as visible debris
+        // because the loop only stopped on `is_ascii_alphabetic()`).
+        assert_eq!(sanitize("\x1b[2~"), "");
+        assert_eq!(sanitize("a\x1b[2~b"), "ab");
+    }
+
+    #[test]
+    fn sanitize_strips_csi_with_at_sign_final() {
+        // ESC [ 1 @ is the "insert character" CSI; `@` is 0x40, the low end
+        // of the final-byte range 0x40..=0x7E, which the old `is_ascii_alphabetic`
+        // test missed.
+        assert_eq!(sanitize("\x1b[1@"), "");
+        assert_eq!(sanitize("a\x1b[1@b"), "ab");
+    }
+
+    #[test]
+    fn sanitize_strips_osc_terminated_by_st() {
+        // ESC ] ... ESC \  -- the String Terminator variant. The plan
+        // explicitly requires both the ESC and the backslash to be consumed.
+        assert_eq!(sanitize("\x1b]0;title\x1b\\visible"), "visible");
+        // No leftover backslash anywhere in the output.
+        let out = sanitize("\x1b]11;rgb:00/00/00\x1b\\text");
+        assert!(!out.contains('\\'), "backslash survived: {out:?}");
+        assert_eq!(out, "text");
+    }
+
+    #[test]
+    fn sanitize_strips_dcs_string() {
+        // DCS (ESC P) is terminated only by ST (ESC \), never by BEL.
+        assert_eq!(sanitize("\x1bP1$qtbel-stays-as-data\x07\x1b\\after"), "after");
+    }
+
+    #[test]
+    fn sanitize_strips_apc_string() {
+        // APC (ESC _) is used by tmux for pass-through sequences.
+        assert_eq!(sanitize("\x1b_tmux-passthrough\x1b\\after"), "after");
+    }
+
+    #[test]
+    fn sanitize_strips_sos_and_pm_strings() {
+        // SOS (ESC X) and PM (ESC ^) share the DCS/APC termination rule.
+        assert_eq!(sanitize("\x1bXfoo\x1b\\after"), "after");
+        assert_eq!(sanitize("\x1b^bar\x1b\\after"), "after");
+    }
+
+    #[test]
+    fn sanitize_strips_two_byte_esc_sequences() {
+        // ESC 7 / ESC 8 (save/restore cursor), ESC M (reverse index), ESC c
+        // (full reset), ESC = / ESC > (keypad mode). All two-byte ESC <x>
+        // forms must drop both bytes.
+        assert_eq!(sanitize("\x1b7AB"), "AB");
+        assert_eq!(sanitize("A\x1b8B"), "AB");
+        assert_eq!(sanitize("A\x1bMB"), "AB");
+        assert_eq!(sanitize("\x1bc"), "");
+        assert_eq!(sanitize("\x1b=x"), "x");
+        assert_eq!(sanitize("\x1b>x"), "x");
+    }
+
+    #[test]
+    fn sanitize_replaces_c1_controls_with_space() {
+        // C1 controls (U+0080..U+009F) are invisible in many editors but
+        // some terminals still honor them as control bytes. The plan
+        // requires they be replaced with a space, not dropped.
+        let poisoned = "a\u{0085}b\u{0099}c\u{0084}d";
+        let out = sanitize(poisoned);
+        assert_eq!(out, "a b c d");
+    }
+
+    #[test]
+    fn sanitize_preserves_emoji_and_zwj_sequences() {
+        // Emoji and ZWJ sequences are not control characters -- they must
+        // survive intact (related to TUI-004's grapheme handling).
+        let s = "wave 👋 and family 👨‍👩‍👧 done";
+        assert_eq!(sanitize(s), s);
+    }
+
+    #[test]
+    fn sanitize_json_text_field_with_escaped_controls_is_safe() {
+        // The plan's acceptance test: a JSON text field containing escaped
+        // U+001B and U+000D is safe AFTER parse_line. parse_line decodes
+        // JSON unescaping (so `"\u001b"` becomes a real ESC byte) and then
+        // sanitizes; the resulting Text event body must have no ESC and no
+        // bare CR. The opencode stream-json "text" event carries the
+        // string under /part/text -- see part_text.
+        let line = r#"{"type":"text","part":{"type":"text","text":"hi\u001b[31mred\rthere"}}"#;
+        let evs = parse_line(line);
+        assert_eq!(evs.len(), 1);
+        let body = evs[0].body();
+        assert!(!body.contains('\u{1b}'), "ESC survived: {body:?}");
+        assert!(!body.contains('\r'), "bare CR survived: {body:?}");
+        assert!(body.contains("red"));
+        assert!(body.contains("there"));
+    }
+
+    #[test]
+    fn sanitize_fuzzed_output_has_no_control_bytes_or_esc() {
+        // The plan's invariant: for any input, sanitized output contains
+        // no ESC and no control characters. Run a quick deterministic fuzz
+        // over mixed-byte junk.
+        let cases = [
+            "\x1b[1;2;3mtext\x1b[0m\x1b]2;title\x07after",
+            "a\x1bb\x1bc\x1bd",
+            "\x1bPp\x1b\\\x1b]q\x07r",
+            "\r\r\r\x1b[H\x1b[2J\r",
+            "\u{0000}\u{0001}\u{007f}\u{0080}\u{009f}",
+            "mixed\x1b[?25l\x1b[?1006h\x1b[?1049hanimation",
+            "\x1b[38;2;255;0;0mred\x1b[39m",
+        ];
+        for case in cases {
+            let out = sanitize(case);
+            for c in out.chars() {
+                assert!(
+                    !c.is_control() && c != '\u{1b}',
+                    "control byte {:#x} survived in {case:?} -> {out:?}",
+                    c as u32
+                );
+            }
+        }
     }
 
     #[test]

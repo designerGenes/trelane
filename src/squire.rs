@@ -1,7 +1,7 @@
 use crate::Context;
 use crate::commands;
 use crate::error::Result;
-use crate::models::{AgentActivityState, AgentStatus, Message, WakeCandidate, WakeKind};
+use crate::models::{AgentActivityState, AgentStatus, Message, StoryEvent, WakeCandidate, WakeKind};
 use crate::prompt;
 use crate::store;
 use rusqlite::{Connection, OptionalExtension};
@@ -752,6 +752,22 @@ pub fn tick(ctx: &Context, launcher_override: Option<&str>, verbose: bool) -> Re
             Ok(()) => {
                 launched += 1;
                 launched_agents.insert(cand.agent.as_str());
+                // Story ledger (best-effort, R16): record that the squire
+                // issued this wake. The agent-side run_start event (emitted
+                // by cmd_wake) carries the agent's view; this wake_issued
+                // event carries the squire's view (it picked this agent
+                // out of the queue with this reason). The two views JOIN
+                // by ts_iso/agent -- the squire is the actor here, the
+                // woken agent is in detail.woke.
+                let _ = store::append_story_event(
+                    &ctx.conn,
+                    &StoryEvent::new("wake_issued", Some("squire".to_string()))
+                        .trace(crate::telemetry::current_trace_id(&ctx.trelane_dir()))
+                        .detail(serde_json::json!({
+                            "woke": cand.agent,
+                            "reason": cand.reason,
+                        })),
+                );
                 // Apply deferred side effects now that the agent launched.
 
                 // R23: the agent actually launched, so its starvation streak is

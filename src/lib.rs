@@ -26,6 +26,7 @@ pub mod store;
 pub mod telemetry;
 pub mod testing;
 pub mod text_input;
+pub mod tui_session;
 
 use crate::cli::{Cli, Command};
 use crate::domain::find_root;
@@ -68,7 +69,109 @@ pub fn ensure_config() -> Result<PathBuf> {
             std::fs::write(&path, serde_json::to_string_pretty(&config)?)?;
         }
     }
+    // Run any pending versioned migrations on the on-disk config. Pure over
+    // the JSON: load, migrate, save. A no-op when the config is already at
+    // CURRENT_CONFIG_VERSION.
+    migrate_config_file(&path)?;
     Ok(path)
+}
+
+/// Run pending versioned migrations on the on-disk config file, in place.
+///
+/// Each migration step is **exact-match-only**: a profile/template value is
+/// rewritten only if it byte-equals a known legacy built-in default. Any
+/// user-customized value (even by a single character) is left untouched --
+/// the user's choice always wins. New built-in profiles introduced by the
+/// migration are inserted only if no profile of that name exists yet.
+///
+/// After all migrations, the file's `config_version` is bumped to
+/// `CURRENT_CONFIG_VERSION` and the file is rewritten as pretty JSON.
+///
+/// (TUI-002: the launcher profile defaults changed from human-readable to
+/// structured output. Without this migration, an existing config's
+/// unchanged-from-default `opencode` profile would keep the old plain-text
+/// command and the monitor would re-acquire the photographed corruption on
+/// the very next wake.)
+fn migrate_config_file(path: &Path) -> Result<()> {
+    let text = std::fs::read_to_string(path)?;
+    let mut config: Config = serde_json::from_str(&text)?;
+    let original_version = config.config_version;
+    if original_version >= crate::models::CURRENT_CONFIG_VERSION {
+        return Ok(()); // nothing to do
+    }
+
+    // ---- v0 -> v1: launcher profile defaults flip to structured output ----
+    if original_version < 1 {
+        // Legacy built-in defaults that the v1 default REPLACED. Each entry
+        // is (profile_name, exact_legacy_value, new_value). An exact match
+        // means the user never customized this profile, so it's safe to
+        // rewrite to the new default. A non-match means the user changed
+        // it -- we leave it alone.
+        const LEGACY_PROFILE_DEFAULTS: &[(&str, &str, &str)] = &[
+            (
+                "claude-code",
+                // Legacy v0 default for claude-code (human-readable).
+                r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50"#,
+                // v1 default: stream-json so the monitor can parse events.
+                r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50 --output-format stream-json --verbose"#,
+            ),
+            (
+                "opencode",
+                // Legacy v0 default for opencode (human-readable).
+                r#"opencode run "$(cat {prompt_file})""#,
+                // v1 default: structured JSON events with thoughts.
+                r#"opencode run --format json --thinking "$(cat {prompt_file})""#,
+            ),
+        ];
+        for (name, legacy, new) in LEGACY_PROFILE_DEFAULTS {
+            if let Some(current) = config.launcher.profiles.get(*name) {
+                if current == *legacy {
+                    config
+                        .launcher
+                        .profiles
+                        .insert(name.to_string(), new.to_string());
+                }
+                // else: user customized it -- leave it alone.
+            }
+            // If the profile is absent entirely, do NOT add it here: the
+            // user explicitly removed it, and re-adding would silently
+            // change behavior. The new *-plain escape hatches below are
+            // different names so adding them is additive, not a rewrite.
+        }
+
+        // Legacy built-in default for the launcher template (the
+        // "fallback when no profile is selected" command). Same
+        // exact-match-only rule.
+        const LEGACY_TEMPLATE: &str =
+            r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50"#;
+        const NEW_TEMPLATE: &str =
+            r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50 --output-format stream-json --verbose"#;
+        if config.launcher.template == LEGACY_TEMPLATE {
+            config.launcher.template = NEW_TEMPLATE.to_string();
+        }
+
+        // Additive: insert the new *-plain escape hatches ONLY where the
+        // user hasn't already defined a profile of that name. These are
+        // new names, so this never overwrites an existing customization.
+        if !config.launcher.profiles.contains_key("claude-code-plain") {
+            config.launcher.profiles.insert(
+                "claude-code-plain".to_string(),
+                r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50"#
+                    .to_string(),
+            );
+        }
+        if !config.launcher.profiles.contains_key("opencode-plain") {
+            config.launcher.profiles.insert(
+                "opencode-plain".to_string(),
+                r#"opencode run "$(cat {prompt_file})""#.to_string(),
+            );
+        }
+    }
+    // ---- future migrations: `if original_version < 2 { ... }` here ----
+
+    config.config_version = crate::models::CURRENT_CONFIG_VERSION;
+    std::fs::write(path, serde_json::to_string_pretty(&config)?)?;
+    Ok(())
 }
 
 /// Load the global config, creating it with defaults if missing.
@@ -701,6 +804,22 @@ pub fn handle(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Some(Command::Story {
+            json,
+            agent,
+            path,
+            kinds,
+            rework_only,
+        }) => {
+            let ctx = Context::open(cli.root.as_deref())?;
+            commands::cmd_story(&ctx, &commands::StoryArgs {
+                json,
+                agent,
+                path,
+                kinds,
+                rework_only,
+            })
+        }
         Some(Command::Rate {
             agent,
             rating,
@@ -1219,4 +1338,166 @@ fn cmd_kill() -> Result<()> {
 /// has restored the terminal out of raw/alternate-screen mode.
 pub fn run_kill_from_diagnostic() -> Result<()> {
     cmd_kill()
+}
+
+// --------------------------------------------------------------- migrations
+#[cfg(test)]
+mod migrate_tests {
+    use super::*;
+    use crate::models::{Config, CURRENT_CONFIG_VERSION};
+    use std::collections::HashMap;
+
+    /// Build a JSON config string at the given version with the given
+    /// profiles and template. Round-trips through serde so we exercise the
+    /// real load path.
+    fn write_config(path: &Path, version: u32, template: &str, profiles: &[(&str, &str)]) {
+        let mut map: HashMap<String, String> = HashMap::new();
+        for (k, v) in profiles {
+            map.insert(k.to_string(), v.to_string());
+        }
+        let config = Config {
+            agents: crate::models::AgentConfig::default(),
+            launcher: crate::models::LauncherConfig {
+                template: template.to_string(),
+                profiles: map,
+            },
+            squire: crate::models::SquireConfig {
+                interval_s: 20,
+                max_concurrent: 2,
+                reply_timeout_s: Some(3600),
+                breaker_escalation_count: 3,
+                starvation_ticks: 3,
+            },
+            claims: crate::models::ClaimsConfig { default_ttl_s: 900 },
+            di: crate::models::DiConfig::default(),
+            retention: crate::models::RetentionConfig::default(),
+            ui: crate::models::UiConfig::default(),
+            biplane: crate::models::BiplaneConfig::default(),
+            bench: crate::models::BenchConfig::default(),
+            workspace: crate::models::WorkspaceConfig::default(),
+            config_version: version,
+        };
+        std::fs::write(path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    }
+
+    fn load(path: &Path) -> Config {
+        let text = std::fs::read_to_string(path).unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    const LEGACY_OPENCODE: &str = r#"opencode run "$(cat {prompt_file})""#;
+    const LEGACY_CLAUDE: &str =
+        r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50"#;
+    const NEW_OPENCODE: &str = r#"opencode run --format json --thinking "$(cat {prompt_file})""#;
+    const NEW_CLAUDE: &str =
+        r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50 --output-format stream-json --verbose"#;
+
+    #[test]
+    fn legacy_default_profiles_are_migrated_to_structured_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        write_config(
+            &path,
+            0,
+            LEGACY_CLAUDE,
+            &[("opencode", LEGACY_OPENCODE), ("claude-code", LEGACY_CLAUDE)],
+        );
+        migrate_config_file(&path).unwrap();
+        let c = load(&path);
+        assert_eq!(c.config_version, CURRENT_CONFIG_VERSION);
+        assert_eq!(c.launcher.profiles.get("opencode").unwrap(), NEW_OPENCODE);
+        assert_eq!(c.launcher.profiles.get("claude-code").unwrap(), NEW_CLAUDE);
+        // The template (matching the legacy default) is also upgraded.
+        assert_eq!(c.launcher.template, NEW_CLAUDE);
+    }
+
+    #[test]
+    fn user_customized_profiles_are_not_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        // opencode customized (extra flag); claude-code at legacy default.
+        let custom = r#"opencode run --model my-model "$(cat {prompt_file})""#;
+        write_config(
+            &path,
+            0,
+            LEGACY_CLAUDE,
+            &[("opencode", custom), ("claude-code", LEGACY_CLAUDE)],
+        );
+        migrate_config_file(&path).unwrap();
+        let c = load(&path);
+        // Custom opencode untouched.
+        assert_eq!(c.launcher.profiles.get("opencode").unwrap(), custom);
+        // claude-code at legacy default was migrated.
+        assert_eq!(c.launcher.profiles.get("claude-code").unwrap(), NEW_CLAUDE);
+    }
+
+    #[test]
+    fn user_customized_template_is_not_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        let custom_template = "my-custom-launcher --foo {prompt_file}";
+        write_config(&path, 0, custom_template, &[]);
+        migrate_config_file(&path).unwrap();
+        let c = load(&path);
+        assert_eq!(c.launcher.template, custom_template);
+    }
+
+    #[test]
+    fn new_plain_escape_hatch_profiles_are_added_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        write_config(&path, 0, LEGACY_CLAUDE, &[]);
+        migrate_config_file(&path).unwrap();
+        let c = load(&path);
+        assert!(c.launcher.profiles.contains_key("opencode-plain"));
+        assert!(c.launcher.profiles.contains_key("claude-code-plain"));
+        assert_eq!(
+            c.launcher.profiles.get("opencode-plain").unwrap(),
+            LEGACY_OPENCODE
+        );
+    }
+
+    #[test]
+    fn existing_plain_profiles_are_not_overwritten_by_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        let custom_plain = "my-plain-launcher";
+        write_config(
+            &path,
+            0,
+            LEGACY_CLAUDE,
+            &[("opencode-plain", custom_plain)],
+        );
+        migrate_config_file(&path).unwrap();
+        let c = load(&path);
+        assert_eq!(c.launcher.profiles.get("opencode-plain").unwrap(), custom_plain);
+    }
+
+    #[test]
+    fn already_current_config_is_a_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        write_config(&path, CURRENT_CONFIG_VERSION, "anything", &[]);
+        let bytes_before = std::fs::read(&path).unwrap();
+        migrate_config_file(&path).unwrap();
+        let bytes_after = std::fs::read(&path).unwrap();
+        assert_eq!(bytes_before, bytes_after, "no-op should not rewrite file");
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.json");
+        write_config(
+            &path,
+            0,
+            LEGACY_CLAUDE,
+            &[("opencode", LEGACY_OPENCODE), ("claude-code", LEGACY_CLAUDE)],
+        );
+        migrate_config_file(&path).unwrap();
+        let after_first = std::fs::read(&path).unwrap();
+        migrate_config_file(&path).unwrap();
+        let after_second = std::fs::read(&path).unwrap();
+        assert_eq!(after_first, after_second, "second migration is a no-op");
+    }
 }

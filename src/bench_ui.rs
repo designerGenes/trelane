@@ -18,6 +18,7 @@
 //! is still a complete record; and a crash in the TUI cannot affect the run.
 
 use crate::error::{Result, TrelaneError};
+use crate::tui_session::StdCapture;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -25,57 +26,23 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Redirect process stdout (fd 1) to a file for as long as this guard lives,
-/// restoring the original on drop.
-///
-/// Why this exists: the orchestrator reuses `testing::run_testing`, which was
-/// written as a CLI runner and prints ~30 progress lines to stdout (`[testing]
-/// step 1: ...`, `waking engine`, `launched ... pid=`). Under the TUI those
-/// prints land on the SAME terminal the alternate screen owns, in raw mode, so
-/// newlines don't carriage-return -- producing the cascading staircase of
-/// corrupted text. Rather than convert all 30 print sites (they're still the
-/// right behavior for a non-TUI run), we capture fd 1 into a `bench.log` file
-/// for the TUI's lifetime. The progress isn't lost -- it's in the file, and
-/// the TUI already renders the same information from the events stream -- it
-/// just stops fighting the screen.
+// `StdCapture` (see `tui_session::StdCapture`) redirects fd 1 AND fd 2 into
+// `bench.log` for as long as it lives. This is the TUI-003 parity fix: the
+// orchestrator reuses `testing::run_testing`, which was written as a CLI
+// runner and prints ~30 progress lines to stdout (`[testing] step 1: ...`,
+// `waking engine`, `launched ... pid=`). Under the TUI those prints land on
+// the SAME terminal the alternate screen owns, in raw mode, so newlines
+// don't carriage-return -- producing the cascading staircase of corrupted
+// text. fd 2 was equally able to corrupt the screen when a deep helper hit
+// an `eprintln!`. Both fds now go to the log, so nothing but ratatui ever
+// touches the screen while the alternate screen is up.
 ///
 /// fd-level (not `print!`-level) redirect is required because the prints
 /// happen on a background thread and inside `run_testing`, which we don't
-/// thread a writer through; swapping the fd catches every write regardless of
-/// where it originates.
-struct StdoutCapture {
-    saved_fd: i32,
-}
-
-impl StdoutCapture {
-    /// Point stdout at `path` (created/truncated). On any failure, returns a
-    /// guard that restores nothing -- capture is best-effort; a bench that
-    /// can't open its log should still run (just with the old corruption),
-    /// not abort.
-    fn to_file(path: &std::path::Path) -> Self {
-        use std::os::unix::io::IntoRawFd;
-        let saved_fd = unsafe { libc::dup(libc::STDOUT_FILENO) };
-        if let Ok(file) = std::fs::File::create(path) {
-            let file_fd = file.into_raw_fd();
-            unsafe {
-                libc::dup2(file_fd, libc::STDOUT_FILENO);
-                libc::close(file_fd);
-            }
-        }
-        StdoutCapture { saved_fd }
-    }
-}
-
-impl Drop for StdoutCapture {
-    fn drop(&mut self) {
-        if self.saved_fd >= 0 {
-            unsafe {
-                libc::dup2(self.saved_fd, libc::STDOUT_FILENO);
-                libc::close(self.saved_fd);
-            }
-        }
-    }
-}
+/// thread a writer through; swapping the fd catches every write regardless
+/// of where it originates. The shared helper returns an error on any setup
+/// failure so this entry point can refuse to enter the alternate screen
+/// rather than running with a half-captured terminal.
 
 /// Run the bench TUI in the foreground while the orchestrator runs on a
 /// background thread. The orchestrator is `orchestrator()` -- a closure that
@@ -95,16 +62,20 @@ where
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = stop.clone();
 
-    // Capture stdout (fd 1) into bench.log beside the events file, for the
-    // whole run. The orchestrator reuses run_testing, which prints ~30
-    // progress lines to stdout; the TUI draws to /dev/tty (see run_loop) so it
-    // is immune to this redirect. Result: progress is preserved in a file the
-    // user can read, and it no longer corrupts the screen. Best-effort -- if
-    // the log can't be opened, the guard restores nothing and the run
-    // proceeds (with the old behavior) rather than aborting.
-    let capture = events_path
-        .parent()
-        .map(|dir| StdoutCapture::to_file(&dir.join("bench.log")));
+    // Capture stdout AND stderr (fd 1 and fd 2) into bench.log beside the
+    // events file, for the whole run. The orchestrator reuses run_testing,
+    // which prints ~30 progress lines to stdout and surfaces deeper errors
+    // via eprintln!; the TUI draws to /dev/tty (see run_loop) so it is
+    // immune to this redirect. Result: progress is preserved in a file the
+    // user can read, and it no longer corrupts the screen. TUI-003: capture
+    // setup is NOT best-effort -- if the log can't be opened the TUI would
+    // start with the orchestrator still able to write to the controlling
+    // terminal, which is the bug the guard prevents. Surface the error here
+    // so the caller can decline to enter the alternate screen.
+    let capture = match events_path.parent() {
+        Some(dir) => Some(StdCapture::to_file(&dir.join("bench.log"))?),
+        None => None,
+    };
 
     // Spawn the orchestrator on a background thread. It writes to
     // bench-events.jsonl (tailed by the TUI); its stdout goes to bench.log.

@@ -1352,10 +1352,23 @@ mod tests {
 
     #[test]
     fn model_catalog_starts_with_default_then_sorted_profiles() {
-        // Config::default() ships claude-code, copilot, opencode.
+        // Config::default() ships the built-in monitor-facing profiles plus
+        // the *-plain escape hatches and the legacy -stream aliases. The
+        // catalog is "(default)" followed by the sorted profile names.
         let s = state_with_defaults();
         assert_eq!(s.models[0], "(default)");
-        assert_eq!(&s.models[1..], &["claude-code", "copilot", "opencode"]);
+        assert_eq!(
+            &s.models[1..],
+            &[
+                "claude-code",
+                "claude-code-plain",
+                "claude-code-stream",
+                "copilot",
+                "opencode",
+                "opencode-plain",
+                "opencode-stream",
+            ]
+        );
     }
 
     #[test]
@@ -1364,12 +1377,15 @@ mod tests {
         s.tab = Tab::Agents;
         s.cursor = 0; // alpha, model "opencode"
         assert_eq!(s.agents[0].model, "opencode");
-        s.cycle_agent_model(true); // opencode is last -> wraps to "(default)"
-        assert_eq!(s.agents[0].model, "(default)");
+        // "opencode" is no longer the last profile (TUI-002 added
+        // "opencode-plain" and "opencode-stream" after it), so advancing
+        // from "opencode" moves to "opencode-plain", not to "(default)".
+        s.cycle_agent_model(true); // opencode -> opencode-plain
+        assert_eq!(s.agents[0].model, "opencode-plain");
         assert!(s.models_dirty);
         assert_eq!(
             s.pending_models.get("alpha").map(String::as_str),
-            Some("(default)")
+            Some("opencode-plain")
         );
     }
 
@@ -1380,8 +1396,11 @@ mod tests {
         s.cursor = 1; // beta, model "claude-code" (index 1)
         s.cycle_agent_model(false); // -> index 0 "(default)"
         assert_eq!(s.agents[1].model, "(default)");
-        s.cycle_agent_model(false); // wraps to last "opencode"
-        assert_eq!(s.agents[1].model, "opencode");
+        // Wrapping backward past "(default)" lands on the LAST entry. After
+        // TUI-002 the last sorted profile is "opencode-stream", not
+        // "opencode".
+        s.cycle_agent_model(false); // wraps to last "opencode-stream"
+        assert_eq!(s.agents[1].model, "opencode-stream");
     }
 
     #[test]

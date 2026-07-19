@@ -142,6 +142,7 @@ agent selection without modifying `AGENTS.md`.
 | `trelane status` | Show full swarm state |
 | `trelane biplane [--json] [--safe-pocket DIR] [--describe FILE] [--next-steps] [--emit-plan] [--interactive] [--accept-defaults]` | Analyze project, generate reports, plan domains |
 | `trelane metrics [--json]` | Show aggregate metrics from OpenTelemetry traces |
+| `trelane story [--json] [--agent A] [--path P] [--kind K...] [--rework-only]` | Show the causal story ledger: who wrote each file when, plus rework detection |
 | `trelane rate AGENT RATING --rationale TEXT --rater AGENT` | Rate another agent's run (inter-agent consensus) |
 | `trelane wake AGENT [--why TEXT] [--launcher CMD]` | Launch an agent process |
 | `trelane set-launch-target AGENT --adapter tmux --target PANE [--command TEXT]` | Store a tmux relaunch target |
@@ -155,20 +156,62 @@ agent selection without modifying `AGENTS.md`.
 ## Launcher
 
 `~/.config/trelane/config.json > launcher.template` is any shell command
-with placeholders `{prompt_file}`, `{agent}`, `{root}`. Three built-in
+with placeholders `{prompt_file}`, `{agent}`, `{root}`. The built-in
 profiles ship in the default config:
 
 | Profile | Template | Notes |
 |---------|----------|-------|
-| `claude-code` | `claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50` | Default; targets Claude Code headless |
-| `opencode` | `opencode run "$(cat {prompt_file})"` | Targets opencode CLI |
+| `claude-code` | `claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50 --output-format stream-json --verbose` | Monitor-facing default; targets Claude Code headless with NDJSON stream |
+| `claude-code-plain` | `claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50` | Human-readable escape hatch (loses live reasoning in the monitor) |
+| `opencode` | `opencode run --format json --thinking "$(cat {prompt_file})"` | Monitor-facing default; targets opencode CLI with NDJSON event stream |
+| `opencode-plain` | `opencode run "$(cat {prompt_file})"` | Human-readable escape hatch (loses live reasoning in the monitor) |
 | `copilot` | `copilot -p "$(cat {prompt_file})" --allow-all-tools` | Targets GitHub Copilot CLI |
+
+The legacy `-stream` aliases (`opencode-stream`, `claude-code-stream`) are
+kept for compatibility with configs that named them explicitly before they
+became the defaults; new configs should use the names above.
+
+### Structured-output contract
+
+The `trelane monitor` feed tailer parses an agent's run log as
+newline-delimited JSON events (opencode `--format json --thinking`, or
+claude-code `--output-format stream-json --verbose`). Only structured
+output lets the monitor show live reasoning, tool calls, and step
+boundaries as discrete events. The monitor-facing defaults (`opencode`,
+`claude-code`) therefore emit structured output.
+
+A raw opencode model ID (anything that is not a known profile name -- e.g.
+`openrouter/z-ai/glm-5.2`, which is what the Biplane UI's model selector
+stores) resolves to `opencode run --format json --thinking --model {id}
+--dir {root} "$(cat {prompt_file})"`. The structured-output flags are
+non-negotiable: without them opencode emits interactive-style prose (ANSI
+color codes, `\r`-driven spinners) that the monitor cannot parse as event
+boundaries and that can corrupt the screen by carrying terminal control
+sequences into rendered text.
+
+If you need human-readable output for a specific agent (e.g. you also run
+the agent manually and want to read its log as prose), select the matching
+`*-plain` profile. The monitor still works against plain profiles -- lines
+become `Raw` events -- but the live-reasoning feature is lost.
 
 Antigravity has no headless CLI; it must be driven via a custom tmux/adapter
 command.
 
 Select a profile per agent with `--launcher-agent <profile>` at registration,
 or override any template in config.json.
+
+### Config migration
+
+When the launcher profile defaults change between Trelane versions (as they
+did when the monitor-facing defaults flipped from human-readable to
+structured output), `trelane` migrates the on-disk config on first load. The
+migration is **exact-match-only**: a profile/template value is rewritten only
+if it byte-equals a known legacy built-in default. Any value you customized
+-- even by a single character -- is left untouched, so your explicit choices
+are never silently overridden. New built-in profiles introduced by a
+migration (e.g. `opencode-plain`) are inserted only if no profile of that
+name exists yet. The file's `config_version` field is bumped to record
+which migrations have run.
 
 ## Session UI
 
@@ -307,6 +350,87 @@ The metrics summary shows:
 
 Ratings aggregate into the `avg_rating` column in `trelane metrics`.
 
+## Story Ledger
+
+`trelane story` reads the append-only causal ledger
+(`.trelane/trelane.db::story_events`, schema v14) and renders a
+human-readable timeline of everything that happened in a session, in the
+order it happened. It complements `trelane metrics`: metrics answer "how
+long / how much", the ledger answers "what happened, in what order, and
+why".
+
+The ledger is **append-only** (no UPDATE or DELETE anywhere in the
+codebase; the `seq INTEGER PRIMARY KEY AUTOINCREMENT` column documents the
+intent). It records:
+
+- `run_start` / `run_end` — every agent run's boundaries, with the wake
+  reason, the git tree SHA, and the files-changed/lines-added/lines-removed
+  totals (the SAME numbers computed for the telemetry span).
+- `file_change` — one per path whose sha256 differs between the run's
+  pre-wake baseline and post-run `git_dirty` map. `created` / `modified` /
+  `deleted`, with `hash_before` and `hash_after` so byte-identical
+  reappearance can be detected.
+- `claim_acquired` / `claim_denied` / `claim_released` — every path-claim
+  lifecycle event, with the holder and the release channel (explicit,
+  delegation, expiry).
+- `park` / `unpark` — every agent wait and its resolution.
+- `wake_issued` — the squire's side of each wake (the actor is `squire`,
+  the woken agent is in `detail.woke`).
+- `di_resolved` — every domain-intrusion request's terminal resolution,
+  with the outcome (approved/vetoed/expired) and the deciding agent.
+
+Every event carries the session's `trace_id` (shared with the OTLP spans)
+when one exists, so a reader can JOIN ledger events to telemetry spans.
+
+**Usage:**
+
+    trelane story                            # human-readable timeline, grouped under each run
+    trelane story --json                     # JSON array (StoryEvent[]), for piping
+    trelane story --agent alpha              # filter to one agent's events
+    trelane story --path src/data/store.js   # filter to one file's history
+    trelane story --kind file_change --kind claim_acquired   # repeatable
+    trelane story --rework-only             # the headline feature
+
+**The rework signal** (the motivating failure):
+
+    trelane story --rework-only
+
+Lists every `file_change` whose `hash_after` matches an earlier
+`file_change`'s `hash_after` on the same path — i.e. a file reached
+byte-identical content more than once, meaning it was changed away and
+then rebuilt/reverted to the same bytes. Each hit is prefixed with the
+visible `↺ REWORK` marker (no ANSI color, so it's readable from a log
+file) and the enclosing run is shown for context.
+
+The same query as SQL (the direct answer to "did work keep getting redone
+and overwritten?"):
+
+```sql
+SELECT path, hash_after, COUNT(*) AS times_reached, GROUP_CONCAT(seq) AS at_seqs
+FROM story_events
+WHERE kind='file_change' AND hash_after IS NOT NULL
+GROUP BY path, hash_after
+HAVING COUNT(*) > 1
+ORDER BY times_reached DESC;
+```
+
+A complementary query detects the same content hash appearing at multiple
+distinct paths (the "duplicate build" pattern — the same file
+materialized in more than one place):
+
+```sql
+SELECT hash_after, COUNT(DISTINCT path) AS n_paths, GROUP_CONCAT(DISTINCT path) AS paths
+FROM story_events
+WHERE kind='file_change' AND hash_after IS NOT NULL
+GROUP BY hash_after
+HAVING COUNT(DISTINCT path) > 1;
+```
+
+**Known limits:** the ledger records at run boundaries (wake/done) only;
+intra-slice file polling is a separate, later feature. Rework detection
+is byte-identical (same sha256); two functionally-equivalent rewrites
+with different whitespace will not be flagged.
+
 ## Testing Harness
 
 Full usage scenarios live under `tests/` as JSON files.
@@ -335,10 +459,12 @@ to a JSONL report file. Report fields include `messages_sent`,
     "disabled": []
   },
   "launcher": {
-    "template": "claude -p \"$(cat {prompt_file})\" --permission-mode acceptEdits --allowedTools \"Bash(trelane *)\" --max-turns 50",
+    "template": "claude -p \"$(cat {prompt_file})\" --permission-mode acceptEdits --allowedTools \"Bash(trelane *)\" --max-turns 50 --output-format stream-json --verbose",
     "profiles": {
-      "claude-code": "claude -p \"$(cat {prompt_file})\" --permission-mode acceptEdits --allowedTools \"Bash(trelane *)\" --max-turns 50",
-      "opencode": "opencode run \"$(cat {prompt_file})\"",
+      "claude-code": "claude -p \"$(cat {prompt_file})\" --permission-mode acceptEdits --allowedTools \"Bash(trelane *)\" --max-turns 50 --output-format stream-json --verbose",
+      "claude-code-plain": "claude -p \"$(cat {prompt_file})\" --permission-mode acceptEdits --allowedTools \"Bash(trelane *)\" --max-turns 50",
+      "opencode": "opencode run --format json --thinking \"$(cat {prompt_file})\"",
+      "opencode-plain": "opencode run \"$(cat {prompt_file})\"",
       "copilot": "copilot -p \"$(cat {prompt_file})\" --allow-all-tools"
     }
   },

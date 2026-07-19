@@ -77,7 +77,13 @@ impl Tracer {
     pub fn new(trelane_dir: &Path, project_root: &str, session_name: &str) -> Result<Self> {
         let trace_dir = trelane_dir.join("traces");
         fs::create_dir_all(&trace_dir)?;
-        let trace_id = generate_trace_id();
+        // Persist one trace id per project instead of minting a fresh
+        // random one per Tracer construction -- every call site below
+        // constructs a Tracer per span (via `ephemeral`), so a random id
+        // here meant an agent.run span and its own agent.wait span never
+        // shared a trace, and a rate span's parent_span_id pointed into a
+        // trace it wasn't part of. See get_or_create_trace_id.
+        let trace_id = get_or_create_trace_id(&trace_dir)?;
         Ok(Self {
             trace_dir,
             trace_id,
@@ -372,6 +378,66 @@ fn generate_trace_id() -> TraceId {
     hex_encode(&bytes)
 }
 
+/// Read the project's persistent trace id, creating one on first use.
+///
+/// Stored as a plain file next to the trace jsonl files rather than in the
+/// database, so every `Tracer::new`/`ephemeral` call site -- none of which
+/// currently thread a `Connection` through -- can reach it with no
+/// signature changes. A create-if-absent write guards the common
+/// multi-process race (two `trelane` CLI invocations starting near
+/// simultaneously): the loser's `create_new` fails and it falls back to
+/// reading what the winner wrote.
+fn get_or_create_trace_id(trace_dir: &Path) -> Result<TraceId> {
+    let path = trace_dir.join(".trace_id");
+    if let Ok(existing) = fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    let fresh = generate_trace_id();
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            file.write_all(fresh.as_bytes())?;
+            Ok(fresh)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Lost the race -- another process created it first; use theirs.
+            Ok(fs::read_to_string(&path)?.trim().to_string())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Read the project's persistent trace id WITHOUT creating one. Returns
+/// `None` if the trace id file does not yet exist -- the case where a session
+/// has not yet emitted a telemetry span (so no `.trace_id` file has been
+/// written). This is the read-only entry point the story-events ledger
+/// calls so a freshly-appended event shares the same trace_id as OTLP spans
+/// when one exists, and carries a NULL trace_id when one doesn't.
+///
+/// (TUI-005 / story-ledger spec: "Give every ledger event the SAME session
+/// trace_id used by telemetry (read from `<trelane_dir>/traces/.trace_id`,
+/// created by the telemetry fix's get_or_create_trace_id).")
+pub fn current_trace_id(trelane_dir: &Path) -> Option<String> {
+    let path = trelane_dir.join("traces").join(".trace_id");
+    match fs::read_to_string(&path) {
+        Ok(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Err(_) => None,
+    }
+}
+
 fn generate_span_id() -> SpanId {
     use rand::RngCore;
     let mut bytes = [0u8; 8];
@@ -412,7 +478,14 @@ pub fn git_diff_stats(root: &Path) -> (usize, usize, usize) {
     if !output.status.success() {
         return (0, 0, 0);
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    parse_numstat(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse `git diff --numstat` output into (files_changed, lines_added,
+/// lines_removed). Shared by `git_diff_stats` and `diff_trees` so the two
+/// diff sources (against HEAD, and between two snapshotted trees) can't
+/// silently drift apart in how they count.
+fn parse_numstat(text: &str) -> (usize, usize, usize) {
     let mut files = 0;
     let mut added = 0;
     let mut removed = 0;
@@ -430,6 +503,82 @@ pub fn git_diff_stats(root: &Path) -> (usize, usize, usize) {
         }
     }
     (files, added, removed)
+}
+
+/// Snapshot the working tree as a git tree object, without touching the
+/// repository's real index, HEAD, or any ref. Uses a throwaway index file
+/// (via `GIT_INDEX_FILE`) so it's safe to call mid-run, alongside an agent
+/// that's actively editing files, without disturbing the user's actual
+/// staging area. Returns the tree SHA, or `None` on a non-git project or if
+/// the git plumbing calls fail.
+///
+/// This exists because `git_diff_stats` can only compare against HEAD, and
+/// nothing in the live wake/done path ever commits -- so a HEAD diff reports
+/// the cumulative change since the *session* started, not since this *run*
+/// started. Snapshotting a tree at wake time and again at done time lets
+/// `diff_trees` report exactly this run's delta instead.
+pub fn snapshot_tree(root: &Path) -> Option<String> {
+    let tmp_index = std::env::temp_dir().join(format!(
+        "trelane-idx-{}-{}",
+        std::process::id(),
+        now_nanos()
+    ));
+    let add = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .env("GIT_INDEX_FILE", &tmp_index)
+        .args(["add", "-A"])
+        .output();
+    let Ok(add) = add else {
+        let _ = fs::remove_file(&tmp_index);
+        return None;
+    };
+    if !add.status.success() {
+        let _ = fs::remove_file(&tmp_index);
+        return None;
+    }
+    let write_tree = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .env("GIT_INDEX_FILE", &tmp_index)
+        .args(["write-tree"])
+        .output();
+    let _ = fs::remove_file(&tmp_index);
+    let Ok(write_tree) = write_tree else {
+        return None;
+    };
+    if !write_tree.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&write_tree.stdout)
+        .trim()
+        .to_string();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
+    }
+}
+
+/// Diff two tree snapshots from `snapshot_tree` for (files_changed,
+/// lines_added, lines_removed). Identical trees short-circuit to zeros
+/// without shelling out.
+pub fn diff_trees(root: &Path, before: &str, after: &str) -> (usize, usize, usize) {
+    if before == after {
+        return (0, 0, 0);
+    }
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["diff", "--numstat", before, after])
+        .output();
+    let Ok(output) = output else {
+        return (0, 0, 0);
+    };
+    if !output.status.success() {
+        return (0, 0, 0);
+    }
+    parse_numstat(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Aggregate metrics computed from trace spans.

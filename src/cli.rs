@@ -403,6 +403,35 @@ pub enum Command {
         json: bool,
     },
 
+    /// Show the causal story ledger: who wrote each file when, which writes
+    /// reverted earlier byte-identical states, and the sequence of claim/
+    /// park/run events for the session. Append-only; observation, not
+    /// coordination. (story-events ledger)
+    Story {
+        /// Emit the events as a JSON array (StoryEvent[]) instead of the
+        /// rendered timeline. For machine consumption / piping.
+        #[arg(long)]
+        json: bool,
+        /// Filter to one agent's events (use 'squire' for squire-emitted
+        /// events).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Filter to one file's history (e.g. 'src/data/store.js').
+        #[arg(long)]
+        path: Option<String>,
+        /// Filter to given kinds (repeatable): run_start, run_end,
+        /// file_change, claim_acquired, claim_denied, claim_released,
+        /// park, unpark, wake_issued, di_resolved.
+        #[arg(long = "kind", value_name = "KIND")]
+        kinds: Vec<String>,
+        /// Show only file_change events that are overwrite/rework signals
+        /// (a hash_after that reappears on the same path), plus their
+        /// enclosing run_start/run_end for context. The direct answer to
+        /// 'did work keep getting redone and overwritten?'.
+        #[arg(long)]
+        rework_only: bool,
+    },
+
     /// Run repeatable benchmarks against free-model agents (step 3 of the
     /// bench framework). Measures generation speed; writes events for the
     /// live TUI (step 4); produces comparable JSON for `bench compare`

@@ -77,7 +77,19 @@ pub struct Config {
     pub bench: BenchConfig,
     #[serde(default)]
     pub workspace: WorkspaceConfig,
+    /// Schema version of this config file. Absent on configs written before
+    /// the version field was introduced (treated as 0 by `#[serde(default)]`).
+    /// `ensure_config` runs `migrate_config` when this is below
+    /// `CURRENT_CONFIG_VERSION`, then bumps it. See lib.rs::migrate_config
+    /// for the per-version migrations. TUI-002 introduced version 1.
+    #[serde(default)]
+    pub config_version: u32,
 }
+
+/// Current config schema version. Bump this whenever `migrate_config`
+/// gains a new step. `ensure_config` calls `migrate_config` whenever a
+/// loaded config's `config_version` is below this.
+pub const CURRENT_CONFIG_VERSION: u32 = 1;
 
 impl Default for Config {
     fn default() -> Self {
@@ -85,21 +97,48 @@ impl Default for Config {
         // Ready-to-use headless launcher profiles. Select one per agent with
         // `trelane add-agent <name> --launcher-agent <profile>`, or override
         // any of these in config.json.
+        //
+        // TUI-002: the monitor-facing defaults emit STRUCTURED output
+        // (NDJSON event streams: thoughts, tool calls, step boundaries) so
+        // `trelane monitor`'s feed tailer can parse event boundaries. The
+        // plain (human-readable) variants are exposed under explicit `*-plain`
+        // names -- the monitor still works against them (lines become Raw
+        // events) but the live-reasoning feature is lost, so the structured
+        // forms are the right default for any agent the monitor will show.
+        //
+        // `claude-code` and `opencode` are the monitor-facing defaults and
+        // therefore emit structured output. `claude-code-plain` and
+        // `opencode-plain` are the human-output escape hatches. The legacy
+        // `-stream` names are kept as aliases so existing configs that named
+        // them explicitly still work after migration.
         profiles.insert(
             "claude-code".to_string(),
+            // Monitor-facing default: stream-json. `--verbose` is required
+            // by claude-code for stream-json mode.
+            r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50 --output-format stream-json --verbose"#
+                .to_string(),
+        );
+        profiles.insert(
+            "claude-code-plain".to_string(),
+            // Human-readable escape hatch: same harness, no stream-json.
             r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50"#
                 .to_string(),
         );
         profiles.insert(
             "opencode".to_string(),
+            // Monitor-facing default: structured JSON events with thoughts.
+            r#"opencode run --format json --thinking "$(cat {prompt_file})""#.to_string(),
+        );
+        profiles.insert(
+            "opencode-plain".to_string(),
+            // Human-readable escape hatch.
             r#"opencode run "$(cat {prompt_file})""#.to_string(),
         );
-        // Streaming variants: same harnesses, but stdout becomes an NDJSON
-        // event stream (thoughts, tool calls, step boundaries) instead of
-        // prose. cmd_wake already redirects stdout to the agent's run log, so
-        // selecting one of these profiles is ALL it takes for `trelane
-        // monitor` tabs to show live reasoning. Additive: the plain profiles
-        // above keep their existing behavior.
+        // Legacy aliases for configs that named the streaming variants
+        // explicitly before they became the defaults. Same command as the
+        // new monitor-facing defaults; kept so a user's
+        // `--launcher-agent opencode-stream` continues to work after the
+        // migration that made `opencode` itself structured.
         profiles.insert(
             "opencode-stream".to_string(),
             r#"opencode run --format json --thinking "$(cat {prompt_file})""#.to_string(),
@@ -116,7 +155,7 @@ impl Default for Config {
         Self {
             agents: AgentConfig::default(),
             launcher: LauncherConfig {
-                template: r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50"#
+                template: r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50 --output-format stream-json --verbose"#
                     .to_string(),
                 profiles,
             },
@@ -145,6 +184,7 @@ impl Default for Config {
             biplane: BiplaneConfig::default(),
             bench: BenchConfig::default(),
             workspace: WorkspaceConfig::default(),
+            config_version: CURRENT_CONFIG_VERSION,
         }
     }
 }
@@ -1200,6 +1240,135 @@ pub struct AgentStatus {
     pub state: AgentActivityState,
     pub reason: String,
     pub task_ids: Vec<String>,
+}
+
+// ---------------------------------------------------------------- story ledger
+//
+// The append-only causal event ledger (see FEATURES/external/trelane-story-ledger-spec.json).
+// Every recordable "story" of a Trelane session is one row in `story_events`;
+// these types are the Rust view of one row. The ledger is observation-only:
+// it never changes coordination semantics (claims/DI/park/wake), it just
+// records them so `trelane story` can answer after the fact.
+//
+// `StoryEvent` is built up by emitter call sites via builder setters; the
+// constructor `StoryEvent::new(kind, agent)` fills the mandatory id +
+// timestamps so call sites don't have to. Per the spec's R16
+// best-effort invariant, every emitter wraps `store::append_story_event`
+// in `let _ = ...` so a ledger failure can never fail the surrounding
+// claim/park/run.
+
+/// One row in the `story_events` ledger. Maps 1:1 to the schema in
+/// `db.rs::SCHEMA_V14`. `detail` and `refs` are typed as JSON values rather
+/// than fixed structs because the per-kind payload is specified in the spec
+/// (events.kinds) and the renderer decodes by `kind`; encoding them as
+/// serde_json::Value keeps the row representation narrow while letting
+/// emitters stay readable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StoryEvent {
+    /// Globally-unique id for this event ('ev-...'). Generated at construction
+    /// so a row is always identifiable even before it's persisted.
+    pub event_id: String,
+    /// The telemetry trace id shared with OTLP spans, when one exists at emit
+    /// time. Nullable: a session may emit events before any span forces the
+    /// trace id file to exist.
+    pub trace_id: Option<String>,
+    /// crypto::now_iso() at emit time -- human-readable ISO-8601.
+    pub ts_iso: String,
+    /// telemetry::now_nanos() at emit time -- sub-second ordering.
+    pub ts_nanos: u64,
+    /// One of the kinds enumerated in the spec's events.kinds: run_start,
+    /// run_end, file_change, claim_acquired, claim_denied, claim_released,
+    /// park, unpark, wake_issued, di_resolved.
+    pub kind: String,
+    /// The acting agent id, or "squire" for squire-emitted events, or None
+    /// for system events.
+    pub agent: Option<String>,
+    /// The file/glob this event concerns, when applicable. Forward-slashed,
+    /// repo-relative, exactly as git_dirty yields.
+    pub path: Option<String>,
+    /// sha256 hex of the file's content before this event (file_change
+    /// only); None for newly-created files.
+    pub hash_before: Option<String>,
+    /// sha256 hex of the file's content after this event (file_change only);
+    /// None for deleted files. Reappearance of the same hash_after on the
+    /// same path is the overwrite/revert signal the ledger exists to detect.
+    pub hash_after: Option<String>,
+    /// Kind-specific typed payload. See the spec's events.kinds for the
+    /// per-kind shape emitters MUST honor.
+    pub detail: serde_json::Value,
+    /// ids this event references: message ids, request ids, prior event
+    /// ids, run ids. Stored as a JSON array; empty when none.
+    pub refs: Vec<String>,
+}
+
+impl StoryEvent {
+    /// Construct a new event with a fresh event_id and the current
+    /// timestamps filled in. All other fields default to empty/None and are
+    /// filled in by the builder setters below.
+    pub fn new(kind: impl Into<String>, agent: Option<String>) -> Self {
+        StoryEvent {
+            event_id: crate::crypto::new_id("ev"),
+            trace_id: None,
+            ts_iso: crate::crypto::now_iso(),
+            ts_nanos: crate::telemetry::now_nanos(),
+            kind: kind.into(),
+            agent,
+            path: None,
+            hash_before: None,
+            hash_after: None,
+            detail: serde_json::Value::Object(serde_json::Map::new()),
+            refs: Vec::new(),
+        }
+    }
+
+    pub fn trace(mut self, trace_id: Option<String>) -> Self {
+        self.trace_id = trace_id;
+        self
+    }
+
+    pub fn path(mut self, path: Option<String>) -> Self {
+        self.path = path;
+        self
+    }
+
+    pub fn hashes(mut self, before: Option<String>, after: Option<String>) -> Self {
+        self.hash_before = before;
+        self.hash_after = after;
+        self
+    }
+
+    pub fn detail(mut self, detail: serde_json::Value) -> Self {
+        self.detail = detail;
+        self
+    }
+
+    pub fn refs(mut self, refs: Vec<String>) -> Self {
+        self.refs = refs;
+        self
+    }
+
+    /// Convenience: a single ref (the common case for run_end -> run_start).
+    pub fn ref_one(mut self, id: String) -> Self {
+        self.refs.push(id);
+        self
+    }
+}
+
+/// Filter for `read_story_events`. All fields optional; absent fields are
+/// not filtered on. Default = "all events, in append (seq) order".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoryFilter {
+    /// Restrict to these event kinds. Empty = all kinds.
+    pub kinds: Vec<String>,
+    /// Restrict to one agent (or "squire").
+    pub agent: Option<String>,
+    /// Restrict to one path's history.
+    pub path: Option<String>,
+    /// Restrict to one telemetry trace id.
+    pub trace_id: Option<String>,
+    /// Only events with seq strictly greater than this (for incremental
+    /// readers). None = no lower bound.
+    pub after_seq: Option<i64>,
 }
 
 #[cfg(test)]

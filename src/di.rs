@@ -17,7 +17,7 @@
 
 use crate::Context;
 use crate::error::{Result, TrelaneError};
-use crate::models::Message;
+use crate::models::{Message, StoryEvent};
 use crate::{crypto, store};
 use rusqlite::{OptionalExtension, params};
 
@@ -338,6 +338,34 @@ pub fn resolve_pending(ctx: &Context) -> Result<Vec<DiRequest>> {
             req.status = status.to_string();
             req.resolved_at = Some(now.clone());
             emit_di_span(ctx, "di.resolve", &req.id, &req.requester_agent, status);
+            // Story ledger (best-effort, R16): di_resolved is the intrusion
+            // audit trail the spec asks for. The deciding agent is the
+            // target_domain when the request was vetoed or approved by the
+            // owner; for an expiry, no agent decided. The DI request id is
+            // also recorded so a reader can JOIN to the messages table for
+            // the original request.
+            let decided_by = match status {
+                STATUS_VETOED => req.veto_agent.clone(),
+                STATUS_APPROVED => req
+                    .approvals
+                    .iter()
+                    .find(|a| a == &&req.target_domain)
+                    .cloned()
+                    .or_else(|| req.approvals.first().cloned()),
+                _ => None,
+            };
+            let _ = store::append_story_event(
+                &ctx.conn,
+                &StoryEvent::new("di_resolved", Some("squire".to_string()))
+                    .trace(crate::telemetry::current_trace_id(&ctx.trelane_dir()))
+                    .detail(serde_json::json!({
+                        "request_id": req.id,
+                        "target_domain": req.target_domain,
+                        "outcome": status,
+                        "decided_by": decided_by,
+                    }))
+                    .refs(vec![req.id.clone()]),
+            );
             resolved.push(req);
         }
     }
