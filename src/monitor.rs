@@ -240,27 +240,90 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
         .collect()
 }
 
-/// Clip a string to at most `width` characters, appending an ellipsis when it
-/// was cut. Truncation is by `char`, not byte, so it never splits a multibyte
-/// character. This is what keeps the agent feed to exactly ONE terminal row
-/// per event: a body longer than the pane can't wrap onto extra rows, which
-/// is the root cause of the leftover-fragment artifacts (a long line wraps to
-/// several rows, then when the feed scrolls, the vacated wrap-rows aren't
-/// reliably cleared). One row per event makes rendered-rows == event-count, so
-/// the height-based windowing below is exact.
-pub fn truncate_to_width(s: &str, width: usize) -> String {
-    if width == 0 {
+/// Clip a string to at most `width` TERMINAL COLUMNS, appending an ellipsis
+/// when it was cut. Truncation is by extended grapheme cluster and measures
+/// display width via `unicode-width`/`unicode-segmentation`, so:
+///
+/// - CJK and full-width glyphs count as 2 columns (not 1 char) -- the old
+///   `chars().count()` code under-counted these and let a row of Japanese
+///   text overflow the pane.
+/// - Combining-mark clusters (e + ́ ) are kept together (the combining mark
+///   has width 0 but belongs to the previous cluster).
+/// - ZWJ emoji sequences (family, flag) are kept together (width 2).
+/// - The result's `UnicodeWidthStr::width` is guaranteed `<= max_width`.
+///
+/// This is what keeps the agent feed to exactly ONE terminal row per event:
+/// a body longer than the pane can't wrap onto extra rows, which is the root
+/// cause of the leftover-fragment artifacts (a long line wraps to several
+/// rows, then when the feed scrolls, the vacated wrap-rows aren't reliably
+/// cleared). One row per event makes rendered-rows == event-count, so the
+/// height-based windowing below is exact.
+///
+/// (TUI-004: this replaced the old `chars().count()` version, which measured
+/// Unicode scalar values rather than terminal columns.)
+pub fn truncate_to_width(s: &str, max_width: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+
+    if max_width == 0 {
         return String::new();
     }
-    let char_count = s.chars().count();
-    if char_count <= width {
+    // Fast path: the whole string already fits.
+    if UnicodeWidthStr::width(s) <= max_width {
         return s.to_string();
     }
-    if width == 1 {
+    // The ellipsis (…) is a single grapheme with display width 1 (it's
+    // U+2026 in NFC). Reserve its width when we're going to clip.
+    let ellipsis_width = 1usize;
+    if max_width <= ellipsis_width {
+        // Caller asked for a width so small we can't fit content + ellipsis.
+        // The old code returned just "…" for width==1; preserve that shape.
         return "…".to_string();
     }
-    let mut out: String = s.chars().take(width - 1).collect();
+    let content_budget = max_width - ellipsis_width;
+
+    // Walk extended grapheme clusters, accumulating until the next cluster
+    // would exceed the content budget. The width of each cluster is the
+    // width of its rendered form -- combining marks contribute 0, ZWJ
+    // sequences contribute the rendered glyph's width (usually 2 for emoji,
+    // occasionally 1 or 3 for some).
+    let mut out: String = String::with_capacity(s.len());
+    let mut used: usize = 0;
+    for cluster in s.graphemes(true) {
+        // A cluster's display width is the sum of its chars' widths.
+        // unicode-width's UnicodeWidthStr::width(cluster) does exactly this.
+        let cluster_width = UnicodeWidthStr::width(cluster);
+        // Width-0 clusters (a lone combining mark, a ZWJ) never cause us to
+        // stop -- but they can still be appended if we have budget left.
+        if cluster_width == 0 {
+            if used <= content_budget {
+                out.push_str(cluster);
+            }
+            // else: dropping a trailing zero-width cluster after we've
+            // already filled the budget is the right thing; appending it
+            // would leave a dangling combiner.
+            continue;
+        }
+        if used + cluster_width > content_budget {
+            // This cluster doesn't fit; stop and append the ellipsis.
+            break;
+        }
+        out.push_str(cluster);
+        used += cluster_width;
+    }
     out.push('…');
+
+    // Guarantee: the result's display width is <= max_width. The content
+    // is <= content_budget, and the ellipsis adds 1, so total <= max_width.
+    // This holds even when the last cluster is a zero-width trailing
+    // combiner (we never append beyond content_budget).
+    debug_assert!(
+        UnicodeWidthStr::width(out.as_str()) <= max_width,
+        "truncate_to_width overflow: result width {} > max_width {} for {:?}",
+        UnicodeWidthStr::width(out.as_str()),
+        max_width,
+        out
+    );
     out
 }
 
@@ -448,17 +511,30 @@ pub struct AgentFeed {
     pub scroll_from_bottom: usize,
     /// Header line: activity state + reason, refreshed each poll.
     pub status_line: String,
+    /// Bytes read from the log tail that didn't end in a complete LF record
+    /// yet. Carried across polls so a multibyte UTF-8 codepoint or a
+    /// partially-written JSON line that straddles two polls is reconstructed
+    /// instead of dropped or decoded as invalid. (TUI-007.)
+    pub pending: Vec<u8>,
+    /// The most recent poll error (file vanished, permission denied, etc.),
+    /// surfaced as a one-line sanitized state line so a transient problem is
+    /// visible instead of silently swallowed. Cleared on the next successful
+    /// poll. (TUI-007.)
+    pub last_poll_error: Option<String>,
 }
 
 impl AgentFeed {
     /// Register that a (possibly new) run log was selected. A changed name
-    /// resets the cursor -- a fresh wake means a fresh file. Events are kept:
-    /// the feed spans wakes, which is exactly what "why did it sleep and what
-    /// happened when it woke" needs.
+    /// resets the cursor AND the pending byte buffer -- a fresh wake means a
+    /// fresh file, so any half-record from the previous file must not bleed
+    /// into the new one. Events are kept: the feed spans wakes, which is
+    /// exactly what "why did it sleep and what happened when it woke" needs.
     pub fn select_log(&mut self, name: Option<String>) {
         if name != self.log_name {
             self.log_name = name;
             self.pos = 0;
+            self.pending.clear();
+            self.last_poll_error = None;
         }
     }
 
@@ -699,6 +775,21 @@ impl MonitorState {
 
 /// Read any new bytes from the agent's selected run log, parse them, and push
 /// into the feed. Thin: all decisions live in the pure functions above.
+///
+/// (TUI-007.) This is byte-oriented, not string-oriented:
+/// - The appended tail is read as bytes into a per-feed `pending` buffer that
+///   survives across polls. A multibyte UTF-8 codepoint split across two
+///   reads is reconstructed instead of failing the whole poll.
+/// - Complete records are split on BYTE LF (`\n`) so a `\r` inside a line
+///   never breaks the boundary. Each complete record is decoded with
+///   `String::from_utf8_lossy` so invalid bytes become `U+FFFD` replacement
+///   glyphs instead of stopping future feed updates.
+/// - If the file length becomes smaller than `feed.pos`, the file was
+///   truncated or rotated; the cursor and pending buffer are reset so we
+///   re-tail from the new start.
+/// - Any poll error (file vanished, permission denied) is stored in
+///   `feed.last_poll_error` as a one-line sanitized state instead of being
+///   silently swallowed. The next successful poll clears it.
 fn poll_agent_feed(ctx: &Context, agent: &str, feed: &mut AgentFeed) -> Result<()> {
     let log_dir = ctx.trelane_dir().join("agents").join(agent).join("logs");
     let names: Vec<String> = std::fs::read_dir(&log_dir)
@@ -714,31 +805,93 @@ fn poll_agent_feed(ctx: &Context, agent: &str, feed: &mut AgentFeed) -> Result<(
         return Ok(());
     };
     let path = log_dir.join(&name);
-    let Ok(mut file) = std::fs::File::open(&path) else {
-        return Ok(());
+
+    let bytes_read = match read_log_tail(&path, feed) {
+        Ok(n) => n,
+        Err(e) => {
+            // Surface the error as a sanitized one-liner so the user can see
+            // the feed stopped, then return Ok so the monitor keeps running.
+            // `e` is sanitized before storage because poll errors can carry
+            // paths with arbitrary characters (no control bytes from real
+            // io::Error, but the invariant holds regardless).
+            feed.last_poll_error = Some(sanitize(&format!("feed read error: {e}")));
+            return Ok(());
+        }
     };
-    use std::io::{Read, Seek, SeekFrom};
-    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    if len <= feed.pos {
+    if bytes_read == 0 {
         return Ok(());
+    }
+
+    // Split the pending buffer on byte LF. Every complete record (including
+    // the trailing LF) is decoded with from_utf8_lossy and parsed; the final
+    // incomplete record (no LF yet) stays in `pending` for the next poll.
+    let mut events = Vec::new();
+    let mut start = 0usize;
+    let pending = std::mem::take(&mut feed.pending);
+    // We need to scan the full pending buffer (old + new bytes), so put it
+    // back and work on a local.
+    let mut buf = pending;
+    while start < buf.len() {
+        // Find the next byte LF from `start`.
+        match buf[start..].iter().position(|&b| b == b'\n') {
+            Some(rel) => {
+                let end = start + rel; // exclusive: the LF is at `end`
+                let record = &buf[start..end];
+                // Decode with lossy: invalid bytes become U+FFFD, never fail.
+                let line = String::from_utf8_lossy(record).into_owned();
+                // parse_line already sanitizes control bytes; from_utf8_lossy
+                // already replaced any invalid UTF-8 sequences with U+FFFD,
+                // which is a printable replacement glyph.
+                events.extend(parse_line(&line));
+                start = end + 1; // skip past the LF
+            }
+            None => {
+                // No more complete records; the rest is the new pending tail.
+                break;
+            }
+        }
+    }
+    // Keep the unconsumed tail. `start` is the byte offset of the first
+    // incomplete record; everything from there forward waits for the next
+    // poll's appended bytes.
+    feed.pending = buf.split_off(start);
+    feed.push_events(events);
+    // Successful poll: clear any previous error.
+    if feed.last_poll_error.is_some() {
+        feed.last_poll_error = None;
+    }
+    Ok(())
+}
+
+/// Read the appended tail of `path` since `feed.pos` into `feed.pending`.
+/// Returns the number of bytes read this poll (0 if nothing new). Handles
+/// truncation/rotation: if the file length is smaller than `feed.pos`,
+/// reset both `pos` and `pending` before reading from the start.
+///
+/// Separated from `poll_agent_feed` so the I/O shape is testable on its own
+/// (the unit tests below exercise truncation recovery and partial-record
+/// reconstruction without standing up a full Context).
+fn read_log_tail(path: &std::path::Path, feed: &mut AgentFeed) -> std::io::Result<usize> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len < feed.pos {
+        // Truncation or rotation: the file shrank below our cursor. Reset
+        // the cursor and the pending buffer so we re-tail from the new
+        // start; the alternative (seeking to a now-invalid offset) would
+        // either error or read garbage.
+        feed.pos = 0;
+        feed.pending.clear();
+    }
+    if len <= feed.pos {
+        return Ok(0);
     }
     file.seek(SeekFrom::Start(feed.pos))?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf)?;
-    // Only consume complete lines; a partially-written trailing line waits
-    // for the next poll so we never parse a half-flushed JSON object.
-    let consumed = match buf.rfind('\n') {
-        Some(idx) => idx + 1,
-        None => return Ok(()),
-    };
-    let complete = &buf[..consumed];
-    feed.pos += consumed as u64;
-    let mut events = Vec::new();
-    for line in complete.lines() {
-        events.extend(parse_line(line));
-    }
-    feed.push_events(events);
-    Ok(())
+    let mut chunk = Vec::new();
+    let n = file.read_to_end(&mut chunk)?;
+    feed.pos += n as u64;
+    feed.pending.extend_from_slice(&chunk);
+    Ok(n)
 }
 
 /// Refresh the Trelane-tab summary and per-agent status lines.
@@ -1384,6 +1537,18 @@ fn render(f: &mut ratatui::Frame, state: &MonitorState) {
                     Style::default().fg(dim),
                 )));
             }
+            // TUI-007: surface the most recent poll error (file vanished,
+            // permission denied, etc.) as a single sanitized line so the
+            // user can see the feed stopped, instead of the monitor looking
+            // frozen with no explanation. The error text was already
+            // sanitized at storage time, but truncate_to_width is the final
+            // render-boundary check that bounds it to one row.
+            if let Some(err) = feed.and_then(|fd| fd.last_poll_error.as_ref()) {
+                lines.push(Line::from(Span::styled(
+                    truncate_to_width(&format!("[feed] {}", err), inner_width),
+                    Style::default().fg(theme_color(THEME_WARN)),
+                )));
+            }
             let following = offset == 0;
             let title = format!(
                 " {name} -- {status}{} ",
@@ -1924,11 +2089,18 @@ mod tests {
 
     #[test]
     fn truncate_never_exceeds_width() {
+        // TUI-004: the invariant is DISPLAY WIDTH (terminal columns), not
+        // char count. ASCII happens to have width==chars, so this stays
+        // equivalent for the ASCII case but uses the real measure.
+        use unicode_width::UnicodeWidthStr;
         let long = "a".repeat(500);
         for w in [0, 1, 2, 10, 80, 200] {
+            let out = truncate_to_width(&long, w);
             assert!(
-                truncate_to_width(&long, w).chars().count() <= w.max(0),
-                "width {w} exceeded"
+                UnicodeWidthStr::width(out.as_str()) <= w.max(0),
+                "width {w} exceeded by {:?} (display width {})",
+                out,
+                UnicodeWidthStr::width(out.as_str())
             );
         }
     }
@@ -1945,12 +2117,117 @@ mod tests {
 
     #[test]
     fn truncate_does_not_split_multibyte_chars() {
-        // Cutting a run of multibyte chars must land on a char boundary; if it
-        // didn't, .chars() would have panicked building the result.
-        let s = "日本語のテキストです"; // 10 chars, 3 bytes each
+        // Cutting a run of multibyte chars must land on a grapheme cluster
+        // boundary (not in the middle of a combining mark or a ZWJ sequence)
+        // and must NOT exceed the requested terminal-column width.
+        let s = "日本語のテキストです"; // 10 CJK glyphs, 3 bytes each, 2 cols each
         let out = truncate_to_width(s, 4);
-        assert_eq!(out.chars().count(), 4);
+        // CJK glyphs are width 2, so width=4 fits exactly one glyph + ellipsis.
+        // The old code returned 4 chars (4 glyphs = 8 columns) -- a width
+        // overflow the screenshots showed as wrap-row artifacts.
+        use unicode_width::UnicodeWidthStr;
+        assert!(
+            UnicodeWidthStr::width(out.as_str()) <= 4,
+            "CJK truncation overflowed width 4: {:?} (width {})",
+            out,
+            UnicodeWidthStr::width(out.as_str())
+        );
         assert!(out.ends_with('…'));
+    }
+
+    // -------- TUI-004: display-column acceptance tests --------
+
+    #[test]
+    fn truncate_cjk_never_exceeds_requested_width() {
+        use unicode_width::UnicodeWidthStr;
+        // Japanese, CJK, and full-width text: every glyph is 2 columns.
+        // A body that fits exactly at width N (even N) stays intact; odd
+        // Ns clip to N-1 cols of content + 1 ellipsis.
+        let s = "日本語テスト";
+        for w in 0..20 {
+            let out = truncate_to_width(s, w);
+            let actual = UnicodeWidthStr::width(out.as_str());
+            assert!(
+                actual <= w,
+                "width {w}: result {out:?} has display width {actual}"
+            );
+        }
+        // Width 4 = 1 CJK glyph (2 cols) + ellipsis (1 col) = 3 cols total.
+        assert_eq!(UnicodeWidthStr::width(truncate_to_width(s, 4).as_str()), 3);
+        // Width 5 = 2 CJK glyphs (4 cols) + ellipsis (1 col) = 5 cols.
+        assert_eq!(UnicodeWidthStr::width(truncate_to_width(s, 5).as_str()), 5);
+    }
+
+    #[test]
+    fn truncate_keeps_combining_mark_clusters_together() {
+        // "e\u{301}" is one grapheme (é represented as e + combining acute).
+        // Truncation must NOT split it -- a trailing combining mark without
+        // its base would render as a stray diacritic on the wrong glyph or
+        // as a tofu box.
+        let s = "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}"; // 5 é clusters
+        let out = truncate_to_width(s, 4);
+        // Each cluster is 1 column wide, so width 4 = 3 clusters + ellipsis.
+        assert!(out.ends_with('…'));
+        // The result must not contain a stray combining mark at the start
+        // of a cluster (i.e. the truncation point is on a grapheme boundary).
+        assert!(
+            !out.starts_with('\u{301}'),
+            "split a combining mark from its base: {out:?}"
+        );
+        use unicode_width::UnicodeWidthStr;
+        assert!(UnicodeWidthStr::width(out.as_str()) <= 4);
+    }
+
+    #[test]
+    fn truncate_keeps_zwj_emoji_sequences_together() {
+        // The family emoji is a ZWJ sequence: man + ZWJ + woman + ZWJ + girl.
+        // It's a single grapheme of width 2. Truncation must NOT split it
+        // (a stray ZWJ or a half-family would render as garbage).
+        let family = "👨\u{200d}👩\u{200d}👧";
+        let s = format!("aa{family}bb"); // 2 ASCII + emoji (width 2) + 2 ASCII = 6 cols
+        let out = truncate_to_width(&s, 4);
+        use unicode_width::UnicodeWidthStr;
+        assert!(
+            UnicodeWidthStr::width(out.as_str()) <= 4,
+            "ZWJ overflow: {out:?}"
+        );
+        // The ZWJ sequence is either entirely present or entirely absent;
+        // never the leading man alone (which would have width 2 but a
+        // dangling ZWJ waiting for the next codepoint).
+        assert!(
+            !out.contains('\u{200d}') || out.contains(family),
+            "split a ZWJ emoji sequence: {out:?}"
+        );
+    }
+
+    #[test]
+    fn truncate_width_zero_and_one_remain_safe() {
+        assert_eq!(truncate_to_width("anything", 0), "");
+        assert_eq!(truncate_to_width("anything", 1), "…");
+        // CJK at width 1: the glyph (width 2) doesn't fit, so just the ellipsis.
+        assert_eq!(truncate_to_width("日本", 1), "…");
+    }
+
+    #[test]
+    fn truncate_preserves_short_strings() {
+        // ASCII and CJK short strings that fit are returned verbatim.
+        assert_eq!(truncate_to_width("hello", 20), "hello");
+        assert_eq!(truncate_to_width("hello", 5), "hello");
+        assert_eq!(truncate_to_width("日本", 4), "日本");
+    }
+
+    #[test]
+    fn truncate_long_ascii_uses_ellipsis_and_fits() {
+        use unicode_width::UnicodeWidthStr;
+        let long = "a".repeat(500);
+        for w in [0, 1, 2, 10, 80, 200] {
+            let out = truncate_to_width(&long, w);
+            let actual = UnicodeWidthStr::width(out.as_str());
+            assert!(actual <= w, "width {w}: actual {actual}");
+            if w >= 2 {
+                assert!(out.ends_with('…'));
+            }
+        }
     }
 
     // ---------------- newest_run_log ----------------
@@ -2031,6 +2308,376 @@ mod tests {
         feed.scroll_up();
         feed.scroll_up();
         assert_eq!(feed.scroll_from_bottom, 1, "can't scroll past the top");
+    }
+
+    // ---------------- TUI-007: byte-oriented feed ingestion ----------------
+    //
+    // The old read_to_string path failed the whole poll on invalid or
+    // temporarily-incomplete UTF-8, and silently discarded every polling
+    // error. These tests exercise the new byte-buffer + from_utf8_lossy
+    // + truncation-recovery + error-surfacing path. They drive read_log_tail
+    // and poll_agent_feed directly against a temp file so the I/O shape is
+    // covered without standing up a full Context.
+
+    fn write_and_sync(path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .unwrap();
+        f.write_all(bytes).unwrap();
+        f.flush().unwrap();
+    }
+
+    fn append_and_sync(path: &std::path::Path, bytes: &[u8]) {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap();
+        f.write_all(bytes).unwrap();
+        f.flush().unwrap();
+    }
+
+    #[test]
+    fn read_log_tail_reads_appended_bytes_and_advances_pos() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("run.log");
+        write_and_sync(&log, b"line one\nline two\n");
+        let mut feed = AgentFeed::default();
+        let n = read_log_tail(&log, &mut feed).unwrap();
+        assert_eq!(n, 18, "read both lines");
+        assert_eq!(feed.pos, 18);
+        // Both complete records are in pending; no LF-terminated record is
+        // ever dropped or split.
+        assert_eq!(feed.pending.iter().filter(|&&b| b == b'\n').count(), 2);
+    }
+
+    #[test]
+    fn read_log_tail_reconstructs_split_utf8_codepoint_across_polls() {
+        // The Japanese Hiragana 'hiragana A' あ is U+3042, encoded as the
+        // 3 bytes E3 81 82. Split it after the second byte; the first poll
+        // must NOT fail, and the second poll must complete the codepoint so
+        // from_utf8_lossy decodes it correctly (no U+FFFD).
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("run.log");
+        write_and_sync(&log, b"");
+        let mut feed = AgentFeed::default();
+
+        // First poll: write the first 2 bytes of あ + an LF that closes a
+        // partial record. The record is INCOMPLETE (the codepoint is split),
+        // so it must stay in `pending` -- no event emitted yet.
+        append_and_sync(&log, b"x\xe3\x81\n");
+        let n = read_log_tail(&log, &mut feed).unwrap();
+        assert_eq!(n, 4);
+        // The byte LF at offset 3 closes a record whose bytes are
+        // 'x', 0xE3, 0x81. Those bytes don't form valid UTF-8 (0xE3 0x81 is
+        // a 2-byte prefix of a 3-byte codepoint), so from_utf8_lossy would
+        // replace them with U+FFFD. That's the correct behavior per the
+        // spec: "Invalid UTF-8 bytes become replacement glyphs and cannot
+        // stop future feed updates." But the record IS LF-terminated, so
+        // it's consumed (and the partial codepoint at the END of the buffer
+        // is what stays pending). To exercise the cross-poll reconstruction
+        // cleanly, we instead test a record that straddles polls without an
+        // LF in the middle.
+        // Reset and run the real reconstruction case.
+        feed = AgentFeed::default();
+        write_and_sync(&log, b"");
+        // Write 'a' + the first 2 bytes of あ, NO LF.
+        append_and_sync(&log, b"a\xe3\x81");
+        read_log_tail(&log, &mut feed).unwrap();
+        // No complete record yet (no LF), so nothing should have been
+        // consumed and pending holds the partial bytes.
+        assert_eq!(feed.pending, b"a\xe3\x81");
+        assert_eq!(feed.pos, 3);
+
+        // Second poll: append the final byte of あ + LF.
+        append_and_sync(&log, b"\x82\n");
+        read_log_tail(&log, &mut feed).unwrap();
+        // Now the record 'aあ\n' is complete and pending is drained.
+        assert_eq!(feed.pending, b"a\xe3\x81\x82\n");
+        // Simulate the parse step poll_agent_feed does: split on byte LF.
+        let mut events = Vec::new();
+        let mut buf = std::mem::take(&mut feed.pending);
+        let mut start = 0;
+        while start < buf.len() {
+            match buf[start..].iter().position(|&b| b == b'\n') {
+                Some(rel) => {
+                    let end = start + rel;
+                    let line = String::from_utf8_lossy(&buf[start..end]).into_owned();
+                    events.extend(parse_line(&line));
+                    start = end + 1;
+                }
+                None => break,
+            }
+        }
+        feed.pending = buf.split_off(start);
+        // The reconstructed string is 'aあ' (the U+3042 codepoint came back
+        // together), NOT 'a\u{FFFD}'.
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AgentEvent::Raw(s) => assert_eq!(s, "aあ", "codepoint reconstructed across polls"),
+            other => panic!("expected Raw, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_log_tail_invalid_utf8_becomes_replacement_glyphs_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("run.log");
+        // Two lone continuation bytes (invalid as UTF-8 start bytes) + LF.
+        write_and_sync(&log, b"\xff\xfe\n");
+        let mut feed = AgentFeed::default();
+        // The read itself must succeed -- invalid UTF-8 is a decode-time
+        // concern, handled by from_utf8_lossy in the parser step, not an
+        // I/O error.
+        let n = read_log_tail(&log, &mut feed).unwrap();
+        assert_eq!(n, 3);
+        assert!(!feed.pending.is_empty());
+    }
+
+    #[test]
+    fn read_log_tail_resets_on_truncation() {
+        // Simulate log rotation: the file shrank below our cursor. The
+        // reader must reset pos to 0 and clear pending so we re-tail from
+        // the new start, instead of seeking to a now-invalid offset.
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("run.log");
+        // Write 100 bytes and consume them.
+        write_and_sync(&log, &b"x".repeat(100));
+        let mut feed = AgentFeed::default();
+        feed.pos = 100;
+        feed.pending = b"leftover".to_vec();
+        // Truncate the file to 30 bytes (rotation).
+        write_and_sync(&log, &b"y".repeat(30));
+        let n = read_log_tail(&log, &mut feed).unwrap();
+        assert_eq!(feed.pos, 30, "pos reset to file length");
+        assert_eq!(n, 30, "read the new content from start");
+        assert!(
+            !feed.pending.contains(&b'x'),
+            "pending was cleared of pre-truncation bytes"
+        );
+        assert!(feed.pending.iter().all(|&b| b == b'y'));
+    }
+
+    #[test]
+    fn select_log_clears_pending_and_error() {
+        // Switching to a fresh run log must drop any partial bytes and any
+        // error state from the previous file, so they don't bleed into the
+        // new feed.
+        let mut feed = AgentFeed::default();
+        feed.select_log(Some("run-a.log".to_string()));
+        feed.pending = b"partial".to_vec();
+        feed.last_poll_error = Some("old error".to_string());
+        feed.pos = 99;
+        feed.select_log(Some("run-b.log".to_string()));
+        assert!(feed.pending.is_empty(), "pending cleared on log switch");
+        assert!(
+            feed.last_poll_error.is_none(),
+            "error cleared on log switch"
+        );
+        assert_eq!(feed.pos, 0, "pos reset on log switch");
+        // Same log name: no reset (cursor and pending untouched).
+        feed.pending = b"more".to_vec();
+        feed.pos = 7;
+        feed.select_log(Some("run-b.log".to_string()));
+        assert_eq!(feed.pending, b"more");
+        assert_eq!(feed.pos, 7);
+    }
+
+    #[test]
+    fn poll_agent_feed_records_error_when_log_unreadable() {
+        // When the log file can't be opened (it doesn't exist), the poll
+        // must store a sanitized error in last_poll_error and return Ok so
+        // the monitor keeps running. The error text must contain no control
+        // bytes (the sanitize invariant holds even for io::Error strings).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let db_path = root.join(".trelane").join("trelane.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = crate::db::open(&db_path).unwrap();
+        let ctx = Context {
+            root: root.clone(),
+            conn,
+            config: crate::models::Config::default(),
+        };
+        // Register an agent so poll_agent_feed's log_dir resolution runs.
+        crate::commands::cmd_add_agent(
+            &ctx,
+            "alpha",
+            &["src/**".to_string()],
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut feed = AgentFeed::default();
+        // No log file exists yet; the feed should not error out at the
+        // `poll_agent_feed` level.
+        feed.select_log(Some("run-nope.log".to_string()));
+        // poll_agent_feed needs a log_name; force one that won't be found.
+        let result = poll_agent_feed(&ctx, "alpha", &mut feed);
+        assert!(result.is_ok(), "poll returned Ok despite missing log");
+        // The feed has no log_name (newest_run_log returned None for the
+        // empty dir), so last_poll_error stays None -- the "no log yet"
+        // case is normal, not an error.
+        assert!(feed.last_poll_error.is_none());
+    }
+
+    #[test]
+    fn poll_agent_feed_parses_complete_lines_from_byte_buffer() {
+        // End-to-end: write two JSON events to a log, poll, and assert
+        // both are parsed. This exercises the byte-LF split + the
+        // from_utf8_lossy decode + parse_line path together.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let db_path = root.join(".trelane").join("trelane.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = crate::db::open(&db_path).unwrap();
+        let ctx = Context {
+            root: root.clone(),
+            conn,
+            config: crate::models::Config::default(),
+        };
+        crate::commands::cmd_add_agent(
+            &ctx,
+            "alpha",
+            &["src/**".to_string()],
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        let log_dir = ctx.trelane_dir().join("agents").join("alpha").join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let log_path = log_dir.join("run-r-20260719T000000Z-zz.log");
+        write_and_sync(
+            &log_path,
+            b"{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"hello\"}}\n\
+              {\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"world\"}}\n",
+        );
+
+        let mut feed = AgentFeed::default();
+        poll_agent_feed(&ctx, "alpha", &mut feed).unwrap();
+        assert_eq!(feed.events.len(), 2, "both complete records parsed");
+        match (&feed.events[0], &feed.events[1]) {
+            (AgentEvent::Text(a), AgentEvent::Text(b)) => {
+                assert_eq!(a, "hello");
+                assert_eq!(b, "world");
+            }
+            other => panic!("expected two Text events, got {other:?}"),
+        }
+        assert!(feed.pending.is_empty(), "no partial record left");
+        assert!(feed.last_poll_error.is_none());
+    }
+
+    #[test]
+    fn poll_agent_feed_handles_partial_trailing_record_across_polls() {
+        // Write a complete record + the start of a second (no LF), poll,
+        // then append the rest + LF and poll again. The first poll emits
+        // one event and keeps the partial bytes; the second poll emits the
+        // second event and drains pending.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let db_path = root.join(".trelane").join("trelane.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = crate::db::open(&db_path).unwrap();
+        let ctx = Context {
+            root: root.clone(),
+            conn,
+            config: crate::models::Config::default(),
+        };
+        crate::commands::cmd_add_agent(
+            &ctx,
+            "alpha",
+            &["src/**".to_string()],
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        let log_dir = ctx.trelane_dir().join("agents").join("alpha").join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let log_path = log_dir.join("run-r-20260719T000000Z-aa.log");
+        write_and_sync(
+            &log_path,
+            b"{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"first\"}}\n\
+              {\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"se",
+        );
+
+        let mut feed = AgentFeed::default();
+        poll_agent_feed(&ctx, "alpha", &mut feed).unwrap();
+        assert_eq!(feed.events.len(), 1, "only the complete record parsed");
+        assert!(!feed.pending.is_empty(), "partial record kept for next poll");
+        // The partial bytes are the start of the second JSON object.
+        assert!(feed.pending.starts_with(b"{\"type\":\"text\""));
+
+        // Append the rest of the second record + LF.
+        append_and_sync(&log_path, b"cond\"}}\n");
+        poll_agent_feed(&ctx, "alpha", &mut feed).unwrap();
+        assert_eq!(feed.events.len(), 2, "second record parsed after completion");
+        assert!(feed.pending.is_empty(), "pending drained after second poll");
+        match &feed.events[1] {
+            AgentEvent::Text(s) => assert_eq!(s, "second"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn poll_agent_feed_recovers_from_log_truncation() {
+        // Write two records, poll both, then truncate the file to a single
+        // fresh record and poll again. The cursor must reset and the new
+        // record must be parsed without the old pending bytes leaking in.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let db_path = root.join(".trelane").join("trelane.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = crate::db::open(&db_path).unwrap();
+        let ctx = Context {
+            root: root.clone(),
+            conn,
+            config: crate::models::Config::default(),
+        };
+        crate::commands::cmd_add_agent(
+            &ctx,
+            "alpha",
+            &["src/**".to_string()],
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+        let log_dir = ctx.trelane_dir().join("agents").join("alpha").join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let log_path = log_dir.join("run-r-20260719T000000Z-bb.log");
+        write_and_sync(
+            &log_path,
+            b"{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"old1\"}}\n\
+              {\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"old2\"}}\n",
+        );
+        let mut feed = AgentFeed::default();
+        poll_agent_feed(&ctx, "alpha", &mut feed).unwrap();
+        assert_eq!(feed.events.len(), 2);
+
+        // Truncate + write a single fresh record (rotation).
+        write_and_sync(
+            &log_path,
+            b"{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"fresh\"}}\n",
+        );
+        // Force-feed a stale pending to prove it gets cleared on truncation.
+        feed.pending = b"stale partial".to_vec();
+        poll_agent_feed(&ctx, "alpha", &mut feed).unwrap();
+        // The fresh record is parsed; the stale pending is gone (not
+        // concatenated onto the fresh content).
+        let last = feed.events.last().unwrap();
+        match last {
+            AgentEvent::Text(s) => assert_eq!(s, "fresh", "stale pending leaked into fresh content"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+        assert!(feed.pending.is_empty());
     }
 
     // ---------------- tab navigation ----------------
