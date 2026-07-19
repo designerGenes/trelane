@@ -234,6 +234,11 @@ pub struct BiplaneUiState {
     pub model_overlay: Option<ModelOverlay>,
     /// When the inline list editor is open (work/deps/writable). None closed.
     pub list_editor: Option<ListEditor>,
+    /// True while a row-delete confirmation is pending (the next y confirms,
+    /// anything else cancels). Mirrors the monitor's kill_confirm pattern:
+    /// destructive actions get an explicit on-screen y/n gate so a stray
+    /// keypress can't silently drop a domain the user curated.
+    pub delete_confirm_pending: bool,
 }
 
 /// State for the model-selection overlay: a paged, scrollable picker over the
@@ -308,6 +313,7 @@ impl BiplaneUiState {
             model_free_only: false,
             model_overlay: None,
             list_editor: None,
+            delete_confirm_pending: false,
         }
     }
 
@@ -870,6 +876,105 @@ impl BiplaneUiState {
         }
     }
 
+    /// Insert a new scaffolded domain row immediately AFTER the cursor and
+    /// move the cursor onto it, so the user can immediately edit its name
+    /// (press `e` on the Name column) and writable globs (press `e` on the
+    /// Writable column). The new row is marked included and given a unique
+    /// placeholder name + a default writable glob so it's close to valid;
+    /// `validate_description` will still catch a forgotten name/glob at save
+    /// time. Sets `dirty` — the user must press `s` to persist (the
+    /// architecture already gates all writes behind `save_description`).
+    pub fn add_row(&mut self) {
+        let name = self.unique_scaffold_name();
+        let spec = DomainSpec {
+            name: name.clone(),
+            description: String::new(),
+            writable: vec![format!("src/{name}/**")],
+            forbidden_write: Vec::new(),
+            depends_on: Vec::new(),
+            planned_work: Vec::new(),
+            agents: 1,
+            model: None,
+        };
+        let row = DomainRow {
+            spec,
+            include: true,
+        };
+        // Insert after the cursor (or at the end if the list is empty).
+        let insert_at = if self.rows.is_empty() {
+            0
+        } else {
+            self.cursor + 1
+        };
+        self.rows.insert(insert_at, row);
+        self.cursor = insert_at;
+        // Reset the column cursor to Include so the user starts at the
+        // leftmost column of the new row, not whatever column the previous
+        // row happened to be focused on.
+        self.col_cursor = 0;
+        self.dirty = true;
+        self.status = Some(format!(
+            "added '{}' — press e on the Name column to rename, s to save",
+            name
+        ));
+    }
+
+    /// Generate a unique scaffold name for a newly-added row: "new-domain",
+    /// or "new-domain-2", "new-domain-3", ... if that's already taken.
+    /// Uniqueness matters because `validate_description` rejects duplicate
+    /// domain names, and a freshly-added row should be saveable without the
+    /// user having to rename it first just to clear a collision.
+    fn unique_scaffold_name(&self) -> String {
+        let taken: std::collections::HashSet<&str> =
+            self.rows.iter().map(|r| r.spec.name.as_str()).collect();
+        if !taken.contains("new-domain") {
+            return "new-domain".to_string();
+        }
+        let mut n = 2;
+        loop {
+            let candidate = format!("new-domain-{n}");
+            if !taken.contains(candidate.as_str()) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    /// Arm the delete-confirmation overlay for the focused row. The next
+    /// keypress is captured by the run_loop's confirm intercept: `y`/`Y`
+    /// calls `confirm_delete_row`, anything else calls `cancel_delete_row`.
+    /// Does NOT remove the row yet — the on-screen confirmation is the
+    /// whole point.
+    pub fn request_delete_row(&mut self) {
+        if self.cursor < self.rows.len() {
+            self.delete_confirm_pending = true;
+            self.status = None;
+        }
+    }
+
+    /// Actually remove the focused row. Called by the confirm intercept
+    /// when the user presses `y`. Clamps the cursor so it stays in bounds,
+    /// sets `dirty`, and surfaces a status line noting which row was
+    /// removed. The removal is NOT persisted to disk until the user presses
+    /// `s` — same as every other mutation in this editor.
+    pub fn confirm_delete_row(&mut self) {
+        self.delete_confirm_pending = false;
+        if self.cursor < self.rows.len() {
+            let removed = self.rows.remove(self.cursor);
+            if self.cursor > 0 && self.cursor >= self.rows.len() {
+                self.cursor = self.rows.len().saturating_sub(1);
+            }
+            self.dirty = true;
+            self.status = Some(format!("removed '{}' — press s to save", removed.spec.name));
+        }
+    }
+
+    /// Cancel the pending delete without removing anything.
+    pub fn cancel_delete_row(&mut self) {
+        self.delete_confirm_pending = false;
+        self.status = Some("delete cancelled".to_string());
+    }
+
     /// Number of currently included domains.
     pub fn included_count(&self) -> usize {
         self.rows.iter().filter(|r| r.include).count()
@@ -1179,6 +1284,18 @@ fn run_loop(
                         }
                         continue;
                     }
+                    // Row-delete confirmation intercept: when a delete is
+                    // pending, the very next key is captured BEFORE any
+                    // global or view-specific key, so 'q'/Tab/'s' can't
+                    // slip past an unanswered "delete? y/n". Mirrors the
+                    // monitor's kill_confirm_pending pattern.
+                    if state.delete_confirm_pending {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => state.confirm_delete_row(),
+                            _ => state.cancel_delete_row(),
+                        }
+                        continue; // key consumed by the confirmation
+                    }
                     // Keys common to every view come first; view-specific keys
                     // are dispatched by the active sub-screen. This is the one
                     // place that knows which view is active, so the pure state
@@ -1245,6 +1362,19 @@ fn run_loop(
                                 KeyCode::Char(']') => state.adjust_budget(true),
                                 KeyCode::Char('K') => state.move_up(),
                                 KeyCode::Char('J') => state.move_down(),
+                                // 'a' adds a new scaffolded domain row after
+                                // the cursor and moves the cursor onto it so
+                                // the user can immediately edit its name and
+                                // writable globs. Not persisted until 's'.
+                                KeyCode::Char('a') => state.add_row(),
+                                // 'D' (shift-d) arms a delete confirmation
+                                // overlay — the row is NOT removed until the
+                                // user presses 'y'; any other key cancels.
+                                // Uppercase to signal "destructive, gated"
+                                // and to avoid overloading lowercase 'd'
+                                // (which the list editor uses for item-level
+                                // delete).
+                                KeyCode::Char('D') => state.request_delete_row(),
                                 _ => {}
                             },
                             BiplaneView::Project => match other {
@@ -1634,14 +1764,16 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
     // Footer — hint depends on the active view so keys shown are the live ones.
     let default_hint = match state.view {
         BiplaneView::Domains => {
-            if state.model_overlay.is_some() {
+            if state.delete_confirm_pending {
+                "delete this domain?  y confirm   any other key cancel"
+            } else if state.model_overlay.is_some() {
                 "picking model — type to filter   Tab free-only   ↑↓ PgUp/PgDn move   Enter select   Esc cancel"
             } else if state.list_editor.is_some() {
                 "list editor — ↑↓ move   a add   e edit   d delete   Esc save & close"
             } else if state.editing {
                 "editing — type/adjust value   e/Enter commit   Esc cancel"
             } else {
-                "↑↓ row  ←→ column  e edit  [ ] budget  K/J reorder  G generate  T project  s save  ? help  q quit"
+                "↑↓ row  ←→ column  e edit  a add row  D delete row  [ ] budget  K/J reorder  G generate  T project  s save  ? help  q quit"
             }
         }
         BiplaneView::Project => "↑↓ scroll  V switch pane  G generate  T domains  s save  ? help  q quit",
@@ -1668,6 +1800,75 @@ fn render(f: &mut ratatui::Frame, state: &BiplaneUiState) {
     if state.list_editor.is_some() {
         render_list_editor(f, state, accent, dim);
     }
+    // Delete confirmation sits on top of everything else so it's the
+    // unmissable focal point when armed.
+    if state.delete_confirm_pending {
+        render_delete_confirm(f, state, accent, dim);
+    }
+}
+
+/// The delete-confirmation overlay: a small centered popup naming the
+/// domain about to be removed and asking for an explicit y/n. Any key other
+/// than y/Y cancels (the run_loop's confirm intercept handles this), so the
+/// user can't accidentally confirm with a stray Enter or space.
+fn render_delete_confirm(
+    f: &mut ratatui::Frame,
+    state: &BiplaneUiState,
+    accent: ratatui::style::Color,
+    dim: ratatui::style::Color,
+) {
+    use ratatui::layout::Rect;
+    use ratatui::style::{Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+
+    let Some(row) = state.rows.get(state.cursor) else {
+        return;
+    };
+    let name = &row.spec.name;
+
+    let area = f.area();
+    let w = 52u16.min(area.width.saturating_sub(4));
+    let h = 7u16;
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    };
+
+    let warn = tc(crate::diagnostic::THEME_WARN);
+    let lines = vec![
+        Line::from(Span::styled(
+            "Delete domain?",
+            Style::default().fg(warn).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(name.clone(), Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "  and all its settings will be removed from the plan.",
+                Style::default().fg(dim),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  y", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(" to confirm   ", Style::default().fg(dim)),
+            Span::styled("any other key", Style::default().fg(dim)),
+            Span::styled(" to cancel", Style::default().fg(dim)),
+        ]),
+    ];
+
+    f.render_widget(Clear, popup);
+    let para = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Confirm Delete ")
+            .border_style(Style::default().fg(warn)),
+    );
+    f.render_widget(para, popup);
 }
 
 /// A centered, bordered help overlay listing every key binding, grouped by
@@ -1717,6 +1918,8 @@ fn render_help_overlay(
         key("space", "quick-toggle the include checkbox"),
         key("[ ]", "decrease / increase the overall agent budget"),
         key("K / J", "reorder the focused domain up / down"),
+        key("a", "add a new scaffolded domain row after the cursor"),
+        key("D", "delete the focused domain row (asks y/n to confirm)"),
         Line::from(""),
         Line::from(Span::styled("Project view", Style::default().fg(accent))),
         key("↑ ↓", "scroll the content"),
@@ -2584,5 +2787,140 @@ mod tests {
     #[test]
     fn report_json_absent_by_default() {
         assert!(state().report_json.is_none());
+    }
+
+    // ---------------- add / remove row ----------------
+
+    #[test]
+    fn add_row_inserts_after_cursor_and_dirties() {
+        let mut s = state(); // 3 rows: engine, ui, api
+        s.cursor = 1; // ui
+        s.add_row();
+        // New row is at index 2 (after the cursor), cursor moved to it.
+        assert_eq!(s.rows.len(), 4);
+        assert_eq!(s.cursor, 2);
+        assert!(s.dirty);
+        // The new row is included by default and has a scaffolded name.
+        assert!(s.rows[2].include);
+        assert_eq!(s.rows[2].spec.name, "new-domain");
+        assert_eq!(s.rows[2].spec.agents, 1);
+        assert!(!s.rows[2].spec.writable.is_empty(), "scaffolded with a default glob");
+    }
+
+    #[test]
+    fn add_row_generates_unique_name() {
+        let mut s = state(); // cursor=0, rows: [engine, ui, api]
+        s.add_row(); // inserts at 1, cursor -> 1
+        assert_eq!(s.rows[1].spec.name, "new-domain");
+        s.cursor = 3; // now on "api" (pushed to index 3)
+        s.add_row(); // inserts at 4, cursor -> 4
+        assert_eq!(s.rows[4].spec.name, "new-domain-2");
+        // Adding again from a different position still avoids collision.
+        s.cursor = 0;
+        s.add_row(); // inserts at 1, cursor -> 1
+        assert_eq!(s.rows[1].spec.name, "new-domain-3");
+    }
+
+    #[test]
+    fn add_row_to_empty_list_works() {
+        let mut s = state();
+        s.rows.clear();
+        s.cursor = 0;
+        s.add_row();
+        assert_eq!(s.rows.len(), 1);
+        assert_eq!(s.cursor, 0);
+        assert!(s.dirty);
+    }
+
+    #[test]
+    fn add_row_resets_column_cursor() {
+        let mut s = state();
+        // Move column cursor to the rightmost column.
+        for _ in 0..10 {
+            s.col_right();
+        }
+        assert_ne!(s.col_cursor, 0);
+        s.add_row();
+        assert_eq!(s.col_cursor, 0, "new row starts at the Include column");
+    }
+
+    #[test]
+    fn delete_confirm_arms_and_is_cancelled_by_non_y() {
+        let mut s = state(); // 3 rows
+        s.cursor = 0; // engine
+        s.request_delete_row();
+        assert!(s.delete_confirm_pending);
+        // Simulate any non-y key: cancel.
+        s.cancel_delete_row();
+        assert!(!s.delete_confirm_pending);
+        // Row was NOT removed.
+        assert_eq!(s.rows.len(), 3);
+        assert!(!s.dirty, "cancel doesn't mutate, so dirty stays false");
+    }
+
+    #[test]
+    fn delete_confirm_removes_row_on_y_and_clamps_cursor() {
+        let mut s = state(); // 3 rows: engine, ui, api
+        s.cursor = 2; // api (last)
+        s.request_delete_row();
+        assert!(s.delete_confirm_pending);
+        s.confirm_delete_row();
+        assert!(!s.delete_confirm_pending);
+        assert_eq!(s.rows.len(), 2, "api was removed");
+        // Cursor clamped to the new last row.
+        assert_eq!(s.cursor, 1);
+        assert!(s.dirty);
+        assert_eq!(s.rows[0].spec.name, "engine");
+        assert_eq!(s.rows[1].spec.name, "ui");
+    }
+
+    #[test]
+    fn delete_confirm_deleting_only_row_leaves_empty_list() {
+        let mut s = state();
+        s.rows.clear();
+        s.add_row();
+        assert_eq!(s.rows.len(), 1);
+        s.request_delete_row();
+        s.confirm_delete_row();
+        assert!(s.rows.is_empty());
+        assert_eq!(s.cursor, 0);
+        assert!(s.dirty);
+    }
+
+    #[test]
+    fn delete_confirm_status_names_the_removed_domain() {
+        let mut s = state();
+        s.cursor = 0; // engine
+        s.request_delete_row();
+        s.confirm_delete_row();
+        assert!(s.status.as_deref().unwrap().contains("engine"));
+    }
+
+    #[test]
+    fn add_then_delete_leaves_dirty_and_no_disk_write() {
+        // The architecture gates ALL writes behind save_description (called
+        // only on 's'). Adding then deleting a row leaves dirty=true (the
+        // delete is itself a mutation), but no file was ever written. This
+        // test verifies the state transitions; the actual file-write gate
+        // is exercised by the save path's existing tests.
+        let mut s = state();
+        let original_len = s.rows.len();
+        s.add_row();
+        assert!(s.dirty);
+        // Move to the new row and delete it.
+        s.request_delete_row();
+        s.confirm_delete_row();
+        assert!(s.dirty, "dirty stays true after add+delete");
+        assert_eq!(s.rows.len(), original_len, "net row count unchanged");
+    }
+
+    #[test]
+    fn delete_confirm_does_not_fire_on_empty_list() {
+        let mut s = state();
+        s.rows.clear();
+        s.cursor = 0;
+        s.request_delete_row();
+        // No row to delete -> confirm should NOT arm (no-op).
+        assert!(!s.delete_confirm_pending);
     }
 }
