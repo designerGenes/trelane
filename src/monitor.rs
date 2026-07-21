@@ -85,129 +85,55 @@ impl AgentEvent {
 /// screen (fragmented, overlapping text -- exactly what a raw spinner replay
 /// looks like once it reaches a terminal that isn't expecting it).
 ///
-/// (TUI-001) This is a complete ANSI/VT state machine, not the partial
-/// ad-hoc parser that shipped before. It removes, per the remediation plan's
-/// boundary invariant:
-///   * CSI sequences (`ESC [ <params/intermediates> <final byte in
-///     0x40..=0x7E>`), e.g. `ESC [ 2 ~`, `ESC [ 1 @`, `ESC [ 32 m`.
-///   * OSC sequences (`ESC ] ...`), terminated by either BEL (`0x07`) or ST
-///     (`ESC \`) -- both terminators are fully consumed, not left as
-///     visible debris.
-///   * DCS / SOS / PM / APC string sequences (`ESC P`, `ESC X`, `ESC ^`,
-///     `ESC _`), each terminated by ST (`ESC \`).
-///   * Two-byte ESC sequences (`ESC <any other byte>`) -- cursor saves,
-///     index/next-line, charset shifts, etc. Both bytes are dropped.
-///   * C0 controls (`U+0000..U+001F`), DEL (`U+007F`), and C1 controls
-///     (`U+0080..U+009F`) -- every remaining `char::is_control()` byte --
-///     are replaced with a single space so spacing is preserved without
-///     ever emitting a byte that can move a cursor.
-///
-/// The output is guaranteed to contain only printable Unicode plus ordinary
-/// spaces: `sanitize(s).chars().all(|c| !c.is_control() && c != '\u{1b}')`.
+/// Recognized ANSI CSI (`ESC [ ... letter`) and OSC (`ESC ] ... BEL`)
+/// sequences are dropped in full, not left as visible bracket/digit debris.
+/// Any other C0 control byte (bare CR, stray NL, bell, etc.) becomes a
+/// single space, which preserves spacing without ever emitting a byte that
+/// can move a cursor.
 fn sanitize(s: &str) -> String {
-    let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
         if c == '\u{1b}' {
-            i = consume_escape(&chars, i, &mut out);
+            match chars.peek() {
+                Some('[') => {
+                    // CSI: ESC [ <params/intermediates> <final-letter>.
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if next.is_ascii_alphabetic() {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    // OSC: ESC ] ... terminated by BEL (or a following ESC,
+                    // left for the outer loop to consume on its own turn).
+                    chars.next();
+                    while let Some(&next) = chars.peek() {
+                        if next == '\u{7}' {
+                            chars.next();
+                            break;
+                        }
+                        if next == '\u{1b}' {
+                            break;
+                        }
+                        chars.next();
+                    }
+                }
+                _ => {
+                    // Unrecognized escape form: drop just the ESC byte so we
+                    // never silently swallow real content after it.
+                }
+            }
             continue;
         }
-        if c.is_control() {
-            // C0 (incl. CR, LF, BEL), DEL, and C1 (U+0080..U+009F) all become
-            // a single space. char::is_control() covers all three ranges.
+        if (c as u32) < 0x20 || c as u32 == 0x7f {
             out.push(' ');
-            i += 1;
             continue;
         }
         out.push(c);
-        i += 1;
     }
     out
-}
-
-/// Advance past one escape sequence starting at `chars[start]` (which is
-/// `ESC`). Returns the index of the next character to process. Any
-/// recognized sequence appends nothing to `out`; unrecognized forms drop
-/// only the ESC byte so real content after it is not silently swallowed.
-fn consume_escape(chars: &[char], start: usize, out: &mut String) -> usize {
-    let mut i = start;
-    // ESC alone at end of input: drop it.
-    if i + 1 >= chars.len() {
-        return i + 1;
-    }
-    let next = chars[i + 1];
-    i += 2; // past ESC and the introducer
-    match next {
-        // CSI: ESC [ <parameter/intermediate bytes> <final byte 0x40..0x7E>.
-        '[' => {
-            while i < chars.len() {
-                let b = chars[i];
-                i += 1;
-                let code = b as u32;
-                if (0x40..=0x7E).contains(&code) {
-                    break; // final byte consumed
-                }
-                if b == '\u{1b}' {
-                    // Embedded ESC: a new sequence is starting before the
-                    // CSI got its final byte. Back up so the outer loop
-                    // handles the ESC.
-                    i -= 1;
-                    break;
-                }
-                // Parameter (0x30..0x3F) and intermediate (0x20..0x2F)
-                // bytes are consumed silently. Anything else (e.g. an
-                // unexpected control) is consumed and the loop continues
-                // until a final byte or end of input.
-            }
-        }
-        // OSC: ESC ] ... terminated by BEL (0x07) or ST (ESC \).
-        ']' => {
-            while i < chars.len() {
-                let b = chars[i];
-                if b == '\u{7}' {
-                    i += 1; // consume BEL terminator
-                    break;
-                }
-                if b == '\u{1b}' {
-                    // Either ST (ESC \) or an embedded ESC starting a new
-                    // sequence.
-                    if i + 1 < chars.len() && chars[i + 1] == '\\' {
-                        i += 2; // consume ST
-                        break;
-                    }
-                    // ESC alone: leave it for the outer loop.
-                    break;
-                }
-                i += 1;
-            }
-        }
-        // DCS / SOS / PM / APC: terminated ONLY by ST (ESC \). Unlike OSC,
-        // BEL does NOT terminate these.
-        'P' | 'X' | '^' | '_' => {
-            while i < chars.len() {
-                let b = chars[i];
-                if b == '\u{1b}' {
-                    if i + 1 < chars.len() && chars[i + 1] == '\\' {
-                        i += 2; // consume ST
-                        break;
-                    }
-                    // ESC alone: leave it for the outer loop.
-                    break;
-                }
-                i += 1;
-            }
-        }
-        // Any other byte after ESC is a two-byte escape sequence
-        // (ESC =, ESC >, ESC D, ESC M, ESC E, ESC 7, ESC 8, ESC c, ...).
-        // Both bytes are already consumed by the initial `i += 2` above;
-        // nothing is appended.
-        _ => {}
-    }
-    // `out` is unchanged -- escape sequences produce no visible output.
-    let _ = out;
-    i
 }
 
 impl AgentEvent {
@@ -240,90 +166,27 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
         .collect()
 }
 
-/// Clip a string to at most `width` TERMINAL COLUMNS, appending an ellipsis
-/// when it was cut. Truncation is by extended grapheme cluster and measures
-/// display width via `unicode-width`/`unicode-segmentation`, so:
-///
-/// - CJK and full-width glyphs count as 2 columns (not 1 char) -- the old
-///   `chars().count()` code under-counted these and let a row of Japanese
-///   text overflow the pane.
-/// - Combining-mark clusters (e + ́ ) are kept together (the combining mark
-///   has width 0 but belongs to the previous cluster).
-/// - ZWJ emoji sequences (family, flag) are kept together (width 2).
-/// - The result's `UnicodeWidthStr::width` is guaranteed `<= max_width`.
-///
-/// This is what keeps the agent feed to exactly ONE terminal row per event:
-/// a body longer than the pane can't wrap onto extra rows, which is the root
-/// cause of the leftover-fragment artifacts (a long line wraps to several
-/// rows, then when the feed scrolls, the vacated wrap-rows aren't reliably
-/// cleared). One row per event makes rendered-rows == event-count, so the
-/// height-based windowing below is exact.
-///
-/// (TUI-004: this replaced the old `chars().count()` version, which measured
-/// Unicode scalar values rather than terminal columns.)
-pub fn truncate_to_width(s: &str, max_width: usize) -> String {
-    use unicode_segmentation::UnicodeSegmentation;
-    use unicode_width::UnicodeWidthStr;
-
-    if max_width == 0 {
+/// Clip a string to at most `width` characters, appending an ellipsis when it
+/// was cut. Truncation is by `char`, not byte, so it never splits a multibyte
+/// character. This is what keeps the agent feed to exactly ONE terminal row
+/// per event: a body longer than the pane can't wrap onto extra rows, which
+/// is the root cause of the leftover-fragment artifacts (a long line wraps to
+/// several rows, then when the feed scrolls, the vacated wrap-rows aren't
+/// reliably cleared). One row per event makes rendered-rows == event-count, so
+/// the height-based windowing below is exact.
+pub fn truncate_to_width(s: &str, width: usize) -> String {
+    if width == 0 {
         return String::new();
     }
-    // Fast path: the whole string already fits.
-    if UnicodeWidthStr::width(s) <= max_width {
+    let char_count = s.chars().count();
+    if char_count <= width {
         return s.to_string();
     }
-    // The ellipsis (…) is a single grapheme with display width 1 (it's
-    // U+2026 in NFC). Reserve its width when we're going to clip.
-    let ellipsis_width = 1usize;
-    if max_width <= ellipsis_width {
-        // Caller asked for a width so small we can't fit content + ellipsis.
-        // The old code returned just "…" for width==1; preserve that shape.
+    if width == 1 {
         return "…".to_string();
     }
-    let content_budget = max_width - ellipsis_width;
-
-    // Walk extended grapheme clusters, accumulating until the next cluster
-    // would exceed the content budget. The width of each cluster is the
-    // width of its rendered form -- combining marks contribute 0, ZWJ
-    // sequences contribute the rendered glyph's width (usually 2 for emoji,
-    // occasionally 1 or 3 for some).
-    let mut out: String = String::with_capacity(s.len());
-    let mut used: usize = 0;
-    for cluster in s.graphemes(true) {
-        // A cluster's display width is the sum of its chars' widths.
-        // unicode-width's UnicodeWidthStr::width(cluster) does exactly this.
-        let cluster_width = UnicodeWidthStr::width(cluster);
-        // Width-0 clusters (a lone combining mark, a ZWJ) never cause us to
-        // stop -- but they can still be appended if we have budget left.
-        if cluster_width == 0 {
-            if used <= content_budget {
-                out.push_str(cluster);
-            }
-            // else: dropping a trailing zero-width cluster after we've
-            // already filled the budget is the right thing; appending it
-            // would leave a dangling combiner.
-            continue;
-        }
-        if used + cluster_width > content_budget {
-            // This cluster doesn't fit; stop and append the ellipsis.
-            break;
-        }
-        out.push_str(cluster);
-        used += cluster_width;
-    }
+    let mut out: String = s.chars().take(width - 1).collect();
     out.push('…');
-
-    // Guarantee: the result's display width is <= max_width. The content
-    // is <= content_budget, and the ellipsis adds 1, so total <= max_width.
-    // This holds even when the last cluster is a zero-width trailing
-    // combiner (we never append beyond content_budget).
-    debug_assert!(
-        UnicodeWidthStr::width(out.as_str()) <= max_width,
-        "truncate_to_width overflow: result width {} > max_width {} for {:?}",
-        UnicodeWidthStr::width(out.as_str()),
-        max_width,
-        out
-    );
     out
 }
 
@@ -511,30 +374,17 @@ pub struct AgentFeed {
     pub scroll_from_bottom: usize,
     /// Header line: activity state + reason, refreshed each poll.
     pub status_line: String,
-    /// Bytes read from the log tail that didn't end in a complete LF record
-    /// yet. Carried across polls so a multibyte UTF-8 codepoint or a
-    /// partially-written JSON line that straddles two polls is reconstructed
-    /// instead of dropped or decoded as invalid. (TUI-007.)
-    pub pending: Vec<u8>,
-    /// The most recent poll error (file vanished, permission denied, etc.),
-    /// surfaced as a one-line sanitized state line so a transient problem is
-    /// visible instead of silently swallowed. Cleared on the next successful
-    /// poll. (TUI-007.)
-    pub last_poll_error: Option<String>,
 }
 
 impl AgentFeed {
     /// Register that a (possibly new) run log was selected. A changed name
-    /// resets the cursor AND the pending byte buffer -- a fresh wake means a
-    /// fresh file, so any half-record from the previous file must not bleed
-    /// into the new one. Events are kept: the feed spans wakes, which is
-    /// exactly what "why did it sleep and what happened when it woke" needs.
+    /// resets the cursor -- a fresh wake means a fresh file. Events are kept:
+    /// the feed spans wakes, which is exactly what "why did it sleep and what
+    /// happened when it woke" needs.
     pub fn select_log(&mut self, name: Option<String>) {
         if name != self.log_name {
             self.log_name = name;
             self.pos = 0;
-            self.pending.clear();
-            self.last_poll_error = None;
         }
     }
 
@@ -775,21 +625,6 @@ impl MonitorState {
 
 /// Read any new bytes from the agent's selected run log, parse them, and push
 /// into the feed. Thin: all decisions live in the pure functions above.
-///
-/// (TUI-007.) This is byte-oriented, not string-oriented:
-/// - The appended tail is read as bytes into a per-feed `pending` buffer that
-///   survives across polls. A multibyte UTF-8 codepoint split across two
-///   reads is reconstructed instead of failing the whole poll.
-/// - Complete records are split on BYTE LF (`\n`) so a `\r` inside a line
-///   never breaks the boundary. Each complete record is decoded with
-///   `String::from_utf8_lossy` so invalid bytes become `U+FFFD` replacement
-///   glyphs instead of stopping future feed updates.
-/// - If the file length becomes smaller than `feed.pos`, the file was
-///   truncated or rotated; the cursor and pending buffer are reset so we
-///   re-tail from the new start.
-/// - Any poll error (file vanished, permission denied) is stored in
-///   `feed.last_poll_error` as a one-line sanitized state instead of being
-///   silently swallowed. The next successful poll clears it.
 fn poll_agent_feed(ctx: &Context, agent: &str, feed: &mut AgentFeed) -> Result<()> {
     let log_dir = ctx.trelane_dir().join("agents").join(agent).join("logs");
     let names: Vec<String> = std::fs::read_dir(&log_dir)
@@ -805,93 +640,31 @@ fn poll_agent_feed(ctx: &Context, agent: &str, feed: &mut AgentFeed) -> Result<(
         return Ok(());
     };
     let path = log_dir.join(&name);
-
-    let bytes_read = match read_log_tail(&path, feed) {
-        Ok(n) => n,
-        Err(e) => {
-            // Surface the error as a sanitized one-liner so the user can see
-            // the feed stopped, then return Ok so the monitor keeps running.
-            // `e` is sanitized before storage because poll errors can carry
-            // paths with arbitrary characters (no control bytes from real
-            // io::Error, but the invariant holds regardless).
-            feed.last_poll_error = Some(sanitize(&format!("feed read error: {e}")));
-            return Ok(());
-        }
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return Ok(());
     };
-    if bytes_read == 0 {
+    use std::io::{Read, Seek, SeekFrom};
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len <= feed.pos {
         return Ok(());
     }
-
-    // Split the pending buffer on byte LF. Every complete record (including
-    // the trailing LF) is decoded with from_utf8_lossy and parsed; the final
-    // incomplete record (no LF yet) stays in `pending` for the next poll.
-    let mut events = Vec::new();
-    let mut start = 0usize;
-    let pending = std::mem::take(&mut feed.pending);
-    // We need to scan the full pending buffer (old + new bytes), so put it
-    // back and work on a local.
-    let mut buf = pending;
-    while start < buf.len() {
-        // Find the next byte LF from `start`.
-        match buf[start..].iter().position(|&b| b == b'\n') {
-            Some(rel) => {
-                let end = start + rel; // exclusive: the LF is at `end`
-                let record = &buf[start..end];
-                // Decode with lossy: invalid bytes become U+FFFD, never fail.
-                let line = String::from_utf8_lossy(record).into_owned();
-                // parse_line already sanitizes control bytes; from_utf8_lossy
-                // already replaced any invalid UTF-8 sequences with U+FFFD,
-                // which is a printable replacement glyph.
-                events.extend(parse_line(&line));
-                start = end + 1; // skip past the LF
-            }
-            None => {
-                // No more complete records; the rest is the new pending tail.
-                break;
-            }
-        }
-    }
-    // Keep the unconsumed tail. `start` is the byte offset of the first
-    // incomplete record; everything from there forward waits for the next
-    // poll's appended bytes.
-    feed.pending = buf.split_off(start);
-    feed.push_events(events);
-    // Successful poll: clear any previous error.
-    if feed.last_poll_error.is_some() {
-        feed.last_poll_error = None;
-    }
-    Ok(())
-}
-
-/// Read the appended tail of `path` since `feed.pos` into `feed.pending`.
-/// Returns the number of bytes read this poll (0 if nothing new). Handles
-/// truncation/rotation: if the file length is smaller than `feed.pos`,
-/// reset both `pos` and `pending` before reading from the start.
-///
-/// Separated from `poll_agent_feed` so the I/O shape is testable on its own
-/// (the unit tests below exercise truncation recovery and partial-record
-/// reconstruction without standing up a full Context).
-fn read_log_tail(path: &std::path::Path, feed: &mut AgentFeed) -> std::io::Result<usize> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path)?;
-    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
-    if len < feed.pos {
-        // Truncation or rotation: the file shrank below our cursor. Reset
-        // the cursor and the pending buffer so we re-tail from the new
-        // start; the alternative (seeking to a now-invalid offset) would
-        // either error or read garbage.
-        feed.pos = 0;
-        feed.pending.clear();
-    }
-    if len <= feed.pos {
-        return Ok(0);
-    }
     file.seek(SeekFrom::Start(feed.pos))?;
-    let mut chunk = Vec::new();
-    let n = file.read_to_end(&mut chunk)?;
-    feed.pos += n as u64;
-    feed.pending.extend_from_slice(&chunk);
-    Ok(n)
+    let mut buf = String::new();
+    file.read_to_string(&mut buf)?;
+    // Only consume complete lines; a partially-written trailing line waits
+    // for the next poll so we never parse a half-flushed JSON object.
+    let consumed = match buf.rfind('\n') {
+        Some(idx) => idx + 1,
+        None => return Ok(()),
+    };
+    let complete = &buf[..consumed];
+    feed.pos += consumed as u64;
+    let mut events = Vec::new();
+    for line in complete.lines() {
+        events.extend(parse_line(line));
+    }
+    feed.push_events(events);
+    Ok(())
 }
 
 /// Refresh the Trelane-tab summary and per-agent status lines.
@@ -1047,49 +820,40 @@ fn kill_session_agents(ctx: &Context) -> Result<(usize, usize)> {
 /// tab's log on an interval; renders tabs; handles navigation keys.
 pub fn run_monitor(ctx: &Context) -> Result<()> {
     use crossterm::event::{self, Event, KeyCode};
-    use crate::tui_session::TuiSession;
+    use crossterm::execute;
+    use crossterm::terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    };
+    use ratatui::Terminal;
+    use ratatui::backend::CrosstermBackend;
 
     let agents = store::list_agents(&ctx.conn)?;
     let mut state = MonitorState::new(&agents);
     poll_statuses(ctx, &mut state);
 
+    enable_raw_mode()?;
     // Draw to /dev/tty directly, not std::io::stdout(). When the monitor
     // co-runs with a background squire tick-loop (the default `trelane`
     // session), that loop prints progress to stdout; drawing to /dev/tty keeps
     // the TUI immune to it (stdout is captured to a session log by the caller).
     // Falls back to stdout when /dev/tty is unavailable (not a real terminal).
-    let tty: Box<dyn std::io::Write + Send> =
+    let mut tty: Box<dyn std::io::Write + Send> =
         match std::fs::OpenOptions::new().write(true).open("/dev/tty") {
             Ok(f) => Box::new(f),
             Err(_) => Box::new(std::io::stdout()),
         };
-    // TUI-006: the TuiSession guard owns the raw-mode/alternate-screen
-    // ladder and restores every completed stage in reverse order on Drop,
-    // so a panic or an error anywhere in the loop below can't strand the
-    // user's terminal in raw mode with the cursor hidden.
-    let mut session = TuiSession::enter()?;
-    session.enter_alternate_screen(tty)?;
+    execute!(tty, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(tty);
+    let mut terminal = Terminal::new(backend)?;
     // Force a full clear before the first draw. Some terminals/multiplexers
     // don't guarantee a blank alternate screen on entry, and ratatui only
     // diffs against its OWN prior frame -- so without this, a cell that no
     // widget happens to touch this frame (a quiet gap in the layout) can go
     // on showing whatever was there before this session started.
-    session.clear()?;
+    terminal.clear()?;
 
     let outcome = (|| -> Result<()> {
-        let terminal = session.terminal().unwrap();
         let mut last_poll = std::time::Instant::now() - std::time::Duration::from_secs(10);
-        // TUI-005: a full terminal.clear() is requested on Resize (the
-        // backend and both ratatui buffers must be invalidated together --
-        // old-geometry cells otherwise linger) and on Ctrl-L (manual
-        // recovery after out-of-band terminal corruption, e.g. a stray
-        // background write or a pager glitch). It is NOT done per-frame or
-        // per-tab-switch; the per-frame Clear widget that used to live in
-        // render() was a misleading mitigation that can't repair backend/
-        // terminal desync after an out-of-band write. See the plan's
-        // TUI-005 "do_not" list: no clearing every frame, no sleeps, and
-        // input draining alone is not the guarantee.
-        let mut needs_clear = false;
         loop {
             // Poll on an interval, not every frame: agent list + statuses are
             // DB queries, and the active feed is a file read.
@@ -1117,30 +881,16 @@ pub fn run_monitor(ctx: &Context) -> Result<()> {
             // terminal can fall behind on. Collapsing the burst into a single
             // state update plus one draw for the final state removes it.
             // event::poll(0) is a non-blocking check, so this never waits.
+            // (The other fix is the per-frame Clear + one-row-per-event
+            // rendering in render(), which removes the debris at its source.)
             loop {
                 if !event::poll(std::time::Duration::from_millis(0))? {
                     break;
                 }
-                // TUI-005: Resize is not a Key event -- it must be handled
-                // here in the drain loop, and it invalidates both ratatui
-                // buffers (the backend's previous-frame diff state) via a
-                // full clear before the next draw. Without this, cells from
-                // the old geometry can survive into the new frame. Ctrl-L
-                // is the manual-recovery binding for out-of-band corruption.
-                // Both classifications live in the pure `requests_full_clear`
-                // / `is_ctrl_l` helpers above so they're unit-testable.
-                let ev = event::read()?;
-                if requests_full_clear(&ev) {
-                    needs_clear = true;
-                    continue; // redraw with clear happens below this iteration
-                }
-                let Event::Key(key) = ev else {
-                    continue; // mouse/focus/paste: ignored
-                };
-                {
-                        let mode = state.active_mode();
-                        let on_trelane =
-                            matches!(state.tabs.get(state.active), Some(MonitorTab::Trelane));
+                if let Event::Key(key) = event::read()? {
+                    let mode = state.active_mode();
+                    let on_trelane =
+                        matches!(state.tabs.get(state.active), Some(MonitorTab::Trelane));
 
                     // A pending kill confirmation captures the very next key --
                     // before any global key -- so 'q'/Tab/'d' can't slip past
@@ -1253,22 +1003,16 @@ pub fn run_monitor(ctx: &Context) -> Result<()> {
                         }
                         _ => {}
                     }
-                } // end Event::Key handling block
+                }
                 if state.should_quit {
                     return Ok(());
                 }
             }
 
-            // TUI-005: honor a full-clear request (Resize or Ctrl-L) BEFORE
-            // the draw, so the backend's previous-buffer state and the
-            // physical terminal are invalidated together. A tab switch
-            // deliberately does NOT request a clear: the frame's own content
-            // covers the whole pane, and clearing on every switch would be
-            // exactly the per-frame clearing the plan forbids.
-            if needs_clear {
-                terminal.clear()?;
-                needs_clear = false;
-            }
+            // A tab switch changes the pane's content entirely; the per-frame
+            // Clear widget in render() wipes the content area before each draw,
+            // so the switch needs no extra between-frames clear here.
+
             terminal.draw(|f| render(f, &state))?;
 
             // Block briefly for the next event so the loop doesn't busy-spin
@@ -1279,66 +1023,44 @@ pub fn run_monitor(ctx: &Context) -> Result<()> {
         }
     })();
 
-    // TUI-006: close() restores cursor, leaves the alternate screen, and
-    // disables raw mode in reverse order, attempting every stage even if one
-    // fails (the plan's TUI-006 invariant: a failure in disable_raw_mode
-    // must not short-circuit LeaveAlternateScreen or show_cursor). The
-    // loop's own outcome takes precedence over a cleanup error; on a clean
-    // loop exit, a cleanup error is surfaced instead of swallowed.
-    let close_result = session.close();
-    outcome?;
-    close_result
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    outcome
 }
 
-/// Redirect process stdout (fd 1) AND stderr (fd 2) to a file for this
-/// guard's lifetime, restoring both on drop. Used so a background squire
-/// tick-loop's output lands in a session log instead of corrupting the
-/// monitor's screen (the monitor draws to /dev/tty, so it's unaffected by
-/// this redirect). See `tui_session::StdCapture` for the full rationale
-/// (TUI-003: exclusive terminal ownership).
-///
-/// This re-export exists so the call site stays readable; the actual
-/// implementation is shared with `bench_ui` so both entry points get the
-/// same flush-both, restore-both, fail-before-alt-screen semantics.
-pub(crate) use crate::tui_session::StdCapture;
-
-// ---------------------------------------------------- TUI-005 event helpers
-//
-// The full-clear decision is factored out of run_monitor's event loop into
-// these pure functions so it's unit-testable without a PTY: the loop calls
-// `requests_full_clear(event)` and, when true, calls `terminal.clear()`
-// before the next draw. See TUI-005 in the remediation plan.
-
-/// True when this key event is Ctrl-L. Most terminals deliver it as
-/// `Char('l')` with the CONTROL modifier; a few deliver the raw form-feed
-/// byte (0x0C), which crossterm reports as `Char('\x0c')` with no modifier.
-/// Handle both so the binding works across kitty/iTerm/Terminal.app/
-/// alacritty equally.
-pub fn is_ctrl_l(key: &crossterm::event::KeyEvent) -> bool {
-    (key.code == crossterm::event::KeyCode::Char('l')
-        && key
-            .modifiers
-            .contains(crossterm::event::KeyModifiers::CONTROL))
-        || key.code == crossterm::event::KeyCode::Char('\u{c}')
+/// Redirect process stdout (fd 1) to a file for this guard's lifetime,
+/// restoring it on drop. Used so a background squire tick-loop's progress
+/// prints land in a session log instead of corrupting the monitor's screen
+/// (the monitor draws to /dev/tty, so it's unaffected by this redirect). Same
+/// technique as bench_ui's capture; see run_session.
+struct StdoutCapture {
+    saved_fd: i32,
 }
 
-/// True when this event requires a full `terminal.clear()` before the next
-/// draw, per TUI-005:
-/// - `Event::Resize`: the backend's previous-buffer state refers to the old
-///   geometry, so it and both ratatui buffers must be invalidated together
-///   or old-geometry cells linger.
-/// - Ctrl-L: manual recovery after out-of-band terminal corruption (a stray
-///   background write, a pager glitch). Draws immediately after the clear.
-///
-/// Deliberately NOT requested on tab switches: the in-frame Clear widget in
-/// render() makes every tab's frame specify every cell of the content area,
-/// so a switch is exact in one frame without a full-terminal clear (which
-/// would be exactly the per-frame clearing the plan forbids).
-pub fn requests_full_clear(ev: &crossterm::event::Event) -> bool {
-    match ev {
-        crossterm::event::Event::Resize(_, _) => true,
-        crossterm::event::Event::Key(key) => is_ctrl_l(key),
-        _ => false,
+impl StdoutCapture {
+    fn to_file(path: &std::path::Path) -> Self {
+        use std::os::unix::io::IntoRawFd;
+        let saved_fd = unsafe { libc::dup(libc::STDOUT_FILENO) };
+        if let Ok(file) = std::fs::File::create(path) {
+            let file_fd = file.into_raw_fd();
+            unsafe {
+                libc::dup2(file_fd, libc::STDOUT_FILENO);
+                libc::close(file_fd);
+            }
+        }
+        StdoutCapture { saved_fd }
+    }
+}
+
+impl Drop for StdoutCapture {
+    fn drop(&mut self) {
+        if self.saved_fd >= 0 {
+            unsafe {
+                libc::dup2(self.saved_fd, libc::STDOUT_FILENO);
+                libc::close(self.saved_fd);
+            }
+        }
     }
 }
 
@@ -1408,19 +1130,10 @@ pub fn run_session(ctx: &Context, launcher: Option<String>, verbose: bool) -> Re
     let interval_s = ctx.config.squire.interval_s;
     let stop = Arc::new(AtomicBool::new(false));
 
-    // Capture the squire thread's stdout AND stderr to a session log for
-    // the UI's lifetime. The monitor is on /dev/tty, so this can't blank
-    // its screen -- and capturing stderr too stops the squire's eprintln!
-    // wake/skip lines from bleeding onto the TUI.
-    //
-    // TUI-003: capture setup must succeed BEFORE run_monitor enters the
-    // alternate screen. If the log can't be opened or either fd can't be
-    // dup'd we return the error here rather than continuing with a
-    // half-redirected terminal -- a partially-captured terminal leaves
-    // the background squire thread's writes able to corrupt the screen,
-    // which is exactly the bug this guard exists to prevent.
+    // Capture the squire thread's stdout to a session log for the UI's
+    // lifetime. The monitor is on /dev/tty, so this can't blank its screen.
     let log_path = ctx.trelane_dir().join("session.log");
-    let capture = StdCapture::to_file(&log_path)?;
+    let capture = StdoutCapture::to_file(&log_path);
 
     // The squire loop needs its own Context (Connection isn't Sync). Open a
     // second one against the same root; SQLite handles the concurrent access.
@@ -1506,25 +1219,11 @@ fn render(f: &mut ratatui::Frame, state: &MonitorState) {
         );
     f.render_widget(tabs, chunks[0]);
 
-    // Clear the content area inside the frame. Purpose and limits, precisely:
-    // ratatui widgets only write the cells they own -- a Paragraph with N
-    // lines leaves rows N..H untouched in the buffer -- so switching from a
-    // dense agent tab to a sparse Trelane tab without this would leave the
-    // old tab's rows lingering (a frame-geometry bug, visible as stale
-    // rows). The in-frame Clear makes THIS frame specify every cell of the
-    // area, so the diff is exact and tab switches are correct in one frame
-    // with no timing delay (acceptance test 3 of TUI-005).
-    //
-    // What this does NOT do (and never did): repair the physical terminal
-    // after an OUT-OF-BAND write. A logical Clear participates in the frame
-    // diff, so if another writer (a background thread's println, or an
-    // embedded escape sequence in event text) changed the physical terminal
-    // behind ratatui's buffer model, diff draws are not guaranteed to repair
-    // cells ratatui believes are already correct. Those cases are handled
-    // elsewhere: TUI-001 (sanitize all log-derived text), TUI-002
-    // (structured launcher output), TUI-003 (exclusive terminal ownership
-    // via stdout+stderr capture), and the deterministic full terminal.clear()
-    // calls in run_monitor (initial entry, Resize, Ctrl-L).
+    // Wipe the content area every frame before drawing into it. This is the
+    // reliable ratatui idiom (see diagnostic.rs) for guaranteeing no cell from
+    // a previous frame -- e.g. a taller agent tab's output -- survives when the
+    // current frame's content is shorter. terminal.clear() between frames is
+    // less dependable than an in-frame Clear over the exact area.
     f.render_widget(Clear, chunks[1]);
 
     // Diagnostic mode replaces the content area with detail/editor views.
@@ -1600,20 +1299,6 @@ fn render(f: &mut ratatui::Frame, state: &MonitorState) {
                     Span::styled(format!("{:<6}", ev.tag()), Style::default().fg(tag_color)),
                     Span::styled(truncate_to_width(&ev.body(), body_width), body_style),
                 ]));
-                // TUI-001 boundary assertion: the body of every rendered
-                // event must be free of ESC and other control bytes. This
-                // catches a regression where a new AgentEvent variant or a
-                // new parser path forgets to route through `sanitize` at
-                // ingestion time. Cheap (the slice is already truncated)
-                // and never trips in practice -- when it does, it means a
-                // bug, not a runtime condition, so `debug_assert!` is the
-                // right level.
-                debug_assert!(
-                    !ev.body().contains('\u{1b}')
-                        && ev.body().chars().all(|c| !c.is_control()),
-                    "rendered event body still contains control bytes: {:?}",
-                    ev.body()
-                );
             }
             if events.is_empty() {
                 lines.push(Line::from(Span::styled(
@@ -1623,18 +1308,6 @@ fn render(f: &mut ratatui::Frame, state: &MonitorState) {
                         inner_width,
                     ),
                     Style::default().fg(dim),
-                )));
-            }
-            // TUI-007: surface the most recent poll error (file vanished,
-            // permission denied, etc.) as a single sanitized line so the
-            // user can see the feed stopped, instead of the monitor looking
-            // frozen with no explanation. The error text was already
-            // sanitized at storage time, but truncate_to_width is the final
-            // render-boundary check that bounds it to one row.
-            if let Some(err) = feed.and_then(|fd| fd.last_poll_error.as_ref()) {
-                lines.push(Line::from(Span::styled(
-                    truncate_to_width(&format!("[feed] {}", err), inner_width),
-                    Style::default().fg(theme_color(THEME_WARN)),
                 )));
             }
             let following = offset == 0;
@@ -1671,12 +1344,10 @@ fn render_footer(
     let on_trelane = matches!(state.tabs.get(state.active), Some(MonitorTab::Trelane));
     let hint = match (state.active_mode(), on_trelane) {
         (ViewMode::Diagnostic, true) => {
-            "Tab switch  d feed  ↑↓ row  ←→ adjust  space toggle  s save  p/r pause/resume  k kill  ^L redraw  q quit"
+            "Tab switch  d feed  ↑↓ row  ←→ adjust  space toggle  s save  p/r pause/resume  k kill  q quit"
         }
-        (ViewMode::Diagnostic, false) => "Tab switch  d back to feed  ^L redraw  q quit",
-        (ViewMode::Normal, _) => {
-            "Tab/←→ switch  0-9 jump  d diagnostic  ↑↓ scroll  End/f follow  ^L redraw  q quit"
-        }
+        (ViewMode::Diagnostic, false) => "Tab switch  d back to feed  q quit",
+        (ViewMode::Normal, _) => "Tab/←→ switch  0-9 jump  d diagnostic  ↑↓ scroll  End/f follow  q quit",
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(dim)))),
@@ -1981,131 +1652,6 @@ mod tests {
         assert_eq!(sanitize("\x1b]0;window title\x07visible"), "visible");
     }
 
-    // -------- TUI-001: extended coverage from the remediation plan --------
-
-    #[test]
-    fn sanitize_strips_csi_with_tilde_final() {
-        // ESC [ 2 ~ is the Insert key; the plan explicitly names it as a case
-        // the old parser mishandled (the `~` was left as visible debris
-        // because the loop only stopped on `is_ascii_alphabetic()`).
-        assert_eq!(sanitize("\x1b[2~"), "");
-        assert_eq!(sanitize("a\x1b[2~b"), "ab");
-    }
-
-    #[test]
-    fn sanitize_strips_csi_with_at_sign_final() {
-        // ESC [ 1 @ is the "insert character" CSI; `@` is 0x40, the low end
-        // of the final-byte range 0x40..=0x7E, which the old `is_ascii_alphabetic`
-        // test missed.
-        assert_eq!(sanitize("\x1b[1@"), "");
-        assert_eq!(sanitize("a\x1b[1@b"), "ab");
-    }
-
-    #[test]
-    fn sanitize_strips_osc_terminated_by_st() {
-        // ESC ] ... ESC \  -- the String Terminator variant. The plan
-        // explicitly requires both the ESC and the backslash to be consumed.
-        assert_eq!(sanitize("\x1b]0;title\x1b\\visible"), "visible");
-        // No leftover backslash anywhere in the output.
-        let out = sanitize("\x1b]11;rgb:00/00/00\x1b\\text");
-        assert!(!out.contains('\\'), "backslash survived: {out:?}");
-        assert_eq!(out, "text");
-    }
-
-    #[test]
-    fn sanitize_strips_dcs_string() {
-        // DCS (ESC P) is terminated only by ST (ESC \), never by BEL.
-        assert_eq!(sanitize("\x1bP1$qtbel-stays-as-data\x07\x1b\\after"), "after");
-    }
-
-    #[test]
-    fn sanitize_strips_apc_string() {
-        // APC (ESC _) is used by tmux for pass-through sequences.
-        assert_eq!(sanitize("\x1b_tmux-passthrough\x1b\\after"), "after");
-    }
-
-    #[test]
-    fn sanitize_strips_sos_and_pm_strings() {
-        // SOS (ESC X) and PM (ESC ^) share the DCS/APC termination rule.
-        assert_eq!(sanitize("\x1bXfoo\x1b\\after"), "after");
-        assert_eq!(sanitize("\x1b^bar\x1b\\after"), "after");
-    }
-
-    #[test]
-    fn sanitize_strips_two_byte_esc_sequences() {
-        // ESC 7 / ESC 8 (save/restore cursor), ESC M (reverse index), ESC c
-        // (full reset), ESC = / ESC > (keypad mode). All two-byte ESC <x>
-        // forms must drop both bytes.
-        assert_eq!(sanitize("\x1b7AB"), "AB");
-        assert_eq!(sanitize("A\x1b8B"), "AB");
-        assert_eq!(sanitize("A\x1bMB"), "AB");
-        assert_eq!(sanitize("\x1bc"), "");
-        assert_eq!(sanitize("\x1b=x"), "x");
-        assert_eq!(sanitize("\x1b>x"), "x");
-    }
-
-    #[test]
-    fn sanitize_replaces_c1_controls_with_space() {
-        // C1 controls (U+0080..U+009F) are invisible in many editors but
-        // some terminals still honor them as control bytes. The plan
-        // requires they be replaced with a space, not dropped.
-        let poisoned = "a\u{0085}b\u{0099}c\u{0084}d";
-        let out = sanitize(poisoned);
-        assert_eq!(out, "a b c d");
-    }
-
-    #[test]
-    fn sanitize_preserves_emoji_and_zwj_sequences() {
-        // Emoji and ZWJ sequences are not control characters -- they must
-        // survive intact (related to TUI-004's grapheme handling).
-        let s = "wave 👋 and family 👨‍👩‍👧 done";
-        assert_eq!(sanitize(s), s);
-    }
-
-    #[test]
-    fn sanitize_json_text_field_with_escaped_controls_is_safe() {
-        // The plan's acceptance test: a JSON text field containing escaped
-        // U+001B and U+000D is safe AFTER parse_line. parse_line decodes
-        // JSON unescaping (so `"\u001b"` becomes a real ESC byte) and then
-        // sanitizes; the resulting Text event body must have no ESC and no
-        // bare CR. The opencode stream-json "text" event carries the
-        // string under /part/text -- see part_text.
-        let line = r#"{"type":"text","part":{"type":"text","text":"hi\u001b[31mred\rthere"}}"#;
-        let evs = parse_line(line);
-        assert_eq!(evs.len(), 1);
-        let body = evs[0].body();
-        assert!(!body.contains('\u{1b}'), "ESC survived: {body:?}");
-        assert!(!body.contains('\r'), "bare CR survived: {body:?}");
-        assert!(body.contains("red"));
-        assert!(body.contains("there"));
-    }
-
-    #[test]
-    fn sanitize_fuzzed_output_has_no_control_bytes_or_esc() {
-        // The plan's invariant: for any input, sanitized output contains
-        // no ESC and no control characters. Run a quick deterministic fuzz
-        // over mixed-byte junk.
-        let cases = [
-            "\x1b[1;2;3mtext\x1b[0m\x1b]2;title\x07after",
-            "a\x1bb\x1bc\x1bd",
-            "\x1bPp\x1b\\\x1b]q\x07r",
-            "\r\r\r\x1b[H\x1b[2J\r",
-            "\u{0000}\u{0001}\u{007f}\u{0080}\u{009f}",
-            "mixed\x1b[?25l\x1b[?1006h\x1b[?1049hanimation",
-            "\x1b[38;2;255;0;0mred\x1b[39m",
-        ];
-        for case in cases {
-            let out = sanitize(case);
-            for c in out.chars() {
-                assert!(
-                    !c.is_control() && c != '\u{1b}',
-                    "control byte {:#x} survived in {case:?} -> {out:?}",
-                    c as u32
-                );
-            }
-        }
-    }
-
     #[test]
     fn sanitize_replaces_bare_cr_with_space_not_dropped() {
         // A spinner redrawing in place: "Hits\rHull\rDone" with NO real
@@ -2179,18 +1725,11 @@ mod tests {
 
     #[test]
     fn truncate_never_exceeds_width() {
-        // TUI-004: the invariant is DISPLAY WIDTH (terminal columns), not
-        // char count. ASCII happens to have width==chars, so this stays
-        // equivalent for the ASCII case but uses the real measure.
-        use unicode_width::UnicodeWidthStr;
         let long = "a".repeat(500);
         for w in [0, 1, 2, 10, 80, 200] {
-            let out = truncate_to_width(&long, w);
             assert!(
-                UnicodeWidthStr::width(out.as_str()) <= w.max(0),
-                "width {w} exceeded by {:?} (display width {})",
-                out,
-                UnicodeWidthStr::width(out.as_str())
+                truncate_to_width(&long, w).chars().count() <= w.max(0),
+                "width {w} exceeded"
             );
         }
     }
@@ -2207,317 +1746,12 @@ mod tests {
 
     #[test]
     fn truncate_does_not_split_multibyte_chars() {
-        // Cutting a run of multibyte chars must land on a grapheme cluster
-        // boundary (not in the middle of a combining mark or a ZWJ sequence)
-        // and must NOT exceed the requested terminal-column width.
-        let s = "日本語のテキストです"; // 10 CJK glyphs, 3 bytes each, 2 cols each
+        // Cutting a run of multibyte chars must land on a char boundary; if it
+        // didn't, .chars() would have panicked building the result.
+        let s = "日本語のテキストです"; // 10 chars, 3 bytes each
         let out = truncate_to_width(s, 4);
-        // CJK glyphs are width 2, so width=4 fits exactly one glyph + ellipsis.
-        // The old code returned 4 chars (4 glyphs = 8 columns) -- a width
-        // overflow the screenshots showed as wrap-row artifacts.
-        use unicode_width::UnicodeWidthStr;
-        assert!(
-            UnicodeWidthStr::width(out.as_str()) <= 4,
-            "CJK truncation overflowed width 4: {:?} (width {})",
-            out,
-            UnicodeWidthStr::width(out.as_str())
-        );
+        assert_eq!(out.chars().count(), 4);
         assert!(out.ends_with('…'));
-    }
-
-    // -------- TUI-004: display-column acceptance tests --------
-
-    #[test]
-    fn truncate_cjk_never_exceeds_requested_width() {
-        use unicode_width::UnicodeWidthStr;
-        // Japanese, CJK, and full-width text: every glyph is 2 columns.
-        // A body that fits exactly at width N (even N) stays intact; odd
-        // Ns clip to N-1 cols of content + 1 ellipsis.
-        let s = "日本語テスト";
-        for w in 0..20 {
-            let out = truncate_to_width(s, w);
-            let actual = UnicodeWidthStr::width(out.as_str());
-            assert!(
-                actual <= w,
-                "width {w}: result {out:?} has display width {actual}"
-            );
-        }
-        // Width 4 = 1 CJK glyph (2 cols) + ellipsis (1 col) = 3 cols total.
-        assert_eq!(UnicodeWidthStr::width(truncate_to_width(s, 4).as_str()), 3);
-        // Width 5 = 2 CJK glyphs (4 cols) + ellipsis (1 col) = 5 cols.
-        assert_eq!(UnicodeWidthStr::width(truncate_to_width(s, 5).as_str()), 5);
-    }
-
-    #[test]
-    fn truncate_keeps_combining_mark_clusters_together() {
-        // "e\u{301}" is one grapheme (é represented as e + combining acute).
-        // Truncation must NOT split it -- a trailing combining mark without
-        // its base would render as a stray diacritic on the wrong glyph or
-        // as a tofu box.
-        let s = "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}"; // 5 é clusters
-        let out = truncate_to_width(s, 4);
-        // Each cluster is 1 column wide, so width 4 = 3 clusters + ellipsis.
-        assert!(out.ends_with('…'));
-        // The result must not contain a stray combining mark at the start
-        // of a cluster (i.e. the truncation point is on a grapheme boundary).
-        assert!(
-            !out.starts_with('\u{301}'),
-            "split a combining mark from its base: {out:?}"
-        );
-        use unicode_width::UnicodeWidthStr;
-        assert!(UnicodeWidthStr::width(out.as_str()) <= 4);
-    }
-
-    #[test]
-    fn truncate_keeps_zwj_emoji_sequences_together() {
-        // The family emoji is a ZWJ sequence: man + ZWJ + woman + ZWJ + girl.
-        // It's a single grapheme of width 2. Truncation must NOT split it
-        // (a stray ZWJ or a half-family would render as garbage).
-        let family = "👨\u{200d}👩\u{200d}👧";
-        let s = format!("aa{family}bb"); // 2 ASCII + emoji (width 2) + 2 ASCII = 6 cols
-        let out = truncate_to_width(&s, 4);
-        use unicode_width::UnicodeWidthStr;
-        assert!(
-            UnicodeWidthStr::width(out.as_str()) <= 4,
-            "ZWJ overflow: {out:?}"
-        );
-        // The ZWJ sequence is either entirely present or entirely absent;
-        // never the leading man alone (which would have width 2 but a
-        // dangling ZWJ waiting for the next codepoint).
-        assert!(
-            !out.contains('\u{200d}') || out.contains(family),
-            "split a ZWJ emoji sequence: {out:?}"
-        );
-    }
-
-    #[test]
-    fn truncate_width_zero_and_one_remain_safe() {
-        assert_eq!(truncate_to_width("anything", 0), "");
-        assert_eq!(truncate_to_width("anything", 1), "…");
-        // CJK at width 1: the glyph (width 2) doesn't fit, so just the ellipsis.
-        assert_eq!(truncate_to_width("日本", 1), "…");
-    }
-
-    #[test]
-    fn truncate_preserves_short_strings() {
-        // ASCII and CJK short strings that fit are returned verbatim.
-        assert_eq!(truncate_to_width("hello", 20), "hello");
-        assert_eq!(truncate_to_width("hello", 5), "hello");
-        assert_eq!(truncate_to_width("日本", 4), "日本");
-    }
-
-    #[test]
-    fn truncate_long_ascii_uses_ellipsis_and_fits() {
-        use unicode_width::UnicodeWidthStr;
-        let long = "a".repeat(500);
-        for w in [0, 1, 2, 10, 80, 200] {
-            let out = truncate_to_width(&long, w);
-            let actual = UnicodeWidthStr::width(out.as_str());
-            assert!(actual <= w, "width {w}: actual {actual}");
-            if w >= 2 {
-                assert!(out.ends_with('…'));
-            }
-        }
-    }
-
-    // ---------------- TUI-005: full-clear decision + frame correctness --------
-    //
-    // These tests cover the plan's TUI-005 acceptance criteria using
-    // ratatui's TestBackend instead of a PTY. The full PTY end-to-end
-    // scenario (real monitor in a pseudo-terminal, 100 tab switches, two
-    // resizes, one Ctrl-L) is the plan's regression_test_plan; the unit
-    // tests here lock in the DECISION logic (when do we request a full
-    // clear) and the FRAME correctness (the rendered buffer has no stale
-    // cells and no control bytes), which is what the PTY scenario asserts
-    // at the byte level.
-
-    #[test]
-    fn ctrl_l_is_detected_both_modi() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-        // The common form: Char('l') + CONTROL.
-        let k1 = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
-        assert!(is_ctrl_l(&k1), "Char('l') + CONTROL");
-        // The raw form-feed byte form (some terminals send 0x0C directly).
-        let k2 = KeyEvent::new(KeyCode::Char('\u{c}'), KeyModifiers::NONE);
-        assert!(is_ctrl_l(&k2), "raw form-feed Char('\\x0c')");
-        // Plain 'l' without CONTROL is NOT a redraw request.
-        let k3 = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE);
-        assert!(!is_ctrl_l(&k3));
-        // Control-something-else is NOT.
-        let k4 = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
-        assert!(!is_ctrl_l(&k4));
-    }
-
-    #[test]
-    fn resize_and_ctrl_l_request_full_clear_others_do_not() {
-        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-        // Resize always requests a clear.
-        assert!(requests_full_clear(&Event::Resize(80, 24)));
-        // Ctrl-L requests a clear.
-        assert!(requests_full_clear(&Event::Key(KeyEvent::new(
-            KeyCode::Char('l'),
-            KeyModifiers::CONTROL
-        ))));
-        assert!(requests_full_clear(&Event::Key(KeyEvent::new(
-            KeyCode::Char('\u{c}'),
-            KeyModifiers::NONE
-        ))));
-        // A Tab key (tab switch) does NOT request a clear: the in-frame
-        // Clear widget makes tab switches exact without a full-terminal
-        // clear. This is the "do not clear every frame / every switch"
-        // invariant from the plan.
-        assert!(!requests_full_clear(&Event::Key(KeyEvent::new(
-            KeyCode::Tab,
-            KeyModifiers::NONE
-        ))));
-        // A quit key does NOT.
-        assert!(!requests_full_clear(&Event::Key(KeyEvent::new(
-            KeyCode::Char('q'),
-            KeyModifiers::NONE
-        ))));
-        // Mouse/focus events do NOT.
-        assert!(!requests_full_clear(&Event::FocusGained));
-    }
-
-    #[test]
-    fn render_switches_from_dense_agent_tab_to_sparse_trelane_tab_without_stale_cells(
-    ) {
-        // Acceptance test 3 (normal tab switching correct without a timing
-        // delay): render a dense agent tab (many events), then switch to
-        // the sparse Trelane tab, and assert EVERY cell in the content
-        // rectangle holds the second frame's content -- i.e. no stale rows
-        // from the dense tab survive in the buffer. The in-frame Clear
-        // widget is what makes this exact; this test would fail without it.
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let width: u16 = 60;
-        let height: u16 = 20;
-        let backend = TestBackend::new(width, height);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        // Build state with one agent whose feed is dense.
-        let agents = vec!["alpha".to_string()];
-        let mut state = MonitorState::new(&agents);
-        let feed = state.feed_mut("alpha");
-        feed.status_line = "running -- working".to_string();
-        // Fill the feed with more events than the pane can show, so the
-        // dense tab truly fills the content area.
-        for i in 0..50 {
-            feed.push_events(vec![AgentEvent::Text(format!("dense line {i}"))]);
-        }
-        // Render the dense agent tab (tab 1).
-        state.jump_to(1);
-        terminal.draw(|f| render(f, &state)).unwrap();
-
-        // Switch to the sparse Trelane tab (tab 0) and render again.
-        state.jump_to(0);
-        terminal.draw(|f| render(f, &state)).unwrap();
-
-        // Inspect the buffer: no cell anywhere may still contain the dense
-        // tab's "dense line N" text. The buffer's cell symbols are joined
-        // row by row; a stale dense row would show up as that exact text.
-        let buf = terminal.backend().buffer();
-        let mut all_text = String::new();
-        for row in 0..height {
-            for col in 0..width {
-                all_text.push_str(buf[(col, row)].symbol());
-            }
-            all_text.push('\n');
-        }
-        assert!(
-            !all_text.contains("dense line"),
-            "stale dense-tab row survived the switch to the sparse Trelane tab:\n{all_text}"
-        );
-        // And the sparse tab's expected content IS present.
-        assert!(
-            all_text.contains("Trelane Monitor"),
-            "Trelane tab chrome missing after switch:\n{all_text}"
-        );
-    }
-
-    #[test]
-    fn render_poisoned_raw_event_emits_no_control_bytes() {
-        // The ratatui_test_backend part of the plan's regression plan:
-        // render poisoned Raw events and assert no Cell symbol contains ESC
-        // or control characters. parse_line sanitizes at ingestion, so a
-        // poisoned line's stored event body is already clean; this test
-        // verifies the full pipeline end-to-end at the buffer level.
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        let agents = vec!["alpha".to_string()];
-        let mut state = MonitorState::new(&agents);
-        // Feed a poisoned line through the PUBLIC parse path (the one the
-        // real feed uses), then push the resulting events.
-        let poisoned = "> build \x1b[36m\u{b7}\x1b[0m nvidia/nemotron\rHits\rHull\r\x07done";
-        let evs = parse_line(poisoned);
-        let feed = state.feed_mut("alpha");
-        feed.push_events(evs);
-        state.jump_to(1);
-        terminal.draw(|f| render(f, &state)).unwrap();
-
-        let buf = terminal.backend().buffer();
-        for row in 0..24u16 {
-            for col in 0..80u16 {
-                let sym = buf[(col, row)].symbol();
-                for c in sym.chars() {
-                    assert!(
-                        !c.is_control() && c != '\u{1b}',
-                        "control byte {:#x} in cell ({col},{row}) symbol {sym:?}",
-                        c as u32
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn render_every_event_occupies_exactly_one_row_at_several_widths() {
-        // The plan's "render at several widths and assert no event occupies
-        // more than one logical row." Each feed line is one row by
-        // construction (truncate_to_width + no .wrap()); this asserts the
-        // invariant at the buffer level for a long event at several widths.
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        for (w, h) in [(40u16, 15u16), (80, 24), (120, 30)] {
-            let backend = TestBackend::new(w, h);
-            let mut terminal = Terminal::new(backend).unwrap();
-            let agents = vec!["alpha".to_string()];
-            let mut state = MonitorState::new(&agents);
-            let feed = state.feed_mut("alpha");
-            // One very long event + a few short ones.
-            feed.push_events(vec![
-                AgentEvent::Text("x".repeat(500)),
-                AgentEvent::Text("short".to_string()),
-            ]);
-            state.jump_to(1);
-            terminal.draw(|f| render(f, &state)).unwrap();
-
-            // Count rows in the buffer that contain the long-event body.
-            // The long body is truncated to ONE row (with an ellipsis), so
-            // the run of 'x' characters appears on exactly one row; a wrap
-            // would put 'x' runs on 2+ rows.
-            let buf = terminal.backend().buffer();
-            let mut rows_with_x_run = 0;
-            for row in 0..h {
-                let mut line = String::new();
-                for col in 0..w {
-                    line.push_str(buf[(col, row)].symbol());
-                }
-                // A run of many x's marks the long event's row.
-                if line.matches('x').count() > 10 {
-                    rows_with_x_run += 1;
-                }
-            }
-            assert_eq!(
-                rows_with_x_run, 1,
-                "width {w}: long event wrapped onto {rows_with_x_run} rows"
-            );
-        }
     }
 
     // ---------------- newest_run_log ----------------
@@ -2598,376 +1832,6 @@ mod tests {
         feed.scroll_up();
         feed.scroll_up();
         assert_eq!(feed.scroll_from_bottom, 1, "can't scroll past the top");
-    }
-
-    // ---------------- TUI-007: byte-oriented feed ingestion ----------------
-    //
-    // The old read_to_string path failed the whole poll on invalid or
-    // temporarily-incomplete UTF-8, and silently discarded every polling
-    // error. These tests exercise the new byte-buffer + from_utf8_lossy
-    // + truncation-recovery + error-surfacing path. They drive read_log_tail
-    // and poll_agent_feed directly against a temp file so the I/O shape is
-    // covered without standing up a full Context.
-
-    fn write_and_sync(path: &std::path::Path, bytes: &[u8]) {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)
-            .unwrap();
-        f.write_all(bytes).unwrap();
-        f.flush().unwrap();
-    }
-
-    fn append_and_sync(path: &std::path::Path, bytes: &[u8]) {
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(path)
-            .unwrap();
-        f.write_all(bytes).unwrap();
-        f.flush().unwrap();
-    }
-
-    #[test]
-    fn read_log_tail_reads_appended_bytes_and_advances_pos() {
-        let tmp = tempfile::tempdir().unwrap();
-        let log = tmp.path().join("run.log");
-        write_and_sync(&log, b"line one\nline two\n");
-        let mut feed = AgentFeed::default();
-        let n = read_log_tail(&log, &mut feed).unwrap();
-        assert_eq!(n, 18, "read both lines");
-        assert_eq!(feed.pos, 18);
-        // Both complete records are in pending; no LF-terminated record is
-        // ever dropped or split.
-        assert_eq!(feed.pending.iter().filter(|&&b| b == b'\n').count(), 2);
-    }
-
-    #[test]
-    fn read_log_tail_reconstructs_split_utf8_codepoint_across_polls() {
-        // The Japanese Hiragana 'hiragana A' あ is U+3042, encoded as the
-        // 3 bytes E3 81 82. Split it after the second byte; the first poll
-        // must NOT fail, and the second poll must complete the codepoint so
-        // from_utf8_lossy decodes it correctly (no U+FFFD).
-        let tmp = tempfile::tempdir().unwrap();
-        let log = tmp.path().join("run.log");
-        write_and_sync(&log, b"");
-        let mut feed = AgentFeed::default();
-
-        // First poll: write the first 2 bytes of あ + an LF that closes a
-        // partial record. The record is INCOMPLETE (the codepoint is split),
-        // so it must stay in `pending` -- no event emitted yet.
-        append_and_sync(&log, b"x\xe3\x81\n");
-        let n = read_log_tail(&log, &mut feed).unwrap();
-        assert_eq!(n, 4);
-        // The byte LF at offset 3 closes a record whose bytes are
-        // 'x', 0xE3, 0x81. Those bytes don't form valid UTF-8 (0xE3 0x81 is
-        // a 2-byte prefix of a 3-byte codepoint), so from_utf8_lossy would
-        // replace them with U+FFFD. That's the correct behavior per the
-        // spec: "Invalid UTF-8 bytes become replacement glyphs and cannot
-        // stop future feed updates." But the record IS LF-terminated, so
-        // it's consumed (and the partial codepoint at the END of the buffer
-        // is what stays pending). To exercise the cross-poll reconstruction
-        // cleanly, we instead test a record that straddles polls without an
-        // LF in the middle.
-        // Reset and run the real reconstruction case.
-        feed = AgentFeed::default();
-        write_and_sync(&log, b"");
-        // Write 'a' + the first 2 bytes of あ, NO LF.
-        append_and_sync(&log, b"a\xe3\x81");
-        read_log_tail(&log, &mut feed).unwrap();
-        // No complete record yet (no LF), so nothing should have been
-        // consumed and pending holds the partial bytes.
-        assert_eq!(feed.pending, b"a\xe3\x81");
-        assert_eq!(feed.pos, 3);
-
-        // Second poll: append the final byte of あ + LF.
-        append_and_sync(&log, b"\x82\n");
-        read_log_tail(&log, &mut feed).unwrap();
-        // Now the record 'aあ\n' is complete and pending is drained.
-        assert_eq!(feed.pending, b"a\xe3\x81\x82\n");
-        // Simulate the parse step poll_agent_feed does: split on byte LF.
-        let mut events = Vec::new();
-        let mut buf = std::mem::take(&mut feed.pending);
-        let mut start = 0;
-        while start < buf.len() {
-            match buf[start..].iter().position(|&b| b == b'\n') {
-                Some(rel) => {
-                    let end = start + rel;
-                    let line = String::from_utf8_lossy(&buf[start..end]).into_owned();
-                    events.extend(parse_line(&line));
-                    start = end + 1;
-                }
-                None => break,
-            }
-        }
-        feed.pending = buf.split_off(start);
-        // The reconstructed string is 'aあ' (the U+3042 codepoint came back
-        // together), NOT 'a\u{FFFD}'.
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            AgentEvent::Raw(s) => assert_eq!(s, "aあ", "codepoint reconstructed across polls"),
-            other => panic!("expected Raw, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn read_log_tail_invalid_utf8_becomes_replacement_glyphs_not_an_error() {
-        let tmp = tempfile::tempdir().unwrap();
-        let log = tmp.path().join("run.log");
-        // Two lone continuation bytes (invalid as UTF-8 start bytes) + LF.
-        write_and_sync(&log, b"\xff\xfe\n");
-        let mut feed = AgentFeed::default();
-        // The read itself must succeed -- invalid UTF-8 is a decode-time
-        // concern, handled by from_utf8_lossy in the parser step, not an
-        // I/O error.
-        let n = read_log_tail(&log, &mut feed).unwrap();
-        assert_eq!(n, 3);
-        assert!(!feed.pending.is_empty());
-    }
-
-    #[test]
-    fn read_log_tail_resets_on_truncation() {
-        // Simulate log rotation: the file shrank below our cursor. The
-        // reader must reset pos to 0 and clear pending so we re-tail from
-        // the new start, instead of seeking to a now-invalid offset.
-        let tmp = tempfile::tempdir().unwrap();
-        let log = tmp.path().join("run.log");
-        // Write 100 bytes and consume them.
-        write_and_sync(&log, &b"x".repeat(100));
-        let mut feed = AgentFeed::default();
-        feed.pos = 100;
-        feed.pending = b"leftover".to_vec();
-        // Truncate the file to 30 bytes (rotation).
-        write_and_sync(&log, &b"y".repeat(30));
-        let n = read_log_tail(&log, &mut feed).unwrap();
-        assert_eq!(feed.pos, 30, "pos reset to file length");
-        assert_eq!(n, 30, "read the new content from start");
-        assert!(
-            !feed.pending.contains(&b'x'),
-            "pending was cleared of pre-truncation bytes"
-        );
-        assert!(feed.pending.iter().all(|&b| b == b'y'));
-    }
-
-    #[test]
-    fn select_log_clears_pending_and_error() {
-        // Switching to a fresh run log must drop any partial bytes and any
-        // error state from the previous file, so they don't bleed into the
-        // new feed.
-        let mut feed = AgentFeed::default();
-        feed.select_log(Some("run-a.log".to_string()));
-        feed.pending = b"partial".to_vec();
-        feed.last_poll_error = Some("old error".to_string());
-        feed.pos = 99;
-        feed.select_log(Some("run-b.log".to_string()));
-        assert!(feed.pending.is_empty(), "pending cleared on log switch");
-        assert!(
-            feed.last_poll_error.is_none(),
-            "error cleared on log switch"
-        );
-        assert_eq!(feed.pos, 0, "pos reset on log switch");
-        // Same log name: no reset (cursor and pending untouched).
-        feed.pending = b"more".to_vec();
-        feed.pos = 7;
-        feed.select_log(Some("run-b.log".to_string()));
-        assert_eq!(feed.pending, b"more");
-        assert_eq!(feed.pos, 7);
-    }
-
-    #[test]
-    fn poll_agent_feed_records_error_when_log_unreadable() {
-        // When the log file can't be opened (it doesn't exist), the poll
-        // must store a sanitized error in last_poll_error and return Ok so
-        // the monitor keeps running. The error text must contain no control
-        // bytes (the sanitize invariant holds even for io::Error strings).
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let db_path = root.join(".trelane").join("trelane.db");
-        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-        let conn = crate::db::open(&db_path).unwrap();
-        let ctx = Context {
-            root: root.clone(),
-            conn,
-            config: crate::models::Config::default(),
-        };
-        // Register an agent so poll_agent_feed's log_dir resolution runs.
-        crate::commands::cmd_add_agent(
-            &ctx,
-            "alpha",
-            &["src/**".to_string()],
-            &[],
-            None,
-            None,
-        )
-        .unwrap();
-
-        let mut feed = AgentFeed::default();
-        // No log file exists yet; the feed should not error out at the
-        // `poll_agent_feed` level.
-        feed.select_log(Some("run-nope.log".to_string()));
-        // poll_agent_feed needs a log_name; force one that won't be found.
-        let result = poll_agent_feed(&ctx, "alpha", &mut feed);
-        assert!(result.is_ok(), "poll returned Ok despite missing log");
-        // The feed has no log_name (newest_run_log returned None for the
-        // empty dir), so last_poll_error stays None -- the "no log yet"
-        // case is normal, not an error.
-        assert!(feed.last_poll_error.is_none());
-    }
-
-    #[test]
-    fn poll_agent_feed_parses_complete_lines_from_byte_buffer() {
-        // End-to-end: write two JSON events to a log, poll, and assert
-        // both are parsed. This exercises the byte-LF split + the
-        // from_utf8_lossy decode + parse_line path together.
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let db_path = root.join(".trelane").join("trelane.db");
-        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-        let conn = crate::db::open(&db_path).unwrap();
-        let ctx = Context {
-            root: root.clone(),
-            conn,
-            config: crate::models::Config::default(),
-        };
-        crate::commands::cmd_add_agent(
-            &ctx,
-            "alpha",
-            &["src/**".to_string()],
-            &[],
-            None,
-            None,
-        )
-        .unwrap();
-        let log_dir = ctx.trelane_dir().join("agents").join("alpha").join("logs");
-        std::fs::create_dir_all(&log_dir).unwrap();
-        let log_path = log_dir.join("run-r-20260719T000000Z-zz.log");
-        write_and_sync(
-            &log_path,
-            b"{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"hello\"}}\n\
-              {\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"world\"}}\n",
-        );
-
-        let mut feed = AgentFeed::default();
-        poll_agent_feed(&ctx, "alpha", &mut feed).unwrap();
-        assert_eq!(feed.events.len(), 2, "both complete records parsed");
-        match (&feed.events[0], &feed.events[1]) {
-            (AgentEvent::Text(a), AgentEvent::Text(b)) => {
-                assert_eq!(a, "hello");
-                assert_eq!(b, "world");
-            }
-            other => panic!("expected two Text events, got {other:?}"),
-        }
-        assert!(feed.pending.is_empty(), "no partial record left");
-        assert!(feed.last_poll_error.is_none());
-    }
-
-    #[test]
-    fn poll_agent_feed_handles_partial_trailing_record_across_polls() {
-        // Write a complete record + the start of a second (no LF), poll,
-        // then append the rest + LF and poll again. The first poll emits
-        // one event and keeps the partial bytes; the second poll emits the
-        // second event and drains pending.
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let db_path = root.join(".trelane").join("trelane.db");
-        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-        let conn = crate::db::open(&db_path).unwrap();
-        let ctx = Context {
-            root: root.clone(),
-            conn,
-            config: crate::models::Config::default(),
-        };
-        crate::commands::cmd_add_agent(
-            &ctx,
-            "alpha",
-            &["src/**".to_string()],
-            &[],
-            None,
-            None,
-        )
-        .unwrap();
-        let log_dir = ctx.trelane_dir().join("agents").join("alpha").join("logs");
-        std::fs::create_dir_all(&log_dir).unwrap();
-        let log_path = log_dir.join("run-r-20260719T000000Z-aa.log");
-        write_and_sync(
-            &log_path,
-            b"{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"first\"}}\n\
-              {\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"se",
-        );
-
-        let mut feed = AgentFeed::default();
-        poll_agent_feed(&ctx, "alpha", &mut feed).unwrap();
-        assert_eq!(feed.events.len(), 1, "only the complete record parsed");
-        assert!(!feed.pending.is_empty(), "partial record kept for next poll");
-        // The partial bytes are the start of the second JSON object.
-        assert!(feed.pending.starts_with(b"{\"type\":\"text\""));
-
-        // Append the rest of the second record + LF.
-        append_and_sync(&log_path, b"cond\"}}\n");
-        poll_agent_feed(&ctx, "alpha", &mut feed).unwrap();
-        assert_eq!(feed.events.len(), 2, "second record parsed after completion");
-        assert!(feed.pending.is_empty(), "pending drained after second poll");
-        match &feed.events[1] {
-            AgentEvent::Text(s) => assert_eq!(s, "second"),
-            other => panic!("expected Text, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn poll_agent_feed_recovers_from_log_truncation() {
-        // Write two records, poll both, then truncate the file to a single
-        // fresh record and poll again. The cursor must reset and the new
-        // record must be parsed without the old pending bytes leaking in.
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let db_path = root.join(".trelane").join("trelane.db");
-        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-        let conn = crate::db::open(&db_path).unwrap();
-        let ctx = Context {
-            root: root.clone(),
-            conn,
-            config: crate::models::Config::default(),
-        };
-        crate::commands::cmd_add_agent(
-            &ctx,
-            "alpha",
-            &["src/**".to_string()],
-            &[],
-            None,
-            None,
-        )
-        .unwrap();
-        let log_dir = ctx.trelane_dir().join("agents").join("alpha").join("logs");
-        std::fs::create_dir_all(&log_dir).unwrap();
-        let log_path = log_dir.join("run-r-20260719T000000Z-bb.log");
-        write_and_sync(
-            &log_path,
-            b"{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"old1\"}}\n\
-              {\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"old2\"}}\n",
-        );
-        let mut feed = AgentFeed::default();
-        poll_agent_feed(&ctx, "alpha", &mut feed).unwrap();
-        assert_eq!(feed.events.len(), 2);
-
-        // Truncate + write a single fresh record (rotation).
-        write_and_sync(
-            &log_path,
-            b"{\"type\":\"text\",\"part\":{\"type\":\"text\",\"text\":\"fresh\"}}\n",
-        );
-        // Force-feed a stale pending to prove it gets cleared on truncation.
-        feed.pending = b"stale partial".to_vec();
-        poll_agent_feed(&ctx, "alpha", &mut feed).unwrap();
-        // The fresh record is parsed; the stale pending is gone (not
-        // concatenated onto the fresh content).
-        let last = feed.events.last().unwrap();
-        match last {
-            AgentEvent::Text(s) => assert_eq!(s, "fresh", "stale pending leaked into fresh content"),
-            other => panic!("expected Text, got {other:?}"),
-        }
-        assert!(feed.pending.is_empty());
     }
 
     // ---------------- tab navigation ----------------

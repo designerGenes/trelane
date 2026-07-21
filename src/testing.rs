@@ -42,12 +42,6 @@ pub struct ScenarioAgent {
     pub forbidden_write: Vec<String>,
     #[serde(default)]
     pub launcher_agent: Option<String>,
-    /// Per-agent max_turns override for Bench mode. When set, the bench
-    /// orchestrator builds a per-agent launch command with this value
-    /// instead of using the global default. Lets scenarios give complex
-    /// agents more turns than simple ones.
-    #[serde(default)]
-    pub max_turns: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -56,10 +50,6 @@ pub enum ScenarioMode {
     #[default]
     Stub,
     Interactive,
-    /// Bench mode: headless free-model agents launched as subprocesses with
-    /// --max-turns. Like Stub mode in structure (squire::tick + wait_for_idle)
-    /// but with a longer slice timeout and an events file the live TUI tails.
-    Bench,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,50 +118,9 @@ pub enum ScenarioStep {
         explanation: String,
         count: usize,
     },
-    /// Verify a file exists in the sandbox project. The floor assertion for
-    /// "did this run actually generate anything": a Stub run with
-    /// hand-placed files passes; a free-model run that produced nothing fails.
-    AssertFileExists {
-        explanation: String,
-        path: String,
-    },
-    /// Verify a file's contents include a substring. Stronger than
-    /// AssertFileExists: catches an agent that created a placeholder file
-    /// with no real content. Substring (not regex) to keep scenarios portable.
-    AssertFileContains {
-        explanation: String,
-        path: String,
-        contains: String,
-    },
-    /// Verify a task is in a named state ("ready"/"active"/"done"/...).
-    /// Asserts the project's task ledger reflects what the scenario expected,
-    /// not just that no deadlock remains.
-    AssertTaskState {
-        explanation: String,
-        task_id: String,
-        state: String,
-    },
-    /// Verify an agent's derived activity state ("idle"/"running"/"blocked"/
-    /// "owned-work-ready"/...). Delegates to squire::agent_activity_status so
-    /// the assertion uses the same derivation the squire itself uses.
-    AssertAgentState {
-        explanation: String,
-        agent: String,
-        state: String,
-    },
-    /// Biplane --describe as a setup phase. Loads the *.describe.json, runs
-    /// Biplane planning (validate -> plan -> apply), and provisions the
-    /// plan's agents + tasks into the live session. This is the
-    /// Biplane->Trelane handoff exercised end-to-end. The describe path is
-    /// resolved relative to the scenario file's parent (so a fixture can
-    /// reference a sibling *.describe.json by bare filename) or as absolute.
-    BiplaneDescribe {
-        explanation: String,
-        describe_path: String,
-    },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ScenarioReport {
     pub run: u32,
     pub scenario: String,
@@ -246,7 +195,6 @@ pub fn run_testing(
             run,
             &sandbox_root,
             launcher_override.or(scenario.launcher.as_deref()),
-            Some(scenario_path),
         )?;
         println!(
             "[testing] run {run} finished result={} duration_ms={}",
@@ -275,7 +223,6 @@ fn run_once(
     run: u32,
     sandbox_root: &Path,
     launcher_override: Option<&str>,
-    scenario_path: Option<&Path>,
 ) -> Result<ScenarioReport> {
     let run_dir = sandbox_root.join(format!("scenario-run-{run}"));
     if run_dir.exists() {
@@ -303,24 +250,6 @@ fn run_once(
     commands::cmd_attach_project(Some(run_dir.clone()), None, None, false)?;
 
     let ctx = Context::open(Some(&run_dir))?;
-
-    // Bench mode: open the events file the live TUI (step 4) will tail.
-    // One file per run, in the sandbox, so concurrent runs don't collide.
-    let mut bench_events = if matches!(scenario.mode, ScenarioMode::Bench) {
-        let mut ev = crate::bench::BenchEvents::create(&run_dir.join("bench-events.jsonl"))?;
-        ev.emit(
-            "run_start",
-            serde_json::json!({
-                "run": run,
-                "scenario": scenario.name,
-                "total_steps": scenario.steps.len(),
-            }),
-        )?;
-        Some(ev)
-    } else {
-        None
-    };
-
     for agent in &scenario.agents {
         println!("[testing] add-agent {}", agent.name);
         commands::cmd_add_agent(
@@ -343,46 +272,6 @@ fn run_once(
             )?;
         }
     }
-
-    // Bench mode per-agent max_turns: set "shell" launch targets for every
-    // agent with the model + max_turns baked into the command. The squire's
-    // tick calls cmd_wake with launcher_override=None (set below), so cmd_wake
-    // checks the stored launch targets first and spawns the per-agent
-    // subprocess with the right max_turns.
-    let launcher_override = if matches!(scenario.mode, ScenarioMode::Bench) {
-        let global_max_turns = ctx.config.bench.default_max_turns;
-        let global_model = launcher_override.and_then(|o| {
-            // Extract the model from the override (built by
-            // bench::build_launcher_override, which puts "--model <id>" in
-            // the command).
-            let parts: Vec<&str> = o.split_whitespace().collect();
-            let i = parts.iter().position(|p| *p == "--model")?;
-            parts.get(i + 1).map(|s| s.to_string())
-        });
-        for agent in &scenario.agents {
-            let max_turns = agent.max_turns.unwrap_or(global_max_turns);
-            let model = agent
-                .launcher_agent
-                .as_deref()
-                .or(global_model.as_deref())
-                .unwrap_or("unknown-model");
-            let cmd = crate::bench::build_launcher_override(model, max_turns);
-            let now = crypto::now_iso();
-            crate::store::upsert_launch_target(
-                &ctx.conn,
-                &agent.name,
-                "shell",
-                "",
-                &cmd,
-                None,
-                &now,
-            )?;
-        }
-        // Clear the override so cmd_wake uses the per-agent launch targets.
-        None
-    } else {
-        launcher_override
-    };
 
     if matches!(scenario.mode, ScenarioMode::Interactive) {
         validate_interactive_setup(&ctx, scenario)?;
@@ -450,7 +339,6 @@ fn run_once(
                     task.as_deref(),
                     &Some(msg_id.clone()),
                     &None,
-                    &None,
                     waiting_on,
                     resume_hint,
                 )?;
@@ -463,22 +351,9 @@ fn run_once(
                 let override_arg = (!launcher.is_empty()).then_some(launcher.as_str());
                 for tick in 0..*ticks {
                     println!("[testing] pump tick {} of {}", tick + 1, ticks);
-                    let launched = crate::squire::tick(&ctx, override_arg, false)?;
+                    crate::squire::tick(&ctx, override_arg, false)?;
                     if matches!(scenario.mode, ScenarioMode::Stub) {
                         wait_for_idle(&ctx, 40, std::time::Duration::from_millis(250))?;
-                    } else if matches!(scenario.mode, ScenarioMode::Bench) {
-                        let running = count_running(&ctx);
-                        if let Some(ref mut events) = bench_events {
-                            events.after_tick(&ctx.conn, tick + 1, launched, running)?;
-                        }
-                        // Free-model slices can take minutes; wait up to the
-                        // configured slice timeout before declaring a stall.
-                        let timeout_s = ctx.config.bench.slice_timeout_s;
-                        wait_for_idle(
-                            &ctx,
-                            ((timeout_s / 2).max(1)) as usize,
-                            std::time::Duration::from_secs(2),
-                        )?;
                     }
                     counters.pumps += 1;
                 }
@@ -502,21 +377,10 @@ fn run_once(
                 let mut quiesced = false;
                 for tick in 0..*max_ticks {
                     println!("[testing] pump watch tick {} of {}", tick + 1, max_ticks);
-                    let launched = crate::squire::tick(&ctx, override_arg, false)?;
+                    crate::squire::tick(&ctx, override_arg, false)?;
                     counters.pumps += 1;
                     if matches!(scenario.mode, ScenarioMode::Stub) {
                         wait_for_idle(&ctx, 40, std::time::Duration::from_millis(250))?;
-                    } else if matches!(scenario.mode, ScenarioMode::Bench) {
-                        let running = count_running(&ctx);
-                        if let Some(ref mut events) = bench_events {
-                            events.after_tick(&ctx.conn, tick + 1, launched, running)?;
-                        }
-                        let timeout_s = ctx.config.bench.slice_timeout_s;
-                        wait_for_idle(
-                            &ctx,
-                            ((timeout_s / 2).max(1)) as usize,
-                            std::time::Duration::from_secs(2),
-                        )?;
                     }
                     if swarm_quiescent(&ctx)? {
                         idle_ticks += 1;
@@ -594,120 +458,12 @@ fn run_once(
                     )));
                 }
             }
-            ScenarioStep::AssertFileExists {
-                explanation: _,
-                path,
-            } => {
-                let abs = ctx.root.join(path);
-                if !abs.exists() {
-                    return Err(TrelaneError::msg(format!(
-                        "scenario assertion failed: expected file to exist but it does not: {}",
-                        path
-                    )));
-                }
-            }
-            ScenarioStep::AssertFileContains {
-                explanation: _,
-                path,
-                contains,
-            } => {
-                let abs = ctx.root.join(path);
-                let contents = fs::read_to_string(&abs).map_err(|e| {
-                    TrelaneError::msg(format!(
-                        "scenario assertion failed: cannot read {} for substring check: {e}",
-                        path
-                    ))
-                })?;
-                if !contents.contains(contains.as_str()) {
-                    return Err(TrelaneError::msg(format!(
-                        "scenario assertion failed: {} does not contain expected substring {:?} \
-                         (file has {} bytes)",
-                        path,
-                        contains,
-                        contents.len()
-                    )));
-                }
-            }
-            ScenarioStep::AssertTaskState {
-                explanation: _,
-                task_id,
-                state,
-            } => {
-                let task = crate::store::get_task(&ctx.conn, task_id)?.ok_or_else(|| {
-                    TrelaneError::msg(format!(
-                        "scenario assertion failed: task '{task_id}' not found"
-                    ))
-                })?;
-                if task.state.as_str() != state.as_str() {
-                    return Err(TrelaneError::msg(format!(
-                        "scenario assertion failed: task '{task_id}' expected state '{state}' \
-                         but is '{}'",
-                        task.state.as_str()
-                    )));
-                }
-            }
-            ScenarioStep::AssertAgentState {
-                explanation: _,
-                agent,
-                state,
-            } => {
-                let status = crate::squire::agent_activity_status(&ctx, agent)?;
-                if status.state.as_str() != state.as_str() {
-                    return Err(TrelaneError::msg(format!(
-                        "scenario assertion failed: agent '{agent}' expected activity state \
-                         '{state}' but is '{}' ({})",
-                        status.state.as_str(),
-                        status.reason
-                    )));
-                }
-            }
-            ScenarioStep::BiplaneDescribe {
-                explanation: _,
-                describe_path,
-            } => {
-                // Resolve the describe path: absolute as-is, otherwise
-                // relative to the scenario file's parent (so a fixture can
-                // reference a sibling *.describe.json by bare filename).
-                let p = std::path::Path::new(describe_path);
-                let resolved = if p.is_absolute() {
-                    p.to_path_buf()
-                } else {
-                    match scenario_path.and_then(|sp| sp.parent()) {
-                        Some(base) => base.join(p),
-                        None => {
-                            return Err(TrelaneError::msg(format!(
-                                "BiplaneDescribe step cannot resolve relative path '{describe_path}' \
-                                 without a scenario file path (in-memory scenarios must use an \
-                                 absolute describe_path)"
-                            )));
-                        }
-                    }
-                };
-                let desc = crate::biplane::load_project_description(&resolved)?;
-                let added = crate::biplane::apply_description_to_session(&ctx, &desc)?;
-                println!(
-                    "[testing] biplane-describe applied '{}' -> provisioned {} agent(s)/task(s)",
-                    resolved.display(),
-                    added
-                );
-            }
         }
     }
 
     let ended_at = chrono::Utc::now();
     let (_, cycle) = crate::pump::wait_graph(&ctx.conn)?;
     let deadlocks_detected = usize::from(cycle.is_some());
-
-    if let Some(ref mut events) = bench_events {
-        let _ = events.emit(
-            "run_end",
-            serde_json::json!({
-                "run": run,
-                "result": if deadlocks_detected == 0 { "ok" } else { "failed" },
-                "duration_ms": (ended_at - started_at).num_milliseconds(),
-            }),
-        );
-    }
 
     Ok(ScenarioReport {
         run,
@@ -729,7 +485,6 @@ fn run_once(
         mode: match scenario.mode {
             ScenarioMode::Stub => "stub".to_string(),
             ScenarioMode::Interactive => "interactive".to_string(),
-            ScenarioMode::Bench => "bench".to_string(),
         },
     })
 }
@@ -745,11 +500,6 @@ fn step_name(step: &ScenarioStep) -> &'static str {
         ScenarioStep::Redomain { .. } => "redomain",
         ScenarioStep::AssertNoDeadlock { .. } => "assert-no-deadlock",
         ScenarioStep::AssertParkedCount { .. } => "assert-parked-count",
-        ScenarioStep::AssertFileExists { .. } => "assert-file-exists",
-        ScenarioStep::AssertFileContains { .. } => "assert-file-contains",
-        ScenarioStep::AssertTaskState { .. } => "assert-task-state",
-        ScenarioStep::AssertAgentState { .. } => "assert-agent-state",
-        ScenarioStep::BiplaneDescribe { .. } => "biplane-describe",
     }
 }
 
@@ -763,12 +513,7 @@ fn step_explanation(step: &ScenarioStep) -> &str {
         | ScenarioStep::ClaimExpectDenied { explanation, .. }
         | ScenarioStep::Redomain { explanation, .. }
         | ScenarioStep::AssertNoDeadlock { explanation }
-        | ScenarioStep::AssertParkedCount { explanation, .. }
-        | ScenarioStep::AssertFileExists { explanation, .. }
-        | ScenarioStep::AssertFileContains { explanation, .. }
-        | ScenarioStep::AssertTaskState { explanation, .. }
-        | ScenarioStep::AssertAgentState { explanation, .. }
-        | ScenarioStep::BiplaneDescribe { explanation, .. } => explanation,
+        | ScenarioStep::AssertParkedCount { explanation, .. } => explanation,
     }
 }
 
@@ -845,19 +590,7 @@ fn resolve_pump_launcher(scenario: &Scenario, launcher_override: Option<&str>) -
             .map(str::to_string)
             .or_else(|| scenario.launcher.clone())
             .unwrap_or_default(),
-        ScenarioMode::Bench => launcher_override.map(str::to_string).unwrap_or_default(),
     }
-}
-
-/// Count how many registered agents currently have a running lock.
-fn count_running(ctx: &Context) -> usize {
-    crate::store::list_agents(&ctx.conn)
-        .map(|ags| {
-            ags.iter()
-                .filter(|a| commands::is_running(&ctx.conn, a).unwrap_or(false))
-                .count()
-        })
-        .unwrap_or(0)
 }
 
 fn launch_interactive_tmux_supervisor(
@@ -1081,19 +814,6 @@ fn send_and_capture(ctx: &Context, input: SendCaptureInput<'_>) -> Result<String
 }
 
 #[cfg(test)]
-pub(crate) fn bench_test_ctx(temp: &tempfile::TempDir) -> Context {
-    let root = temp.path().to_path_buf();
-    let db_path = root.join(".trelane").join("trelane.db");
-    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-    let conn = crate::db::open(&db_path).unwrap();
-    Context {
-        root,
-        conn,
-        config: crate::models::Config::default(),
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1145,367 +865,5 @@ mod tests {
             }),
             "assert-no-deadlock"
         );
-        assert_eq!(
-            step_name(&ScenarioStep::AssertFileExists {
-                explanation: "x".to_string(),
-                path: "src/a.rs".to_string()
-            }),
-            "assert-file-exists"
-        );
-        assert_eq!(
-            step_name(&ScenarioStep::AssertFileContains {
-                explanation: "x".to_string(),
-                path: "src/a.rs".to_string(),
-                contains: "fn main".to_string()
-            }),
-            "assert-file-contains"
-        );
-        assert_eq!(
-            step_name(&ScenarioStep::AssertTaskState {
-                explanation: "x".to_string(),
-                task_id: "t1".to_string(),
-                state: "done".to_string()
-            }),
-            "assert-task-state"
-        );
-        assert_eq!(
-            step_name(&ScenarioStep::AssertAgentState {
-                explanation: "x".to_string(),
-                agent: "alpha".to_string(),
-                state: "idle".to_string()
-            }),
-            "assert-agent-state"
-        );
-    }
-
-    /// The new Assert* variants deserialize from scenario JSON with the
-    /// expected fields. This is the parse contract the fixture files rely on.
-    #[test]
-    fn load_scenario_parses_assert_steps() {
-        let json = r#"{
-          "name": "asserts",
-          "description": "demo assert scenario",
-          "project": { "files": [{ "path": "README.md", "contents": "hi" }] },
-          "agents": [{ "name": "alpha", "description": "ui", "writable": ["src/**"] }],
-          "steps": [
-            { "type": "AssertFileExists", "explanation": "a", "path": "README.md" },
-            { "type": "AssertFileContains", "explanation": "b", "path": "README.md", "contains": "hi" },
-            { "type": "AssertAgentState", "explanation": "c", "agent": "alpha", "state": "idle" }
-          ]
-        }"#;
-        let scenario: Scenario = serde_json::from_str(json).unwrap();
-        assert_eq!(scenario.steps.len(), 3);
-        match &scenario.steps[0] {
-            ScenarioStep::AssertFileExists { path, .. } => assert_eq!(path, "README.md"),
-            other => panic!("expected AssertFileExists, got {:?}", other),
-        }
-        match &scenario.steps[1] {
-            ScenarioStep::AssertFileContains { path, contains, .. } => {
-                assert_eq!(path, "README.md");
-                assert_eq!(contains, "hi");
-            }
-            other => panic!("expected AssertFileContains, got {:?}", other),
-        }
-        match &scenario.steps[2] {
-            ScenarioStep::AssertAgentState { agent, state, .. } => {
-                assert_eq!(agent, "alpha");
-                assert_eq!(state, "idle");
-            }
-            other => panic!("expected AssertAgentState, got {:?}", other),
-        }
-    }
-
-    /// End-to-end through run_once (the real scenario runner path): a Stub
-    /// scenario with AssertFileExists/AssertFileContains against a
-    /// project.files entry passes, and AssertAgentState passes for an idle
-    /// freshly-registered agent. Verifies the new steps execute correctly
-    /// inside the step loop against a real sandbox.
-    #[test]
-    fn run_once_passes_assert_steps_against_intact_sandbox() {
-        let temp = tempfile::tempdir().unwrap();
-        let sandbox = temp.path().join("sandbox");
-        fs::create_dir_all(&sandbox).unwrap();
-        let scenario = Scenario {
-            name: "assert-pass".to_string(),
-            description: "asserts pass against hand-placed files".to_string(),
-            launcher: None,
-            mode: ScenarioMode::Stub,
-            project: ScenarioProject {
-                files: vec![
-                    ScenarioFile {
-                        path: "README.md".to_string(),
-                        contents: "# Demo\nfn main placeholder.\n".to_string(),
-                    },
-                    ScenarioFile {
-                        path: "src/lib.rs".to_string(),
-                        contents: "pub fn answer() -> u8 { 42 }\n".to_string(),
-                    },
-                ],
-            },
-            agents: vec![ScenarioAgent {
-                name: "alpha".to_string(),
-                description: "ui".to_string(),
-                writable: vec!["src/**".to_string()],
-                forbidden_write: vec![],
-                launcher_agent: None,
-                max_turns: None,
-            }],
-            steps: vec![
-                ScenarioStep::AssertFileExists {
-                    explanation: "README present".to_string(),
-                    path: "README.md".to_string(),
-                },
-                ScenarioStep::AssertFileContains {
-                    explanation: "README has the demo heading".to_string(),
-                    path: "README.md".to_string(),
-                    contains: "# Demo".to_string(),
-                },
-                ScenarioStep::AssertFileContains {
-                    explanation: "lib has the answer fn".to_string(),
-                    path: "src/lib.rs".to_string(),
-                    contains: "fn answer".to_string(),
-                },
-                ScenarioStep::AssertAgentState {
-                    explanation: "alpha is idle before any work".to_string(),
-                    agent: "alpha".to_string(),
-                    state: "idle".to_string(),
-                },
-            ],
-            metrics: vec![],
-        };
-        let report = run_once(&scenario, 1, &sandbox, None, None).unwrap();
-        assert_eq!(report.result, "ok", "run should pass all asserts");
-    }
-
-    /// AssertFileExists on a missing path must fail the run -- this is the
-    /// floor assertion's whole point: a run that produced nothing cannot
-    /// pass. Confirms the assertion errors propagate out of run_once
-    /// rather than being silently swallowed.
-    #[test]
-    fn run_once_fails_when_assert_file_exists_targets_missing_path() {
-        let temp = tempfile::tempdir().unwrap();
-        let sandbox = temp.path().join("sandbox");
-        fs::create_dir_all(&sandbox).unwrap();
-        let scenario = Scenario {
-            name: "assert-fail".to_string(),
-            description: "missing file fails the run".to_string(),
-            launcher: None,
-            mode: ScenarioMode::Stub,
-            project: ScenarioProject {
-                files: vec![ScenarioFile {
-                    path: "README.md".to_string(),
-                    contents: "hi".to_string(),
-                }],
-            },
-            agents: vec![ScenarioAgent {
-                name: "alpha".to_string(),
-                description: "ui".to_string(),
-                writable: vec!["src/**".to_string()],
-                forbidden_write: vec![],
-                launcher_agent: None,
-                max_turns: None,
-            }],
-            steps: vec![ScenarioStep::AssertFileExists {
-                explanation: "nonexistent file must fail".to_string(),
-                path: "src/never_created.rs".to_string(),
-            }],
-            metrics: vec![],
-        };
-        let err = run_once(&scenario, 1, &sandbox, None, None).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("src/never_created.rs"),
-            "error names the missing path: {msg}"
-        );
-        assert!(
-            msg.contains("but it does not"),
-            "error says the file is absent: {msg}"
-        );
-    }
-
-    /// AssertFileContains on a present file with the wrong substring must
-    /// fail. Catches the agent that wrote a placeholder with no real content.
-    #[test]
-    fn run_once_fails_when_assert_file_contains_misses() {
-        let temp = tempfile::tempdir().unwrap();
-        let sandbox = temp.path().join("sandbox");
-        fs::create_dir_all(&sandbox).unwrap();
-        let scenario = Scenario {
-            name: "assert-contains-fail".to_string(),
-            description: "wrong substring fails".to_string(),
-            launcher: None,
-            mode: ScenarioMode::Stub,
-            project: ScenarioProject {
-                files: vec![ScenarioFile {
-                    path: "src/lib.rs".to_string(),
-                    contents: "// nothing here\n".to_string(),
-                }],
-            },
-            agents: vec![ScenarioAgent {
-                name: "alpha".to_string(),
-                description: "ui".to_string(),
-                writable: vec!["src/**".to_string()],
-                forbidden_write: vec![],
-                launcher_agent: None,
-                max_turns: None,
-            }],
-            steps: vec![ScenarioStep::AssertFileContains {
-                explanation: "must contain the real impl".to_string(),
-                path: "src/lib.rs".to_string(),
-                contains: "fn answer".to_string(),
-            }],
-            metrics: vec![],
-        };
-        let err = run_once(&scenario, 1, &sandbox, None, None).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("fn answer"),
-            "error names expected substring: {msg}"
-        );
-        assert!(msg.contains("src/lib.rs"), "error names the file: {msg}");
-    }
-
-    /// AssertTaskState on an unknown task must fail the run with the task id
-    /// in the message -- catches a scenario that asserts against a task the
-    /// setup never created.
-    #[test]
-    fn run_once_fails_when_assert_task_state_targets_unknown_task() {
-        let temp = tempfile::tempdir().unwrap();
-        let sandbox = temp.path().join("sandbox");
-        fs::create_dir_all(&sandbox).unwrap();
-        let scenario = Scenario {
-            name: "assert-task-fail".to_string(),
-            description: "unknown task fails".to_string(),
-            launcher: None,
-            mode: ScenarioMode::Stub,
-            project: ScenarioProject {
-                files: vec![ScenarioFile {
-                    path: "README.md".to_string(),
-                    contents: "hi".to_string(),
-                }],
-            },
-            agents: vec![ScenarioAgent {
-                name: "alpha".to_string(),
-                description: "ui".to_string(),
-                writable: vec!["src/**".to_string()],
-                forbidden_write: vec![],
-                launcher_agent: None,
-                max_turns: None,
-            }],
-            steps: vec![ScenarioStep::AssertTaskState {
-                explanation: "unknown task must fail".to_string(),
-                task_id: "task-nope".to_string(),
-                state: "done".to_string(),
-            }],
-            metrics: vec![],
-        };
-        let err = run_once(&scenario, 1, &sandbox, None, None).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("task-nope"),
-            "error names the missing task: {msg}"
-        );
-        assert!(msg.contains("not found"), "error says not found: {msg}");
-    }
-
-    /// BiplaneDescribe step loads a *.describe.json, runs Biplane planning,
-    /// and provisions the plan's agents + tasks into the live session.
-    /// Verified end-to-end against the real space_rogue.describe.json fixture:
-    /// after the step, all four planned domains are registered agents and
-    /// their planned_work items exist as Ready tasks owned by the right agent.
-    /// This is the Biplane->Trelane handoff the bench framework depends on.
-    #[test]
-    fn biplane_describe_provisions_agents_and_tasks_from_fixture() {
-        let temp = tempfile::tempdir().unwrap();
-        let sandbox = temp.path().join("sandbox");
-        fs::create_dir_all(&sandbox).unwrap();
-        let describe_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/space_rogue.describe.json"
-        );
-        let scenario = Scenario {
-            name: "biplane-setup".to_string(),
-            description: "Biplane describe provisions the session".to_string(),
-            launcher: None,
-            mode: ScenarioMode::Stub,
-            // No hand-authored agents: the BiplaneDescribe step provisions
-            // every agent from the plan. This is the Biplane-driven setup path.
-            project: ScenarioProject { files: vec![] },
-            agents: vec![],
-            steps: vec![ScenarioStep::BiplaneDescribe {
-                explanation: "provision from space_rogue describe".to_string(),
-                describe_path: describe_path.to_string(),
-            }],
-            metrics: vec![],
-        };
-        let report = run_once(&scenario, 1, &sandbox, None, None).unwrap();
-        assert_eq!(report.result, "ok");
-
-        // Direct ledger checks: the budgeted domains (max_agents=3 in the
-        // fixture, so the first three in topo order -- engine, worldgen,
-        // combat -- are provisioned; ui is the fourth and is correctly cut by
-        // the cap) are registered as agents, and the planned_work items became
-        // Ready tasks owned by the right domain agent. These run against the
-        // same ctx the step loop used, confirming the provisioning landed in
-        // the DB rather than merely that no step errored.
-        let ctx = crate::Context::open(Some(&sandbox.join("scenario-run-1"))).unwrap();
-        let agents = crate::store::list_agents(&ctx.conn).unwrap();
-        for expected in ["engine", "worldgen", "combat"] {
-            assert!(
-                agents.iter().any(|a| a == expected),
-                "planned domain '{expected}' was not registered as an agent; got {agents:?}"
-            );
-        }
-        // The fixture's max_agents=3 caps the plan; ui is the fourth domain
-        // in dependency order and is intentionally NOT provisioned. Confirming
-        // the cap is honored is part of verifying the Biplane->Trelane
-        // handoff matches the plan, not just the description.
-        assert!(
-            !agents.iter().any(|a| a == "ui"),
-            "ui should be cut by the max_agents=3 budget, but was provisioned: {agents:?}"
-        );
-        let tasks = crate::store::list_tasks(&ctx.conn).unwrap();
-        // engine has 2 planned_work, worldgen 1, combat 1 = 4 (ui's 2 are cut
-        // by the max_agents=3 budget). The count confirms every budgeted
-        // domain's planned_work became a task, not just that some did.
-        assert!(
-            tasks.len() >= 4,
-            "expected at least 4 planned tasks from the three budgeted domains, found {}",
-            tasks.len()
-        );
-        let turn_loop = tasks
-            .iter()
-            .find(|t| t.subject == "Turn loop and scheduler")
-            .expect("planned_work 'Turn loop and scheduler' became a task");
-        assert_eq!(turn_loop.owner_agent, "engine");
-        assert_eq!(turn_loop.state, crate::models::TaskState::Ready);
-    }
-
-    /// BiplaneDescribe with a relative describe_path resolves against the
-    /// scenario file's parent directory. Verified by giving run_once a real
-    /// scenario_path pointing at tests/ and a bare filename -- the same
-    /// resolution a fixture file uses to reference a sibling *.describe.json.
-    #[test]
-    fn biplane_describe_resolves_relative_path_against_scenario_file() {
-        let temp = tempfile::tempdir().unwrap();
-        let sandbox = temp.path().join("sandbox");
-        fs::create_dir_all(&sandbox).unwrap();
-        let scenario_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/dummy.json");
-        let scenario = Scenario {
-            name: "biplane-rel".to_string(),
-            description: "relative describe path resolves against scenario file".to_string(),
-            launcher: None,
-            mode: ScenarioMode::Stub,
-            project: ScenarioProject { files: vec![] },
-            agents: vec![],
-            steps: vec![ScenarioStep::BiplaneDescribe {
-                explanation: "provision via sibling reference".to_string(),
-                describe_path: "space_rogue.describe.json".to_string(),
-            }],
-            metrics: vec![],
-        };
-        let report = run_once(&scenario, 1, &sandbox, None, Some(&scenario_path)).unwrap();
-        assert_eq!(report.result, "ok");
     }
 }

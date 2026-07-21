@@ -1,32 +1,24 @@
-pub mod bench;
-pub mod bench_ui;
 pub mod biplane;
 pub mod biplane_ui;
 pub mod cli;
-pub mod config_fields;
 pub mod commands;
 pub mod crypto;
 pub mod db;
-pub mod di;
 pub mod diagnostic;
 pub mod domain;
 pub mod entropy;
 pub mod error;
 pub mod logo;
 pub mod models;
-pub mod monitor;
 pub mod prompt;
 pub mod prop;
 pub mod pump;
-pub mod refine;
 pub mod retention;
 pub mod splash;
 pub mod squire;
 pub mod store;
 pub mod telemetry;
 pub mod testing;
-pub mod text_input;
-pub mod tui_session;
 
 use crate::cli::{Cli, Command};
 use crate::domain::find_root;
@@ -69,109 +61,7 @@ pub fn ensure_config() -> Result<PathBuf> {
             std::fs::write(&path, serde_json::to_string_pretty(&config)?)?;
         }
     }
-    // Run any pending versioned migrations on the on-disk config. Pure over
-    // the JSON: load, migrate, save. A no-op when the config is already at
-    // CURRENT_CONFIG_VERSION.
-    migrate_config_file(&path)?;
     Ok(path)
-}
-
-/// Run pending versioned migrations on the on-disk config file, in place.
-///
-/// Each migration step is **exact-match-only**: a profile/template value is
-/// rewritten only if it byte-equals a known legacy built-in default. Any
-/// user-customized value (even by a single character) is left untouched --
-/// the user's choice always wins. New built-in profiles introduced by the
-/// migration are inserted only if no profile of that name exists yet.
-///
-/// After all migrations, the file's `config_version` is bumped to
-/// `CURRENT_CONFIG_VERSION` and the file is rewritten as pretty JSON.
-///
-/// (TUI-002: the launcher profile defaults changed from human-readable to
-/// structured output. Without this migration, an existing config's
-/// unchanged-from-default `opencode` profile would keep the old plain-text
-/// command and the monitor would re-acquire the photographed corruption on
-/// the very next wake.)
-fn migrate_config_file(path: &Path) -> Result<()> {
-    let text = std::fs::read_to_string(path)?;
-    let mut config: Config = serde_json::from_str(&text)?;
-    let original_version = config.config_version;
-    if original_version >= crate::models::CURRENT_CONFIG_VERSION {
-        return Ok(()); // nothing to do
-    }
-
-    // ---- v0 -> v1: launcher profile defaults flip to structured output ----
-    if original_version < 1 {
-        // Legacy built-in defaults that the v1 default REPLACED. Each entry
-        // is (profile_name, exact_legacy_value, new_value). An exact match
-        // means the user never customized this profile, so it's safe to
-        // rewrite to the new default. A non-match means the user changed
-        // it -- we leave it alone.
-        const LEGACY_PROFILE_DEFAULTS: &[(&str, &str, &str)] = &[
-            (
-                "claude-code",
-                // Legacy v0 default for claude-code (human-readable).
-                r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50"#,
-                // v1 default: stream-json so the monitor can parse events.
-                r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50 --output-format stream-json --verbose"#,
-            ),
-            (
-                "opencode",
-                // Legacy v0 default for opencode (human-readable).
-                r#"opencode run "$(cat {prompt_file})""#,
-                // v1 default: structured JSON events with thoughts.
-                r#"opencode run --format json --thinking "$(cat {prompt_file})""#,
-            ),
-        ];
-        for (name, legacy, new) in LEGACY_PROFILE_DEFAULTS {
-            if let Some(current) = config.launcher.profiles.get(*name) {
-                if current == *legacy {
-                    config
-                        .launcher
-                        .profiles
-                        .insert(name.to_string(), new.to_string());
-                }
-                // else: user customized it -- leave it alone.
-            }
-            // If the profile is absent entirely, do NOT add it here: the
-            // user explicitly removed it, and re-adding would silently
-            // change behavior. The new *-plain escape hatches below are
-            // different names so adding them is additive, not a rewrite.
-        }
-
-        // Legacy built-in default for the launcher template (the
-        // "fallback when no profile is selected" command). Same
-        // exact-match-only rule.
-        const LEGACY_TEMPLATE: &str =
-            r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50"#;
-        const NEW_TEMPLATE: &str =
-            r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50 --output-format stream-json --verbose"#;
-        if config.launcher.template == LEGACY_TEMPLATE {
-            config.launcher.template = NEW_TEMPLATE.to_string();
-        }
-
-        // Additive: insert the new *-plain escape hatches ONLY where the
-        // user hasn't already defined a profile of that name. These are
-        // new names, so this never overwrites an existing customization.
-        if !config.launcher.profiles.contains_key("claude-code-plain") {
-            config.launcher.profiles.insert(
-                "claude-code-plain".to_string(),
-                r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50"#
-                    .to_string(),
-            );
-        }
-        if !config.launcher.profiles.contains_key("opencode-plain") {
-            config.launcher.profiles.insert(
-                "opencode-plain".to_string(),
-                r#"opencode run "$(cat {prompt_file})""#.to_string(),
-            );
-        }
-    }
-    // ---- future migrations: `if original_version < 2 { ... }` here ----
-
-    config.config_version = crate::models::CURRENT_CONFIG_VERSION;
-    std::fs::write(path, serde_json::to_string_pretty(&config)?)?;
-    Ok(())
 }
 
 /// Load the global config, creating it with defaults if missing.
@@ -179,13 +69,7 @@ pub fn load_config() -> Result<Config> {
     let path = ensure_config()?;
     let text = std::fs::read_to_string(&path)
         .map_err(|e| TrelaneError::msg(format!("cannot read config at {}: {e}", path.display())))?;
-    let config: Config = serde_json::from_str(&text)?;
-    // 4A config-inversion guard: a hand-edited config can invert the DI
-    // temporal relationships (objection window longer than the request
-    // lifetime, etc.). Catch it at load so every downstream path sees a
-    // sane config rather than failing cryptically inside di::resolve_pending.
-    config.di.validate()?;
-    Ok(config)
+    Ok(serde_json::from_str(&text)?)
 }
 
 /// Persist a config to the global config file as pretty JSON, creating the
@@ -228,265 +112,287 @@ pub fn run() -> Result<()> {
     handle(cli)
 }
 
-/// The consolidated session launcher: bare `trelane` (optionally with
-/// `--models`/`--agents` to configure the swarm). Resolves the project root,
-/// initializes a trelane session if one doesn't exist, optionally runs Biplane
-/// to propose agents, then either launches the tabbed monitor UI (default) or
-/// runs headless (`--headless`).
-fn run_session_command(cli: Cli) -> Result<()> {
-    // `--bench-sandbox X` watches a running `trelane bench run` instead of a
-    // normal project: point the monitor at <X>/scenario-run-1 read-only (the
-    // bench orchestrator is that session's ticker, so no squire loop here).
-    // This replaces the removed `monitor --bench-sandbox` command.
-    if let Some(sandbox) = cli.bench_sandbox.as_deref() {
-        let session_root = sandbox.join("scenario-run-1");
-        if !session_root.join(TRELANE_DIR).is_dir() {
-            return Err(TrelaneError::msg(format!(
-                "no bench session at {} -- is a `trelane bench run` active with this \
-                 --sandbox-root? (expected {}/.trelane)",
-                session_root.display(),
-                session_root.display()
-            )));
-        }
-        let ctx = Context::open(Some(&session_root))?;
-        return monitor::run_monitor(&ctx);
-    }
-
+fn cmd_launch(cli: Cli) -> Result<()> {
     let root = match cli.project.as_deref().or(cli.root.as_deref()) {
         Some(p) => p.canonicalize()?,
         None => std::env::current_dir()?.canonicalize()?,
     };
 
-    // Auto-init on first run so `trelane` in a fresh directory just works.
+    let models: Vec<String> = cli
+        .models
+        .as_deref()
+        .unwrap_or("glm-5.2")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let max_agents = cli.max_agents.unwrap_or(3) as usize;
+    let primary_model = models
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "glm-5.2".to_string());
+
+    crate::logo::print_logo();
+    println!();
+    println!("  Project   : {}", root.display());
+    println!("  Models    : {}", models.join(", "));
+    println!("  Max agents: {}", max_agents);
+    println!();
+
     if !root.join(TRELANE_DIR).join("trelane.db").exists() {
-        commands::cmd_init(Some(root.clone()))?;
+        crate::commands::cmd_init(Some(root.clone()))?;
     }
 
-    // Optional Biplane bootstrap: only when asked and no agents exist yet.
-    if cli.with_biplane {
-        let existing = {
-            let ctx = Context::open(Some(&root))?;
-            crate::store::list_agents(&ctx.conn)?
-        };
-        if existing.is_empty() {
-            let models: Vec<String> = cli
-                .models
-                .as_deref()
-                .unwrap_or("glm-5.2")
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            let primary = models.first().cloned().unwrap_or_else(|| "glm-5.2".to_string());
-            let max_agents = cli.max_agents.unwrap_or(3) as usize;
-            eprintln!("[trelane] running Biplane analysis with {primary}...");
-            let plan = biplane::run_biplane_plan(&root, &primary, max_agents)?;
-            let ctx = Context::open(Some(&root))?;
+    let existing_agents = {
+        let ctx = Context::open(Some(&root))?;
+        crate::store::list_agents(&ctx.conn)?
+    };
+
+    if existing_agents.is_empty() {
+        if cli.with_biplane {
+            println!(
+                "[launch] Running Biplane analysis with {}...",
+                primary_model
+            );
+            let plan = biplane::run_biplane_plan(&root, &primary_model, max_agents)?;
+
+            println!("[launch] Biplane proposed {} agent(s):", plan.agents.len());
             for a in &plan.agents {
-                commands::cmd_add_agent(
+                println!(
+                    "  - {} : {} (writable: {})",
+                    a.name,
+                    a.description,
+                    a.writable.join(", ")
+                );
+            }
+            println!();
+
+            let ctx = Context::open(Some(&root))?;
+            for agent in &plan.agents {
+                crate::commands::cmd_add_agent(
                     &ctx,
-                    &a.name,
-                    &a.writable,
+                    &agent.name,
+                    &agent.writable,
                     &[],
-                    if a.description.is_empty() {
-                        None
-                    } else {
-                        Some(a.description.as_str())
-                    },
-                    None,
+                    Some(&agent.description),
+                    Some(&primary_model),
                 )?;
             }
-            eprintln!("[trelane] Biplane proposed {} agent(s).", plan.agents.len());
-        }
-    }
 
-    // Seed/re-sync agents from an existing Biplane plan. If a
-    // biplane-description.json exists (the common case after running
-    // `trelane biplane`), register its domains as the session's default
-    // agents and queue their planned work. Idempotent: agents that already
-    // exist are re-synced (writable/model/description updated to match the
-    // current description), not duplicated, so this is safe to run every
-    // launch. New domains added to the description since the last launch
-    // are registered; domains removed from the description are NOT deleted
-    // from the DB (they may have history -- messages, tasks, claims).
-    //
-    // The previous `!has_agents` gate was a bug: it seeded agents only on
-    // the FIRST launch and then silently ignored every subsequent edit to
-    // the description, so a user who added a domain in the Biplane UI and
-    // saved saw nothing change on the next `trelane` run.
-    {
-        let ctx = Context::open(Some(&root))?;
-        let desc_path = root.join(TRELANE_DIR).join("biplane-description.json");
-        if desc_path.is_file() {
-            match biplane::load_project_description(&desc_path) {
-                Ok(desc) => match biplane::apply_description_to_session(&ctx, &desc) {
-                    Ok(n) if n > 0 => eprintln!(
-                        "[trelane] registered {n} new agent(s) from {}",
-                        desc_path.display()
-                    ),
-                    Ok(_) => {
-                        // No new agents, but existing ones were re-synced
-                        // (apply_plan_to_session prints its own resync line).
-                    }
-                    Err(e) => eprintln!(
-                        "[trelane] warning: could not apply biplane-description.json: {e}"
-                    ),
-                },
-                Err(e) => eprintln!(
-                    "[trelane] warning: could not read biplane-description.json: {e}"
-                ),
+            for task in &plan.initial_tasks {
+                crate::commands::cmd_send(
+                    &ctx,
+                    "user",
+                    &task.agent,
+                    "question",
+                    "normal",
+                    &task.work.subject,
+                    &task.work.body,
+                    &None,
+                    &None,
+                    &[],
+                )?;
             }
+
+            if let Some(pocket) = biplane::find_pocket_for_project(&root) {
+                let report_path = pocket.join("biplane-report.json");
+                let report = biplane::generate_biplane_report(&ctx, Some(&pocket))?;
+                std::fs::write(&report_path, serde_json::to_string_pretty(&report)?)?;
+                println!("[launch] Biplane report saved to {}", report_path.display());
+            }
+            println!();
+        } else {
+            println!("[launch] No agents registered. Use --with-biplane or add agents manually.");
+            println!(
+                "[launch] Run: trelane {} --models {} --max-agents {} --with-biplane",
+                root.display(),
+                primary_model,
+                max_agents
+            );
+            return Ok(());
         }
-    }
-
-    let ctx = Context::open(Some(&root))?;
-
-    // Clear stale running-locks from a previous session so liveness checks
-    // start clean (the old launcher did this too).
-    for agent in crate::store::list_agents(&ctx.conn)? {
-        if crate::store::get_running_lock(&ctx.conn, &agent)?.is_some() {
-            let _ = crate::store::delete_running_lock(&ctx.conn, &agent);
-        }
-    }
-
-    if cli.headless {
-        // True headless: the squire tick-loop in the foreground, no UI. Runs
-        // until interrupted (ctrl-c), matching the old `squire --watch`.
-        use std::sync::Arc;
-        use std::sync::atomic::AtomicBool;
-        let interval_s = cli.interval.unwrap_or(ctx.config.squire.interval_s);
-        crate::logo::print_logo();
-        eprintln!(
-            "{} trelane headless -- squire ticking every {interval_s}s (ctrl-c to stop)",
-            crypto::now_iso()
-        );
-        // A never-set stop flag: headless runs until the process is signaled.
-        let stop = Arc::new(AtomicBool::new(false));
-        monitor::run_squire_loop(&ctx, cli.launcher.as_deref(), interval_s, cli.verbose, &stop);
-        Ok(())
     } else {
-        // Default: the tabbed monitor UI with the squire behind it.
-        monitor::run_session(&ctx, cli.launcher.clone(), cli.verbose)
-    }
-}
-
-/// Open the Biplane UI. Detection and generation belong to the projectDir
-/// (`root` -- the cwd `trelane biplane` runs in); the `-i/--include` folders
-/// contribute markdown ONLY. Concretely:
-///  1. If a `biplane-description.json` (the editable plan) already exists in
-///     `root` and `--regenerate` was not passed, that IS the plan to
-///     view/edit: open the UI on it, no gathering. A `biplane-report.json`
-///     (live-session snapshot) in `root` is a secondary fallback. The `-i`
-///     folders are never checked for either -- a report is a projectDir
-///     artifact so it stays portable with the project.
-///  2. Otherwise gather markdown recursively from `root` PLUS every `-i`
-///     folder, warn if the set is large, ask before submitting to a model,
-///     generate a plan from those sources, persist it into `root`'s
-///     `.trelane/`, and open the UI.
-fn biplane_open_ui(root: &Path, include: &[PathBuf], regenerate: bool) -> Result<()> {
-    use std::io::{IsTerminal, Write};
-
-    // Step 1: existing-artifact detection -- projectDir ONLY. The `-i` folders
-    // are markdown sources, not places a report can live, so a plan generated
-    // here stays portable: it's always found in the folder it was made in.
-    if !regenerate {
-        if let Some(desc_path) = biplane::find_project_description(root) {
-            println!("[biplane] found existing plan: {}", desc_path.display());
-            // Canonical location is <root>/.trelane/biplane-description.json.
-            // A portable plan dropped directly in <root> is copied into place
-            // so the UI (and later a session) load it uniformly.
-            let ui_desc = root.join(TRELANE_DIR).join("biplane-description.json");
-            if desc_path != ui_desc {
-                if let Some(parent) = ui_desc.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::copy(&desc_path, &ui_desc)?;
-            }
-            return biplane_ui::run_with_includes(root, include);
-        }
-        if let Some(report_path) = biplane::find_project_report(root) {
-            println!("[biplane] found existing report: {}", report_path.display());
-            let ui_report = root.join(TRELANE_DIR).join("biplane-report.json");
-            if report_path != ui_report {
-                if let Some(parent) = ui_report.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::copy(&report_path, &ui_report)?;
-            }
-            return biplane_ui::run_with_includes(root, include);
-        }
-    }
-
-    // Step 2: gather markdown for the size warning + confirmation. Sources are
-    // root PLUS the -i folders; this gather is what lets us count/size-check
-    // and confirm before the model call (generation re-scans the same dirs).
-    let mut dirs: Vec<PathBuf> = vec![root.to_path_buf()];
-    dirs.extend(include.iter().cloned());
-    let gather = biplane::gather_markdown_files(&dirs);
-    if gather.count() == 0 {
+        // Resume mode: agents already exist. Clear ALL running locks since
+        // we're explicitly relaunching -- any existing locks are from a
+        // previous session that is no longer active.
         println!(
-            "[biplane] no markdown files found in {} director(ies). Opening the editor \
-             with a scaffold from the project structure instead.",
-            dirs.len()
+            "[launch] Found {} existing agent(s): {}",
+            existing_agents.len(),
+            existing_agents.join(", ")
         );
-        return biplane_ui::run_with_includes(root, include);
+
+        let ctx = Context::open(Some(&root))?;
+        for agent in &existing_agents {
+            crate::store::delete_running_lock(&ctx.conn, agent).ok();
+        }
+        println!("[launch] Cleared all running locks from previous session");
+
+        // Summarize pending work
+        let mut pending_inbox = 0;
+        let mut ready_parks = 0;
+        let mut stuck_parks = 0;
+        for agent in &existing_agents {
+            let inbox = crate::store::get_unprocessed_messages(&ctx.conn, agent)?.len();
+            pending_inbox += inbox;
+
+            for task in crate::store::list_parked_tasks_for_agent(&ctx.conn, agent)? {
+                if crate::prompt::park_satisfied(&ctx.conn, &task)? {
+                    ready_parks += 1;
+                } else {
+                    stuck_parks += 1;
+                }
+            }
+        }
+
+        if pending_inbox > 0 || ready_parks > 0 {
+            println!(
+                "[launch] Resuming: {} unprocessed message(s), {} ready parked task(s), {} waiting parked task(s)",
+                pending_inbox, ready_parks, stuck_parks
+            );
+        } else if stuck_parks > 0 {
+            println!(
+                "[launch] {} parked task(s) still waiting (no ready replies). The squire will attempt deadlock breaking if needed.",
+                stuck_parks
+            );
+        } else {
+            println!(
+                "[launch] No pending work found. All agents have empty inboxes and no parked tasks."
+            );
+            println!(
+                "[launch] Assign new work with: trelane send --from user --to <agent> --type question --subject '...' --body '...'"
+            );
+            println!("[launch] Or run: trelane {} biplane", root.display());
+            return Ok(());
+        }
+        println!();
     }
 
-    let kb = gather.total_bytes / 1024;
+    println!("[launch] Starting interactive tmux session...");
+    println!();
+
+    // Write a self-contained launch script and open it in a new Terminal.app
+    // window.  This ensures the tmux session is created from within a real
+    // terminal with a proper TTY, which is required for tmux pane creation
+    // and opencode TUI launches to work correctly.
+    let exe = std::env::current_exe()?;
+    let session_name = format!("trelane-{}", chrono::Utc::now().format("%Y%m%d%H%M%S"));
+
+    // Frames are provisioned only for agents that can actually run in this
+    // session: session-disabled agents (via --agents/--no-agents or
+    // config.json) get no pane, and an explicit --max-agents caps the count.
+    // Previously every registered agent got a frame, so a session limited to
+    // two runnable agents could still open four panes.
+    let ctx = Context::open(Some(&root))?;
+    let all_agents = crate::store::list_agents(&ctx.conn)?;
+    let enabled_agents = crate::commands::launch_enabled_agents(&ctx)?;
+    let skipped: Vec<String> = all_agents
+        .iter()
+        .filter(|a| !enabled_agents.contains(a))
+        .cloned()
+        .collect();
+    let mut frame_agents = enabled_agents;
+    if let Some(cap) = cli.max_agents {
+        frame_agents.truncate(cap as usize);
+    }
+    if !skipped.is_empty() {
+        println!(
+            "[launch] Skipping frame(s) for {} session-disabled agent(s): {}",
+            skipped.len(),
+            skipped.join(", ")
+        );
+    }
     println!(
-        "[biplane] gathered {} markdown file(s) ({} KB) from {} director(ies).",
-        gather.count(),
-        kb,
-        dirs.len()
+        "[launch] Creating {} frame(s): {}",
+        frame_agents.len(),
+        frame_agents.join(", ")
     );
-    if gather.is_large() {
-        println!(
-            "  WARNING: that's a large amount of markdown ({} files, {} KB). Submitting all \
-             of it may be slow, costly, or exceed the model's context window.",
-            gather.count(),
-            kb
-        );
+    let agent_list = frame_agents.join(" ");
+
+    let script_path = root.join(".trelane").join("launch-session.sh");
+    let script_content = format!(
+        r##"#!/bin/bash
+# Auto-generated by trelane. Do not edit.
+set -euo pipefail
+
+SESSION="{session_name}"
+EXE="{exe}"
+ROOT="{root}"
+
+echo "Creating tmux session $SESSION ..."
+tmux new-session -d -s "$SESSION"
+sleep 1
+
+CONTROLLER=$(tmux list-panes -t "$SESSION" -F "#{{pane_id}}" | head -1)
+
+# Per-session root marker: the diagnostic key bindings read it at trigger time.
+echo "$ROOT" > "/tmp/trelane-$SESSION-root"
+
+# Create one pane per agent
+for AGENT in {agent_list}; do
+    PANE=$(tmux split-window -d -P -F "#{{pane_id}}" -t "$CONTROLLER" 2>/dev/null || true)
+    if [ -n "$PANE" ]; then
+        tmux select-pane -t "$PANE" -T "$AGENT"
+        "$EXE" --root "$ROOT" set-launch-target "$AGENT" --adapter tmux --target "$PANE"
+        echo "  Created pane for $AGENT"
+    fi
+done
+
+tmux select-layout -t "$SESSION" tiled
+
+# Start the squire in the controller pane. TRELANE_SESSION lets the squire own
+# the session UI: status bar refresh, key bindings, verbose marker.
+tmux send-keys -t "$CONTROLLER" "TRELANE_SESSION='$SESSION' '$EXE' --root '$ROOT' squire --watch" Enter
+
+echo ""
+echo "Session $SESSION is ready."
+echo "Attaching..."
+exec tmux attach-session -t "$SESSION"
+"##,
+        session_name = session_name,
+        exe = exe.display(),
+        root = root.display(),
+        agent_list = agent_list,
+    );
+    std::fs::write(&script_path, &script_content)?;
+
+    // Make the script executable
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms)?;
     }
 
-    // Confirm before submitting to a model (skip the prompt when not a TTY --
-    // a non-interactive caller can't answer, so default to not submitting).
-    if !std::io::stdin().is_terminal() {
-        println!(
-            "[biplane] non-interactive: not submitting to a model. Re-run in a terminal to \
-             confirm, or use --describe for an offline path."
-        );
-        return biplane_ui::run_with_includes(root, include);
-    }
-    print!(
-        "  Submit these {} markdown file(s) to the model for report generation? [y/N] ",
-        gather.count()
-    );
-    std::io::stdout().flush().ok();
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    if !matches!(answer.trim(), "y" | "Y" | "yes" | "Yes") {
-        println!("[biplane] skipped submission. Opening the editor on the current description.");
-        return biplane_ui::run_with_includes(root, include);
+    // Open Terminal.app using `open` with a .command file instead of
+    // osascript.  This avoids the repeated macOS Automation permission
+    // prompts that osascript triggers every time the binary is rebuilt
+    // (each rebuild changes the code signature, so TCC re-prompts).
+    let command_file = script_path.with_extension("command");
+    std::fs::write(
+        &command_file,
+        format!("#!/bin/bash\nexec bash '{}'\n", script_path.display()),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&command_file)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&command_file, perms)?;
     }
 
-    // Generate a plan from the gathered sources, convert to an editable
-    // description, and persist it where the UI loads from.
-    let model = biplane::default_biplane_model();
-    let max_agents = 3;
-    println!("[biplane] submitting to {model}...");
-    let plan = biplane::run_biplane_plan_from_sources(root, include, &model, max_agents)?;
-    let project_name = root
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("project");
-    let desc = biplane::plan_to_description(&plan, project_name, max_agents);
-    let desc_path = root.join(TRELANE_DIR).join("biplane-description.json");
-    if let Some(parent) = desc_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&desc_path, serde_json::to_string_pretty(&desc)?)?;
-    println!("[biplane] report generated. Opening the editor...");
-    biplane_ui::run_with_includes(root, include)
+    std::process::Command::new("open")
+        .arg(&command_file)
+        .status()?;
+
+    println!(
+        "[launch] Terminal.app window opened with session: {}",
+        session_name
+    );
+    println!("[launch] The squire and agents will start automatically.");
+
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -495,9 +401,7 @@ fn shell_quote(s: &str) -> String {
 }
 
 /// Compute the live session state and push it to the tmux status bar.
-/// Retained for the tmux-session path even though the default launcher no
-/// longer uses it.
-#[allow(dead_code)]
+/// Called by the squire on every watch tick.
 fn refresh_session_status(ctx: &Context, session: &str) -> Result<()> {
     let agents = store::list_agents(&ctx.conn)?;
     let running = agents
@@ -535,15 +439,12 @@ pub fn handle(cli: Cli) -> Result<()> {
         );
     }
 
-    // Bare `trelane` (no subcommand) launches a session: the tabbed monitor UI
-    // with the squire tick-loop behind it. `--models`/`--agents` still
-    // configure the session; they no longer route to a separate tmux launcher.
-    if cli.command.is_none() {
-        return run_session_command(cli);
+    if cli.models.is_some() && cli.command.is_none() {
+        return cmd_launch(cli);
     }
 
     match cli.command {
-        None => unreachable!("handled by run_session_command above"),
+        None => biplane::cmd_welcome(cli.project),
         Some(Command::Init { project }) => commands::cmd_init(project.or(cli.project)),
         Some(Command::Attach { project, no_inject }) => commands::cmd_attach_project(
             project.or(cli.project),
@@ -621,14 +522,6 @@ pub fn handle(cli: Cli) -> Result<()> {
             let ctx = Context::open(cli.root.as_deref())?;
             commands::cmd_retention(&ctx, &action)
         }
-        Some(Command::Di { action }) => {
-            let ctx = Context::open(cli.root.as_deref())?;
-            commands::cmd_di(&ctx, &action)
-        }
-        Some(Command::Split { action }) => {
-            let ctx = Context::open(cli.root.as_deref())?;
-            refine::cmd_split(&ctx, &action)
-        }
         Some(Command::Ack { agent, msg_id }) => {
             let ctx = Context::open(cli.root.as_deref())?;
             commands::cmd_ack(&ctx, &agent, &msg_id)
@@ -661,7 +554,6 @@ pub fn handle(cli: Cli) -> Result<()> {
             task,
             wait_reply,
             wait_claim,
-            wait_contested_claim,
             waiting_on,
             resume_hint,
         }) => {
@@ -672,7 +564,6 @@ pub fn handle(cli: Cli) -> Result<()> {
                 task.as_deref(),
                 &wait_reply,
                 &wait_claim,
-                &wait_contested_claim,
                 &waiting_on,
                 &resume_hint,
             )
@@ -742,33 +633,13 @@ pub fn handle(cli: Cli) -> Result<()> {
             ui,
             accept_defaults,
             json,
-            refine,
-            refine_model,
-            include,
-            regenerate,
         }) => {
-            if refine {
-                // Slice 5: the deliberate, model-calling refinement pass
-                // (R19). Never on the squire's wake path.
-                let ctx = Context::open(cli.root.as_deref())?;
-                let model = refine_model
-                    .as_deref()
-                    .map(str::to_string)
-                    .unwrap_or_else(biplane::default_biplane_model);
-                return refine::cmd_refine(&ctx, &model, json);
-            }
-            // `trelane biplane` always opens the Biplane UI unless an explicit
-            // non-UI sub-mode was requested. This makes the bare command a
-            // one-step route to the UI, matching how bare `trelane` opens the
-            // monitor UI.
-            let explicit_non_ui_mode =
-                interactive || describe.is_some() || next_steps || emit_plan;
-            if ui || !explicit_non_ui_mode {
+            if ui {
                 let root = match cli.root.as_deref() {
                     Some(p) => p.to_path_buf(),
                     None => std::env::current_dir()?,
                 };
-                return biplane_open_ui(&root, &include, regenerate);
+                biplane_ui::run(&root)
             } else if interactive {
                 // Interactive/describe paths need no DB, so they work even
                 // before a project is initialized as a trelane session.
@@ -805,6 +676,107 @@ pub fn handle(cli: Cli) -> Result<()> {
             let ctx = Context::open(cli.root.as_deref())?;
             commands::cmd_stub(&ctx, &agent)
         }
+        Some(Command::Squire {
+            once,
+            watch,
+            interval,
+            launcher,
+            verbose,
+            max_concurrent,
+        }) => {
+            let mut ctx = Context::open(cli.root.as_deref())?;
+            // A `--max-concurrent N` flag overrides the configured ceiling for
+            // just this squire process, without touching the saved config.
+            if let Some(mc) = max_concurrent {
+                ctx.config.squire.max_concurrent = mc;
+                eprintln!(
+                    "{} squire: max_concurrent overridden to {mc} for this run",
+                    crypto::now_iso()
+                );
+            }
+            // The launch script exports TRELANE_SESSION so the squire can own
+            // the session UI (status bar, key bindings, verbose marker).
+            let session = std::env::var("TRELANE_SESSION")
+                .ok()
+                .filter(|s| !s.is_empty());
+
+            if once || !watch {
+                let v = verbose || splash::verbose_enabled(session.as_deref());
+                squire::tick(&ctx, launcher.as_deref(), v)?;
+                return Ok(());
+            }
+
+            let interval_s = interval.unwrap_or(ctx.config.squire.interval_s);
+
+            // The controller frame is the squire's home: identify it.
+            logo::print_logo();
+            eprintln!(
+                "{} squire watching every {interval_s}s (ctrl-c to stop)",
+                crypto::now_iso()
+            );
+            if let Some(session) = session.as_deref() {
+                eprintln!("  session : {session}");
+                eprintln!(
+                    "  verbose : press {} to toggle (marker: {})",
+                    ctx.config.ui.keys.verbose_toggle,
+                    splash::verbose_marker_path(session)
+                );
+                // Best-effort: a broken tmux server must not kill the squire.
+                if let Err(e) = splash::setup_session_ui(session, &ctx.config.ui) {
+                    eprintln!("warning: session UI setup failed: {e:?}");
+                }
+            }
+            if ctx.config.biplane.reanalyze_on_all_stop {
+                eprintln!("  biplane : reanalyze_on_all_stop enabled");
+            }
+
+            let mut reanalyzed_this_stretch = false;
+
+            loop {
+                let v = verbose || splash::verbose_enabled(session.as_deref());
+                match squire::tick(&ctx, launcher.as_deref(), v) {
+                    Ok(n) => {
+                        if n > 0 {
+                            eprintln!("{} launched {n} agent(s)", crypto::now_iso());
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("{} tick error: {e:?}", crypto::now_iso());
+                    }
+                }
+                // Refresh the status bar from the real session state on every
+                // tick, so ACTIVE/IDLE/DEADLOCK tracks reality instead of the
+                // value set once at bootstrap.
+                if let Some(session) = session.as_deref()
+                    && let Err(e) = refresh_session_status(&ctx, session)
+                    && v
+                {
+                    eprintln!("warning: status bar refresh failed: {e:?}");
+                }
+
+                // Biplane re-analysis: when the swarm is fully quiescent
+                // (no running agents, empty inboxes, no parked tasks).
+                // F3: Detection (thematic deadlock reporting) is on by
+                // default; auto-registration of emergent domains is opt-in.
+                let any_running = crate::store::list_agents(&ctx.conn)?
+                    .iter()
+                    .any(|a| crate::commands::is_running(&ctx.conn, a).unwrap_or(false));
+                if any_running {
+                    reanalyzed_this_stretch = false;
+                } else if !reanalyzed_this_stretch
+                    && crate::testing::swarm_quiescent(&ctx)?
+                    && (ctx.config.biplane.detect_thematic_deadlock
+                        || ctx.config.biplane.reanalyze_on_all_stop)
+                {
+                    if let Err(e) = biplane::reanalyze_on_stop(&ctx) {
+                        eprintln!("warning: biplane re-analysis failed: {e:?}");
+                    }
+                    reanalyzed_this_stretch = true;
+                }
+
+                std::thread::sleep(std::time::Duration::from_secs(interval_s));
+            }
+        }
         Some(Command::Metrics { json }) => {
             let ctx = Context::open(cli.root.as_deref())?;
             let trace_dir = telemetry::trace_dir_for(&ctx.trelane_dir());
@@ -815,22 +787,6 @@ pub fn handle(cli: Cli) -> Result<()> {
                 print_metrics(&metrics);
             }
             Ok(())
-        }
-        Some(Command::Story {
-            json,
-            agent,
-            path,
-            kinds,
-            rework_only,
-        }) => {
-            let ctx = Context::open(cli.root.as_deref())?;
-            commands::cmd_story(&ctx, &commands::StoryArgs {
-                json,
-                agent,
-                path,
-                kinds,
-                rework_only,
-            })
         }
         Some(Command::Rate {
             agent,
@@ -866,58 +822,6 @@ pub fn handle(cli: Cli) -> Result<()> {
             diagnostic::run(&ctx)
         }
         Some(Command::Config { action }) => cmd_config(&action),
-        Some(Command::Bench { action }) => match action {
-            cli::BenchAction::Run {
-                scenario,
-                runs,
-                max_turns,
-                model,
-                report,
-                sandbox_root,
-                free_models_only,
-                ui,
-            } => bench::run_bench(
-                &scenario,
-                runs,
-                report.as_deref(),
-                sandbox_root.as_deref(),
-                max_turns,
-                model.as_deref(),
-                free_models_only,
-                ui,
-            ),
-            cli::BenchAction::Suite {
-                dir,
-                runs,
-                max_turns,
-                model,
-                sandbox_root,
-                free_models_only,
-                save_baseline,
-                output,
-            } => bench::run_suite(
-                &dir,
-                runs,
-                max_turns,
-                model.as_deref(),
-                sandbox_root.as_deref(),
-                free_models_only,
-                output.as_deref(),
-                save_baseline.as_deref(),
-            ),
-            cli::BenchAction::Compare {
-                baseline,
-                candidate,
-                threshold_ms,
-                json,
-            } => {
-                let regressed = bench::compare_reports(&baseline, &candidate, threshold_ms, json)?;
-                if regressed {
-                    std::process::exit(1);
-                }
-                Ok(())
-            }
-        },
         Some(Command::Help { action }) => {
             let ctx = Context::open(cli.root.as_deref())?;
             commands::cmd_help(&ctx, &action)
@@ -934,12 +838,12 @@ pub fn handle(cli: Cli) -> Result<()> {
 
 /// Comma-separated list of config keys the `config` command understands, for
 /// use in "unknown key" errors. Keep in sync with the match arms below.
-const KNOWN_CONFIG_KEYS: &str = "squire.max_concurrent, squire.interval_s, squire.reply_timeout_s, \
+const KNOWN_CONFIG_KEYS: &str =
+    "squire.max_concurrent, squire.interval_s, squire.reply_timeout_s, \
      squire.breaker_escalation_count, squire.starvation_ticks, \
      di.objection_window_s, di.request_timeout_s, di.claim_contested_timeout_s, \
      retention.hot_days, retention.dormant_days, retention.purge_days, \
-     claims.default_ttl_s, workspace.mode, \
-     bench.default_max_turns, bench.default_model, bench.free_models, bench.slice_timeout_s";
+     claims.default_ttl_s, workspace.mode";
 
 fn unknown_config_key(key: &str) -> TrelaneError {
     TrelaneError::msg(format!(
@@ -971,16 +875,6 @@ fn config_get(config: &Config, key: &str) -> Result<String> {
             .unwrap_or_else(|| "none".to_string()),
         "claims.default_ttl_s" => config.claims.default_ttl_s.to_string(),
         "workspace.mode" => config.workspace.mode.as_str().to_string(),
-        "bench.default_max_turns" => config.bench.default_max_turns.to_string(),
-        "bench.default_model" => config
-            .bench
-            .default_model
-            .clone()
-            .unwrap_or_else(|| "none".to_string()),
-        "bench.free_models" => {
-            serde_json::to_string(&config.bench.free_models).unwrap_or_else(|_| "[]".to_string())
-        }
-        "bench.slice_timeout_s" => config.bench.slice_timeout_s.to_string(),
         _ => return Err(unknown_config_key(key)),
     })
 }
@@ -1018,7 +912,9 @@ fn config_set(config: &mut Config, key: &str, value: &str) -> Result<()> {
         "squire.starvation_ticks" => config.squire.starvation_ticks = parse_u64(value)? as i64,
         "di.objection_window_s" => config.di.objection_window_s = parse_u64(value)?,
         "di.request_timeout_s" => config.di.request_timeout_s = parse_u64(value)?,
-        "di.claim_contested_timeout_s" => config.di.claim_contested_timeout_s = parse_u64(value)?,
+        "di.claim_contested_timeout_s" => {
+            config.di.claim_contested_timeout_s = parse_u64(value)?
+        }
         "retention.hot_days" => config.retention.hot_days = parse_u64(value)?,
         "retention.dormant_days" => config.retention.dormant_days = parse_u64(value)?,
         "retention.purge_days" => {
@@ -1029,39 +925,12 @@ fn config_set(config: &mut Config, key: &str, value: &str) -> Result<()> {
         }
         "claims.default_ttl_s" => config.claims.default_ttl_s = parse_u64(value)?,
         "workspace.mode" => {
-            config.workspace.mode =
-                crate::models::WorkspaceMode::parse(value).ok_or_else(|| {
-                    TrelaneError::msg(format!(
-                        "'{value}' is not a valid workspace mode (use 'shared' or 'worktree')"
-                    ))
-                })?;
-        }
-        "bench.default_max_turns" => {
-            config.bench.default_max_turns = value.parse::<u32>().map_err(|_| {
-                TrelaneError::msg(format!("'{value}' is not a valid integer for {key}"))
-            })?;
-        }
-        "bench.default_model" => {
-            config.bench.default_model = match value {
-                "none" | "off" | "" => None,
-                v => Some(v.to_string()),
-            };
-        }
-        "bench.free_models" => {
-            config.bench.free_models = serde_json::from_str(value)
-                .map_err(|_| TrelaneError::msg(format!(
-                    "'{value}' is not a valid JSON array of model ids (e.g. '[\"openrouter/z-ai/glm-5.2\"]')"
+            config.workspace.mode = crate::models::WorkspaceMode::parse(value)
+                .ok_or_else(|| TrelaneError::msg(format!(
+                    "'{value}' is not a valid workspace mode (use 'shared' or 'worktree')"
                 )))?;
         }
-        "bench.slice_timeout_s" => config.bench.slice_timeout_s = parse_u64(value)?,
         _ => return Err(unknown_config_key(key)),
-    }
-    // 4A config-inversion guard: any change to a di.* key re-validates the
-    // full DiConfig so a `config set` that creates an impossible combination
-    // (e.g. objection_window_s > request_timeout_s) is rejected before it
-    // is persisted, with an error naming the offending relationship.
-    if key.starts_with("di.") {
-        config.di.validate()?;
     }
     Ok(())
 }
@@ -1350,166 +1219,4 @@ fn cmd_kill() -> Result<()> {
 /// has restored the terminal out of raw/alternate-screen mode.
 pub fn run_kill_from_diagnostic() -> Result<()> {
     cmd_kill()
-}
-
-// --------------------------------------------------------------- migrations
-#[cfg(test)]
-mod migrate_tests {
-    use super::*;
-    use crate::models::{Config, CURRENT_CONFIG_VERSION};
-    use std::collections::HashMap;
-
-    /// Build a JSON config string at the given version with the given
-    /// profiles and template. Round-trips through serde so we exercise the
-    /// real load path.
-    fn write_config(path: &Path, version: u32, template: &str, profiles: &[(&str, &str)]) {
-        let mut map: HashMap<String, String> = HashMap::new();
-        for (k, v) in profiles {
-            map.insert(k.to_string(), v.to_string());
-        }
-        let config = Config {
-            agents: crate::models::AgentConfig::default(),
-            launcher: crate::models::LauncherConfig {
-                template: template.to_string(),
-                profiles: map,
-            },
-            squire: crate::models::SquireConfig {
-                interval_s: 20,
-                max_concurrent: 2,
-                reply_timeout_s: Some(3600),
-                breaker_escalation_count: 3,
-                starvation_ticks: 3,
-            },
-            claims: crate::models::ClaimsConfig { default_ttl_s: 900 },
-            di: crate::models::DiConfig::default(),
-            retention: crate::models::RetentionConfig::default(),
-            ui: crate::models::UiConfig::default(),
-            biplane: crate::models::BiplaneConfig::default(),
-            bench: crate::models::BenchConfig::default(),
-            workspace: crate::models::WorkspaceConfig::default(),
-            config_version: version,
-        };
-        std::fs::write(path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
-    }
-
-    fn load(path: &Path) -> Config {
-        let text = std::fs::read_to_string(path).unwrap();
-        serde_json::from_str(&text).unwrap()
-    }
-
-    const LEGACY_OPENCODE: &str = r#"opencode run "$(cat {prompt_file})""#;
-    const LEGACY_CLAUDE: &str =
-        r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50"#;
-    const NEW_OPENCODE: &str = r#"opencode run --format json --thinking "$(cat {prompt_file})""#;
-    const NEW_CLAUDE: &str =
-        r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50 --output-format stream-json --verbose"#;
-
-    #[test]
-    fn legacy_default_profiles_are_migrated_to_structured_output() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("config.json");
-        write_config(
-            &path,
-            0,
-            LEGACY_CLAUDE,
-            &[("opencode", LEGACY_OPENCODE), ("claude-code", LEGACY_CLAUDE)],
-        );
-        migrate_config_file(&path).unwrap();
-        let c = load(&path);
-        assert_eq!(c.config_version, CURRENT_CONFIG_VERSION);
-        assert_eq!(c.launcher.profiles.get("opencode").unwrap(), NEW_OPENCODE);
-        assert_eq!(c.launcher.profiles.get("claude-code").unwrap(), NEW_CLAUDE);
-        // The template (matching the legacy default) is also upgraded.
-        assert_eq!(c.launcher.template, NEW_CLAUDE);
-    }
-
-    #[test]
-    fn user_customized_profiles_are_not_overwritten() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("config.json");
-        // opencode customized (extra flag); claude-code at legacy default.
-        let custom = r#"opencode run --model my-model "$(cat {prompt_file})""#;
-        write_config(
-            &path,
-            0,
-            LEGACY_CLAUDE,
-            &[("opencode", custom), ("claude-code", LEGACY_CLAUDE)],
-        );
-        migrate_config_file(&path).unwrap();
-        let c = load(&path);
-        // Custom opencode untouched.
-        assert_eq!(c.launcher.profiles.get("opencode").unwrap(), custom);
-        // claude-code at legacy default was migrated.
-        assert_eq!(c.launcher.profiles.get("claude-code").unwrap(), NEW_CLAUDE);
-    }
-
-    #[test]
-    fn user_customized_template_is_not_overwritten() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("config.json");
-        let custom_template = "my-custom-launcher --foo {prompt_file}";
-        write_config(&path, 0, custom_template, &[]);
-        migrate_config_file(&path).unwrap();
-        let c = load(&path);
-        assert_eq!(c.launcher.template, custom_template);
-    }
-
-    #[test]
-    fn new_plain_escape_hatch_profiles_are_added_when_absent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("config.json");
-        write_config(&path, 0, LEGACY_CLAUDE, &[]);
-        migrate_config_file(&path).unwrap();
-        let c = load(&path);
-        assert!(c.launcher.profiles.contains_key("opencode-plain"));
-        assert!(c.launcher.profiles.contains_key("claude-code-plain"));
-        assert_eq!(
-            c.launcher.profiles.get("opencode-plain").unwrap(),
-            LEGACY_OPENCODE
-        );
-    }
-
-    #[test]
-    fn existing_plain_profiles_are_not_overwritten_by_migration() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("config.json");
-        let custom_plain = "my-plain-launcher";
-        write_config(
-            &path,
-            0,
-            LEGACY_CLAUDE,
-            &[("opencode-plain", custom_plain)],
-        );
-        migrate_config_file(&path).unwrap();
-        let c = load(&path);
-        assert_eq!(c.launcher.profiles.get("opencode-plain").unwrap(), custom_plain);
-    }
-
-    #[test]
-    fn already_current_config_is_a_noop() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("config.json");
-        write_config(&path, CURRENT_CONFIG_VERSION, "anything", &[]);
-        let bytes_before = std::fs::read(&path).unwrap();
-        migrate_config_file(&path).unwrap();
-        let bytes_after = std::fs::read(&path).unwrap();
-        assert_eq!(bytes_before, bytes_after, "no-op should not rewrite file");
-    }
-
-    #[test]
-    fn migration_is_idempotent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("config.json");
-        write_config(
-            &path,
-            0,
-            LEGACY_CLAUDE,
-            &[("opencode", LEGACY_OPENCODE), ("claude-code", LEGACY_CLAUDE)],
-        );
-        migrate_config_file(&path).unwrap();
-        let after_first = std::fs::read(&path).unwrap();
-        migrate_config_file(&path).unwrap();
-        let after_second = std::fs::read(&path).unwrap();
-        assert_eq!(after_first, after_second, "second migration is a no-op");
-    }
 }

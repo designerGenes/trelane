@@ -284,7 +284,10 @@ mod tests {
 
     #[test]
     fn disjoint_globs_do_not_overlap() {
-        let domains = vec![dv("a", &["src/a/**"], &[]), dv("b", &["src/b/**"], &[])];
+        let domains = vec![
+            dv("a", &["src/a/**"], &[]),
+            dv("b", &["src/b/**"], &[]),
+        ];
         let inp = inputs_from_domains(&domains, false);
         assert_eq!(inp.writable_overlaps, 0);
     }
@@ -395,11 +398,7 @@ mod tests {
             writable_overlaps: 100,
             ..inp()
         });
-        assert!(
-            s.score < 80,
-            "overlap alone should not reach critical: {}",
-            s.score
-        );
+        assert!(s.score < 80, "overlap alone should not reach critical: {}", s.score);
     }
 
     #[test]

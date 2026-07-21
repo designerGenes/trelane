@@ -1,0 +1,123 @@
+{
+  "handoff": {
+    "artifact_type": "slice0_repair_handoff",
+    "schema_version": "1.0",
+    "date": "2026-07-12",
+    "project": "trelane",
+    "repo": "/Users/jadennation/DEV/01_active_projects/trelane",
+    "slopified_changes": "trelane-slice0-repair.slop.md (7 full-file blocks)",
+    "slices_attempted_this_session": [
+      "SLICE-0 (repair non-compiling tree)",
+      "SLICE-1 (correct the plan of record)"
+    ],
+    "slices_not_started": [
+      "SLICE-2 (finish C5)",
+      "SLICE-3 (finish C7)",
+      "SLICE-4 (durable collision_risk)",
+      "SLICE-5 (docs/install)",
+      "SLICE-6 (verify + commit)"
+    ],
+    "how_to_apply": [
+      "Deslop trelane-slice0-repair.slop.md over the repo (each block is a FULL-file replacement at the absolute path in its header).",
+      "These 7 files were the corrupted ones; all other files in the tree are unchanged from the prior bundle.",
+      "Then run: cargo build 2>&1 | head -50   (see verification_status \u2014 this was NOT runnable in my sandbox).",
+      "Then: cargo test, git diff --check."
+    ],
+    "critical_caveat": "NO cargo build/test was possible in my environment (no Rust toolchain; edition 2024 needs >=1.85 and the sandbox cannot fetch one \u2014 the same blocker the 2026-07-03 auditor hit). Every fix below is verified STRUCTURALLY only: Rust-aware brace balance == 0 for all 22 src files, paren balance restored where broken, and zero duplicate top-level definitions across the crate. Type-check / borrow-check correctness is NOT verified. The next agent MUST compile and resolve any residual semantic errors.",
+    "what_slice0_fixed": {
+      "summary": "A systematic block-duplication / splice defect corrupted 7 files (not 6 as first diagnosed). Two distinct damage shapes: (a) a stale/incomplete copy of a region duplicated next to the complete copy, and (b) a block spliced INTO the middle of a function/enum, truncating it and orphaning its tail. Repaired by removing stale copies, rejoining truncated items, and restoring dropped tokens \u2014 always keeping the COMPLETE/C2-C7 version.",
+      "files": {
+        "src/db.rs": "Interleaved splice: fragments of open()/open_in_memory()/migrate() were spliced into SCHEMA_C2 and SCHEMA_C5 consts. Removed the fragments; restored SCHEMA_C2 (clean task_submissions DDL) and SCHEMA_C5 (restored the dropped `path TEXT NOT NULL DEFAULT ''` column). The complete open/open_in_memory/migrate (v1..v10) were already intact and kept.",
+        "src/models.rs": "The entire task-ledger section (TASK_STATES, TaskState, AssistPolicy, Task, TaskRole, TaskAssignment, DelegationStatus, Delegation, ReviewDecision, TaskReview) was duplicated. Deleted the duplicate copy; kept the single ParkedTask/Lease/RunningLock/Violation (only in copy A) and TaskSubmission (only in copy B); merged the C6 serde derives (#[derive(... Serialize, Deserialize, Default)] + #[serde(rename_all=\"lowercase\")] + #[default] Open) onto the surviving AssistPolicy.",
+        "src/store.rs": "A stale, incomplete copy of the task-ledger persistence block (row_to_task..list_reviews_for_task) plus a stale `mod tests` was duplicated ahead of the complete block; removed it (the surviving `mod ledger_tests` is a strict superset). Also fixed a corrupted `use crate::models::{...}` where a stale short import list and a complete list were concatenated with a stray `};` \u2014 merged to the complete list. Also restored `pub escalated: bool` to CycleBreakAttempt (its sole constructor sets it and biplane.rs reads it; the field had been dropped).",
+        "src/commands.rs": "A stale copy of the work-ledger commands (cmd_work/list/show/add) was spliced INTO the middle of cmd_done's `wake_meta` method chain (between `.join(\"agents\")` and `.join(\"wake.json\")`). Removed the stale copy, rejoining cmd_done. The complete work-ledger block (with Submit/Review dispatch + cmd_work_submit/cmd_work_review) was kept.",
+        "src/lib.rs": "The Command::Rate match arm was truncated after `.max_by_key(...)`; duplicate Config/Work arms were spliced in and the arm's tail orphaned. Removed the duplicate arms and reconstructed the lost `run_span_id` binding (SpanId=String; `span.span_id.clone()`, with a None-guard). All 27 Command arms are now unique.",
+        "src/biplane.rs": "cmd_biplane_interactive was truncated after a `println!(` (missing `);`); two orphaned duplicate copies of the apply_plan_records test were spliced between the head and the real tail (`let budget = if accept_defaults`). Closed the println!, removed the orphaned test copies, rejoined the function. The complete apply_plan tests live in `mod tests`/`mod reconciliation_tests`.",
+        "src/cli.rs": "(Not in the original 6-file diagnosis.) Command's Config variant was broken and a stale WorkAction enum + a duplicate/truncated Work variant were spliced in, orphaning Kill. Rebuilt the Command tail (Config/Help/Work/Kill) and kept the single COMPLETE WorkAction enum (List{owner,state,json,assistable,agent}, Show, Add, Submit, Review)."
+      }
+    },
+    "corrections_to_prior_diagnostic": [
+      "The corruption spans 7 files, not 6: src/cli.rs was also corrupted (duplicate WorkAction enum + spliced Command tail).",
+      "db.rs was NOT a simple 'duplicate open_in_memory' \u2014 it was an interleaved splice of function-body fragments into schema consts.",
+      "store.rs and commands.rs were not clean contiguous duplicates \u2014 commands.rs spliced a stale block INTO cmd_done; store.rs also had a corrupted import block.",
+      "The internal implementation-chronicle.json's claim of 'only 2 compile-error sites' was a large undercount; the true count is a multi-file duplication/splice defect."
+    ],
+    "corrected_plan_of_record": {
+      "note": "Supersedes the stale premise of C3-C7-execution-plan.md (which claimed C3-C7 unimplemented, schema v7, 125 tests passing, clean tree).",
+      "C0_C1_C2": "implemented (baseline + work ledger + assistance protocol).",
+      "C3_capacity_aware_squire": "implemented (schema v8; wake_plan/tick refactor; activity status; anti-churn store APIs; C3 tests).",
+      "C4_prompt_and_lifecycle": "implemented (prompt.rs Cross-domain assistance section; C4 string tests).",
+      "C6_biplane_decomposition": "implemented EXCEPT durable collision_risk ledger storage (collision_risk is plan-artifact-only).",
+      "C5_workspace_isolation": "partial: config + delegation_workspaces table (v9) + round-trip store fns present; worktree creation/validation absent.",
+      "C7_observability_and_completion": "partial: completion evaluator + fingerprint + attestation + status rendering present; telemetry metrics + tick_detailed + completion CLI absent.",
+      "schema_user_version": 10
+    },
+    "verification_status": {
+      "verified": [
+        "Rust-aware brace balance == 0 for all 22 src/*.rs files.",
+        "Paren balance restored in biplane.rs (was +1) and cli.rs (was -1).",
+        "Zero duplicate top-level fn/struct/enum/const definitions across the crate.",
+        "cli.rs WorkAction variants match commands.rs cmd_work dispatch arms (Add/List/Review/Show/Submit).",
+        "The slopified bundle re-parses with zero errors and exact line counts."
+      ],
+      "NOT_verified": [
+        "cargo build (no toolchain).",
+        "cargo test / actual test count (report's 125 and chronicle's ~156 remain unconfirmed; static declared #[test] count in the repaired tree is ~185 minus removed duplicates).",
+        "Type-checker / borrow-checker correctness.",
+        "Migration behavior on a real v7->v10 upgrade."
+      ]
+    },
+    "residual_risks_next_agent_must_check": [
+      {
+        "id": "R1",
+        "severity": "medium",
+        "where": "src/lib.rs Command::Rate arm",
+        "issue": "run_span_id None-handling was reconstructed (marked with an inline NOTE comment). Verify it matches intended UX (currently prints 'no agent.run span found' and returns Ok)."
+      },
+      {
+        "id": "R2",
+        "severity": "low",
+        "where": "src/db.rs SCHEMA_C5",
+        "issue": "Restored `path` column to delegation_workspaces to match store::insert_delegation_workspace's 5-column INSERT. Confirm no fresh-vs-upgrade drift (table uses CREATE IF NOT EXISTS; a pre-existing v9 DB created WITHOUT `path` would need care \u2014 but this DB was never shipped, so likely moot)."
+      },
+      {
+        "id": "R3",
+        "severity": "high",
+        "where": "whole tree",
+        "issue": "Only structural repair was possible. After deslop, run cargo build and fix any residual semantic errors (imports, arities, enum-variant field names) that a compiler would surface but a brace/dup scan cannot."
+      }
+    ],
+    "remaining_slices": [
+      {
+        "id": "SLICE-2",
+        "title": "Finish C5 worktree isolation",
+        "priority": "high",
+        "summary": "worktree creation on help accept (branch trelane/delegations/<id>, worktree under ~/.trelane/worktrees/<hash>/<id>, persist via insert_delegation_workspace), worktree-mode submission validation (commit==branch HEAD, clean index), review-accept stale-base validation. Files: commands.rs, store.rs, models.rs, db.rs. Use Transaction::new_unchecked(&conn, Immediate); NUL-delimited git output; forbidden paths stay non-delegable."
+      },
+      {
+        "id": "SLICE-3",
+        "title": "Finish C7 observability",
+        "priority": "medium",
+        "summary": "telemetry metrics (agent_capacity_seconds, idle_with_ready_backlog_seconds, help_offers_sent/accepted/latency, delegated_diff_rejection_rate, cycle times, etc.); tick_detailed->TickOutcome with tick() delegating and still returning Result<usize>; best-effort spans (telemetry failure must not abort tick); optional completion/project CLI subcommand. Evaluator + status rendering already exist \u2014 do not re-add."
+      },
+      {
+        "id": "SLICE-4",
+        "title": "(Optional) durable collision_risk",
+        "priority": "medium",
+        "summary": "If required, add tasks.collision_risk via a NEW migration (v11 \u2014 do not reuse v8/v9/v10) and plumb through store + apply_plan_to_session; else document as plan-artifact-only."
+      },
+      {
+        "id": "SLICE-5",
+        "title": "Docs & install (needs live repo; not in bundle)",
+        "priority": "low",
+        "summary": "README.md and install.sh were absent from the analyzed bundle; update README (ownership vs assistance, work/help commands, delegated-write rules, forbidden paths, assist discovery + one-offer limit, workspace.mode, completion model, config keys) and verify install.sh --bump-version/--set-version."
+      },
+      {
+        "id": "SLICE-6",
+        "title": "Final verification + single local commit",
+        "priority": "high",
+        "summary": "cargo fmt/build/test; git diff --check; --help outputs; then ONE local commit excluding .trelane/trelane.db."
+      }
+    ]
+  }
+}

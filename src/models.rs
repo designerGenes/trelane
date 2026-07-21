@@ -17,42 +17,11 @@ pub const MSG_TYPES: &[&str] = &[
     "review-result",
     "handoff",
     "system",
-    // TMP v1.0 structured types (src/rules/trelane-message-protocol.schema.json).
-    // The Squire must be able to decode every type an agent can send (R4).
-    "park",
-    "wake",
-    "di_request",
-    "di_approve",
-    "di_deny",
-    "claim",
-    "bulletin",
-    "domain_change_notice",
-    "split_proposal_notice",
-    "quiescence_notice",
-    "custom",
 ];
-
-/// TMP v1.0 protocol version stamped on every message (GAP-03).
-pub const TMP_VERSION: &str = "1.0";
-
-/// Message channels (TMP envelope). `direct` = inbox-addressed; `bulletin` =
-/// domain-scoped board that never wakes anyone (R13).
-pub const CHANNEL_DIRECT: &str = "direct";
-pub const CHANNEL_BULLETIN: &str = "bulletin";
 
 pub const URGENCIES: &[&str] = &["low", "normal", "high", "critical"];
 
 pub const TRELANE_DIR: &str = ".trelane";
-
-/// R11: the two paths that are permission-proof under every protocol,
-/// unconditionally -- no DI approval, no delegation, no operator override
-/// makes them writable. This is the single source of truth; every place that
-/// used to hand-write `format!("{TRELANE_DIR}/**")` + `".git/**"` (domain.rs,
-/// commands.rs, biplane.rs) now calls this instead, so a third forbidden
-/// path -- or a rename of TRELANE_DIR -- only ever needs to change here.
-pub fn hard_forbidden_globs() -> Vec<String> {
-    vec![format!("{TRELANE_DIR}/**"), ".git/**".to_string()]
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -66,30 +35,12 @@ pub struct Config {
     pub squire: SquireConfig,
     pub claims: ClaimsConfig,
     #[serde(default)]
-    pub di: DiConfig,
-    #[serde(default)]
-    pub retention: RetentionConfig,
-    #[serde(default)]
     pub ui: UiConfig,
     #[serde(default)]
     pub biplane: BiplaneConfig,
     #[serde(default)]
-    pub bench: BenchConfig,
-    #[serde(default)]
     pub workspace: WorkspaceConfig,
-    /// Schema version of this config file. Absent on configs written before
-    /// the version field was introduced (treated as 0 by `#[serde(default)]`).
-    /// `ensure_config` runs `migrate_config` when this is below
-    /// `CURRENT_CONFIG_VERSION`, then bumps it. See lib.rs::migrate_config
-    /// for the per-version migrations. TUI-002 introduced version 1.
-    #[serde(default)]
-    pub config_version: u32,
 }
-
-/// Current config schema version. Bump this whenever `migrate_config`
-/// gains a new step. `ensure_config` calls `migrate_config` whenever a
-/// loaded config's `config_version` is below this.
-pub const CURRENT_CONFIG_VERSION: u32 = 1;
 
 impl Default for Config {
     fn default() -> Self {
@@ -97,56 +48,14 @@ impl Default for Config {
         // Ready-to-use headless launcher profiles. Select one per agent with
         // `trelane add-agent <name> --launcher-agent <profile>`, or override
         // any of these in config.json.
-        //
-        // TUI-002: the monitor-facing defaults emit STRUCTURED output
-        // (NDJSON event streams: thoughts, tool calls, step boundaries) so
-        // `trelane monitor`'s feed tailer can parse event boundaries. The
-        // plain (human-readable) variants are exposed under explicit `*-plain`
-        // names -- the monitor still works against them (lines become Raw
-        // events) but the live-reasoning feature is lost, so the structured
-        // forms are the right default for any agent the monitor will show.
-        //
-        // `claude-code` and `opencode` are the monitor-facing defaults and
-        // therefore emit structured output. `claude-code-plain` and
-        // `opencode-plain` are the human-output escape hatches. The legacy
-        // `-stream` names are kept as aliases so existing configs that named
-        // them explicitly still work after migration.
         profiles.insert(
             "claude-code".to_string(),
-            // Monitor-facing default: stream-json. `--verbose` is required
-            // by claude-code for stream-json mode.
-            r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50 --output-format stream-json --verbose"#
-                .to_string(),
-        );
-        profiles.insert(
-            "claude-code-plain".to_string(),
-            // Human-readable escape hatch: same harness, no stream-json.
             r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50"#
                 .to_string(),
         );
         profiles.insert(
             "opencode".to_string(),
-            // Monitor-facing default: structured JSON events with thoughts.
-            r#"opencode run --format json --thinking "$(cat {prompt_file})""#.to_string(),
-        );
-        profiles.insert(
-            "opencode-plain".to_string(),
-            // Human-readable escape hatch.
             r#"opencode run "$(cat {prompt_file})""#.to_string(),
-        );
-        // Legacy aliases for configs that named the streaming variants
-        // explicitly before they became the defaults. Same command as the
-        // new monitor-facing defaults; kept so a user's
-        // `--launcher-agent opencode-stream` continues to work after the
-        // migration that made `opencode` itself structured.
-        profiles.insert(
-            "opencode-stream".to_string(),
-            r#"opencode run --format json --thinking "$(cat {prompt_file})""#.to_string(),
-        );
-        profiles.insert(
-            "claude-code-stream".to_string(),
-            r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50 --output-format stream-json --verbose"#
-                .to_string(),
         );
         profiles.insert(
             "copilot".to_string(),
@@ -155,7 +64,7 @@ impl Default for Config {
         Self {
             agents: AgentConfig::default(),
             launcher: LauncherConfig {
-                template: r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50 --output-format stream-json --verbose"#
+                template: r#"claude -p "$(cat {prompt_file})" --permission-mode acceptEdits --allowedTools "Bash(trelane *)" --max-turns 50"#
                     .to_string(),
                 profiles,
             },
@@ -172,19 +81,13 @@ impl Default for Config {
                 // so aggressive that a legitimately slow agent gets
                 // force-expired in normal operation.
                 reply_timeout_s: Some(3600),
-                breaker_escalation_count: default_breaker_escalation_count(),
-                starvation_ticks: default_starvation_ticks(),
             },
             claims: ClaimsConfig {
                 default_ttl_s: 900,
             },
-            di: DiConfig::default(),
-            retention: RetentionConfig::default(),
             ui: UiConfig::default(),
             biplane: BiplaneConfig::default(),
-            bench: BenchConfig::default(),
             workspace: WorkspaceConfig::default(),
-            config_version: CURRENT_CONFIG_VERSION,
         }
     }
 }
@@ -225,117 +128,6 @@ pub struct SquireConfig {
     /// triggers abandonment in that case.
     #[serde(default)]
     pub reply_timeout_s: Option<u64>,
-    /// R24: how many times the same agent may be woken as designated breaker
-    /// for the same wait-cycle before the cycle escalates (a different
-    /// tie-break is tried, then the cycle is surfaced as needing a human).
-    /// Default 3.
-    #[serde(default = "default_breaker_escalation_count")]
-    pub breaker_escalation_count: i64,
-    /// R23: a candidate that has been valid but unchosen for this many
-    /// consecutive ticks is guaranteed one of the next tick's capacity slots,
-    /// ahead of ordinary ordering. Default 10 (at the default 20s interval,
-    /// an agent waits at most ~3.3 minutes before its slot is guaranteed).
-    #[serde(default = "default_starvation_ticks")]
-    pub starvation_ticks: i64,
-}
-
-fn default_breaker_escalation_count() -> i64 {
-    3
-}
-
-fn default_starvation_ticks() -> i64 {
-    10
-}
-
-/// Slice 4A: domain-intrusion (DI) timing configuration. See R9, R25, R26.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct DiConfig {
-    /// Seconds a non-owner approval must stand, unvetoed, before the request
-    /// resolves to Approved (R9). Long enough for the owner to see the
-    /// request on their next wake; short enough that a non-responsive owner
-    /// doesn't block work for a full squire cycle. Default 300 (5 minutes).
-    pub objection_window_s: u64,
-    /// Seconds a DI request may sit with no approval and no veto before it
-    /// transitions to Expired -- never silently Approved (R25). Default 3600.
-    pub request_timeout_s: u64,
-    /// Seconds a `claim-contested` park (an approved DI whose claim lost the
-    /// lease race, R26) may sit before the contention is abandoned and the
-    /// requester is woken. Default 1800 (30 minutes).
-    pub claim_contested_timeout_s: u64,
-}
-
-impl Default for DiConfig {
-    fn default() -> Self {
-        Self {
-            objection_window_s: 300,
-            request_timeout_s: 3600,
-            claim_contested_timeout_s: 1800,
-        }
-    }
-}
-
-impl DiConfig {
-    /// 4A config-inversion guard. The DI lifecycle depends on two temporal
-    /// relationships: the objection window must fit inside the request
-    /// lifetime (a non-owner approval that clears the window must still be
-    /// alive to resolve; if `request_timeout_s` fires first, every pending
-    /// non-owner approval silently expires instead of resolving -- an
-    /// operator footgun, not a meaningful mode), and the claim-contested
-    /// park timeout should not outlive the request it is contesting (a
-    /// contention parked on an already-expired request is dead weight).
-    /// Defaults satisfy both; this catches hand-edited configs that do not.
-    /// One canonical site, invoked from every persistence path so file
-    /// edits, `trelane config set`, and the diagnostic editor all enforce it.
-    pub fn validate(&self) -> crate::error::Result<()> {
-        use crate::error::TrelaneError;
-        if self.objection_window_s > self.request_timeout_s {
-            return Err(TrelaneError::msg(format!(
-                "di.objection_window_s ({}) must be <= di.request_timeout_s ({}): \
-                 a non-owner approval that clears the objection window must still be \
-                 alive to resolve. If the request times out first, every pending \
-                 non-owner approval silently expires instead of resolving.",
-                self.objection_window_s, self.request_timeout_s
-            )));
-        }
-        if self.claim_contested_timeout_s > self.request_timeout_s {
-            return Err(TrelaneError::msg(format!(
-                "di.claim_contested_timeout_s ({}) must be <= di.request_timeout_s ({}): \
-                 a claim-contested park (R26) on a request that has already expired \
-                 (R25) is dead weight -- the contention cannot resolve to an approval \
-                 the request no longer has time to grant.",
-                self.claim_contested_timeout_s, self.request_timeout_s
-            )));
-        }
-        Ok(())
-    }
-}
-
-/// Slice 4D: retention configuration (R15). Staleness demotes to a colder
-/// tier; nothing is ever deleted unless `purge_days` is explicitly set.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RetentionConfig {
-    /// Messages untouched for longer than this many days are archived:
-    /// excluded from default queries, fully readable under
-    /// `--include-archived`. Default 30.
-    pub hot_days: u64,
-    /// A whole project with zero agent activity for this many days is
-    /// flagged dormant (a marker only; no data is touched). Default 90.
-    pub dormant_days: u64,
-    /// Real deletion threshold in days. UNSET by default -- deletion only
-    /// ever happens when this is explicitly configured (R15).
-    pub purge_days: Option<u64>,
-}
-
-impl Default for RetentionConfig {
-    fn default() -> Self {
-        Self {
-            hot_days: 30,
-            dormant_days: 90,
-            purge_days: None,
-        }
-    }
 }
 
 /// Deprecated name for [`SquireConfig`], kept so external code compiles.
@@ -396,17 +188,6 @@ pub struct UiKeys {
     pub pane_right: String,
     pub pane_up: String,
     pub pane_down: String,
-    /// Per-session toggle: swap the focused agent pane between its live session
-    /// view and a diagnostic view of that one agent (NOT the whole Trelane
-    /// session -- that's `diagnostic_view`). Defaults to a function key for the
-    /// same reason as the others: a global tmux root-table binding on a letter
-    /// like `D` would swallow every `D` the user types into an agent's own
-    /// terminal. Set it to `"D"` in config if you accept that tradeoff.
-    pub session_diagnostic: String,
-    /// Per-session key: show the focused (usually asleep) agent's message
-    /// history, so the user can see why it parked. Same letter-vs-function-key
-    /// tradeoff as `session_diagnostic`; set to `"M"` to match the design.
-    pub message_history: String,
 }
 
 impl Default for UiKeys {
@@ -420,8 +201,6 @@ impl Default for UiKeys {
             pane_right: "F7".to_string(),
             pane_up: "F8".to_string(),
             pane_down: "F9".to_string(),
-            session_diagnostic: "F10".to_string(),
-            message_history: "F11".to_string(),
         }
     }
 }
@@ -454,15 +233,6 @@ pub struct BiplaneConfig {
     /// agents for emergent domains discovered during reconciliation.
     /// Additive-only: existing agents are never removed or re-assigned.
     pub reanalyze_on_all_stop: bool,
-    /// R18: the finest tier the refinement pass may propose (default
-    /// "feature"). Refinement stops at this rung even when a domain keeps
-    /// growing.
-    #[serde(default = "default_max_granularity_tier")]
-    pub max_granularity_tier: String,
-}
-
-fn default_max_granularity_tier() -> String {
-    "feature".to_string()
 }
 
 impl Default for BiplaneConfig {
@@ -470,54 +240,6 @@ impl Default for BiplaneConfig {
         Self {
             detect_thematic_deadlock: true,
             reanalyze_on_all_stop: false,
-            max_granularity_tier: default_max_granularity_tier(),
-        }
-    }
-}
-
-/// Bench mode configuration. Bench runs headless free-model agents with an
-/// explicit --max-turns budget so they cannot run away in the background.
-/// The free_models allowlist prevents accidental paid-model spend: when
-/// non-empty, `trelane bench run --free-models-only` rejects any model not
-/// in the list before launching.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct BenchConfig {
-    /// Free model ids the bench may use. Empty = no restriction. Set via
-    /// `trelane config set bench.free_models '["openrouter/z-ai/glm-5.2"]'`.
-    #[serde(default)]
-    pub free_models: Vec<String>,
-    /// Default --max-turns per agent slice (default 50). A slice ends when
-    /// the agent exits (calls `trelane done`); the squire re-wakes it next
-    /// tick with a fresh budget if there is still ready work.
-    #[serde(default = "default_bench_max_turns")]
-    pub default_max_turns: u32,
-    /// Default model to launch all agents with when --model is not passed on
-    /// the CLI. Optional: if None, --model is required.
-    #[serde(default)]
-    pub default_model: Option<String>,
-    /// Maximum seconds to wait for all launched agents to finish after a
-    /// tick before declaring them timed out (default 600 = 10 min). A
-    /// free-model slice can take minutes; this is the outer bound.
-    #[serde(default = "default_bench_slice_timeout_s")]
-    pub slice_timeout_s: u64,
-}
-
-fn default_bench_max_turns() -> u32 {
-    50
-}
-
-fn default_bench_slice_timeout_s() -> u64 {
-    600
-}
-
-impl Default for BenchConfig {
-    fn default() -> Self {
-        Self {
-            free_models: Vec::new(),
-            default_max_turns: default_bench_max_turns(),
-            default_model: None,
-            slice_timeout_s: default_bench_slice_timeout_s(),
         }
     }
 }
@@ -595,90 +317,6 @@ pub struct Domain {
     pub launcher_agent: Option<String>,
     #[serde(default)]
     pub forbidden_write: Vec<String>,
-    /// R18: where this domain sits on the open-ended granularity ladder.
-    #[serde(default = "default_granularity_tier")]
-    pub granularity_tier: String,
-    /// R17: lineage -- the domain this one was split from, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_domain: Option<String>,
-    #[serde(default)]
-    pub created_in_pass: i64,
-    /// R20: set only on the proposal record when a split targets an owned
-    /// domain; also stamped on the domain row for audit.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner_at_split_time: Option<String>,
-    /// When the current tier was assigned (growth signals are scoped to
-    /// files changed since this time).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tier_set_at: Option<String>,
-}
-
-pub(crate) fn default_granularity_tier() -> String {
-    "coarse".to_string()
-}
-
-/// R18: the open-ended granularity ladder, climbed one rung at a time, each
-/// domain advancing independently. The ladder is *open-ended*: tiers finer
-/// than the last named rung are representable as free strings, but the
-/// built-in refinement pass only ever proposes the next named rung.
-pub const GRANULARITY_LADDER: &[&str] = &["coarse", "file-group", "feature"];
-
-/// Rank of a tier on the ladder. Unknown (finer, custom) tiers rank beyond
-/// the named rungs, preserving order without hardcoding the end.
-pub fn tier_rank(tier: &str) -> usize {
-    GRANULARITY_LADDER
-        .iter()
-        .position(|t| *t == tier)
-        .unwrap_or(GRANULARITY_LADDER.len())
-}
-
-/// The next named rung up, or None at/above the ladder's current top (or for
-/// a custom tier, which refinement never advances automatically).
-pub fn next_tier(tier: &str) -> Option<&'static str> {
-    GRANULARITY_LADDER
-        .iter()
-        .position(|t| *t == tier)
-        .and_then(|i| GRANULARITY_LADDER.get(i + 1).copied())
-}
-
-/// R21: a ranked move target for a domain that has run out of ready work.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DomainAdjacency {
-    pub from_domain: String,
-    pub to_domain: String,
-    pub rank: i64,
-    #[serde(default)]
-    pub rationale: String,
-    /// Sibling | Structural | LLM
-    #[serde(default = "default_adjacency_source")]
-    pub source: String,
-    #[serde(default)]
-    pub created_at: String,
-}
-
-fn default_adjacency_source() -> String {
-    "sibling".to_string()
-}
-
-/// R20: a proposed split of an OWNED domain. Takes effect only through
-/// review; the owner's current scope is untouched until it separately
-/// finishes or redomains.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SplitProposal {
-    pub id: String,
-    pub domain: String,
-    pub owner_at_split_time: Option<String>,
-    /// JSON: Vec<DomainSpec>-shaped children plus rationale.
-    pub proposal_json: String,
-    #[serde(default = "default_split_status")]
-    pub status: String,
-    pub created_at: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resolved_at: Option<String>,
-}
-
-fn default_split_status() -> String {
-    "pending".to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -714,34 +352,6 @@ pub struct Message {
     pub sig: String,
     #[serde(skip)]
     pub processed_at: Option<String>,
-    /// TMP envelope: `direct` (default) or `bulletin` (R12/R13).
-    #[serde(default = "default_channel")]
-    pub channel: String,
-    /// Bulletin scope: the domain this message is posted to. `None` for
-    /// direct messages.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope: Option<String>,
-    /// Id of the message this one replaces (bulletin updates, R12).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supersedes: Option<String>,
-    /// TMP protocol version.
-    #[serde(default = "default_tmp_version")]
-    pub tmp_version: String,
-    /// R15/4D: last time this message was created, replied to, superseded,
-    /// or otherwise touched. Drives retention archival.
-    #[serde(default)]
-    pub last_touched_at: String,
-    /// R15: set when retention archives the message. `None` = hot tier.
-    #[serde(skip)]
-    pub archived_at: Option<String>,
-}
-
-fn default_channel() -> String {
-    CHANNEL_DIRECT.to_string()
-}
-
-fn default_tmp_version() -> String {
-    TMP_VERSION.to_string()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -759,7 +369,7 @@ impl Message {
         paths: Vec<String>,
         created_at: String,
     ) -> Self {
-        let mut msg = Self {
+        Self {
             id,
             from,
             to,
@@ -774,16 +384,7 @@ impl Message {
             schema: 1,
             sig: String::new(),
             processed_at: None,
-            channel: default_channel(),
-            scope: None,
-            supersedes: None,
-            tmp_version: default_tmp_version(),
-            last_touched_at: String::new(),
-            archived_at: None,
-        };
-        // last_touched_at defaults to created_at (R15: creation is a touch).
-        msg.last_touched_at = msg.created_at.clone();
-        msg
+        }
     }
 }
 
@@ -796,13 +397,7 @@ impl Message {
 // additive -- existing park / claim / message flows are unchanged.
 
 pub const TASK_STATES: &[&str] = &[
-    "draft",
-    "ready",
-    "active",
-    "blocked",
-    "review",
-    "done",
-    "cancelled",
+    "draft", "ready", "active", "blocked", "review", "done", "cancelled",
 ];
 
 /// Lifecycle state of a task in the ledger.
@@ -1165,13 +760,6 @@ pub enum WakeKind {
     OwnedTask,
     HelperAssignment,
     AssistDiscovery,
-    /// 4A: a parked DI request resolved to Approved (R9).
-    DIApproved,
-    /// 4A: a parked DI request resolved to Vetoed (owner veto always wins).
-    DIVetoed,
-    /// 4A/R25: a parked DI request resolved to Expired (silence is not
-    /// permission).
-    DIExpired,
 }
 
 impl WakeKind {
@@ -1182,9 +770,6 @@ impl WakeKind {
             WakeKind::AbandonedPark => 1,
             WakeKind::ReadyPark => 2,
             WakeKind::CycleBreak => 3,
-            WakeKind::DIApproved => 3,
-            WakeKind::DIVetoed => 3,
-            WakeKind::DIExpired => 3,
             WakeKind::OwnedTask => 4,
             WakeKind::HelperAssignment => 5,
             WakeKind::AssistDiscovery => 6,
@@ -1242,135 +827,6 @@ pub struct AgentStatus {
     pub task_ids: Vec<String>,
 }
 
-// ---------------------------------------------------------------- story ledger
-//
-// The append-only causal event ledger (see FEATURES/external/trelane-story-ledger-spec.json).
-// Every recordable "story" of a Trelane session is one row in `story_events`;
-// these types are the Rust view of one row. The ledger is observation-only:
-// it never changes coordination semantics (claims/DI/park/wake), it just
-// records them so `trelane story` can answer after the fact.
-//
-// `StoryEvent` is built up by emitter call sites via builder setters; the
-// constructor `StoryEvent::new(kind, agent)` fills the mandatory id +
-// timestamps so call sites don't have to. Per the spec's R16
-// best-effort invariant, every emitter wraps `store::append_story_event`
-// in `let _ = ...` so a ledger failure can never fail the surrounding
-// claim/park/run.
-
-/// One row in the `story_events` ledger. Maps 1:1 to the schema in
-/// `db.rs::SCHEMA_V14`. `detail` and `refs` are typed as JSON values rather
-/// than fixed structs because the per-kind payload is specified in the spec
-/// (events.kinds) and the renderer decodes by `kind`; encoding them as
-/// serde_json::Value keeps the row representation narrow while letting
-/// emitters stay readable.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct StoryEvent {
-    /// Globally-unique id for this event ('ev-...'). Generated at construction
-    /// so a row is always identifiable even before it's persisted.
-    pub event_id: String,
-    /// The telemetry trace id shared with OTLP spans, when one exists at emit
-    /// time. Nullable: a session may emit events before any span forces the
-    /// trace id file to exist.
-    pub trace_id: Option<String>,
-    /// crypto::now_iso() at emit time -- human-readable ISO-8601.
-    pub ts_iso: String,
-    /// telemetry::now_nanos() at emit time -- sub-second ordering.
-    pub ts_nanos: u64,
-    /// One of the kinds enumerated in the spec's events.kinds: run_start,
-    /// run_end, file_change, claim_acquired, claim_denied, claim_released,
-    /// park, unpark, wake_issued, di_resolved.
-    pub kind: String,
-    /// The acting agent id, or "squire" for squire-emitted events, or None
-    /// for system events.
-    pub agent: Option<String>,
-    /// The file/glob this event concerns, when applicable. Forward-slashed,
-    /// repo-relative, exactly as git_dirty yields.
-    pub path: Option<String>,
-    /// sha256 hex of the file's content before this event (file_change
-    /// only); None for newly-created files.
-    pub hash_before: Option<String>,
-    /// sha256 hex of the file's content after this event (file_change only);
-    /// None for deleted files. Reappearance of the same hash_after on the
-    /// same path is the overwrite/revert signal the ledger exists to detect.
-    pub hash_after: Option<String>,
-    /// Kind-specific typed payload. See the spec's events.kinds for the
-    /// per-kind shape emitters MUST honor.
-    pub detail: serde_json::Value,
-    /// ids this event references: message ids, request ids, prior event
-    /// ids, run ids. Stored as a JSON array; empty when none.
-    pub refs: Vec<String>,
-}
-
-impl StoryEvent {
-    /// Construct a new event with a fresh event_id and the current
-    /// timestamps filled in. All other fields default to empty/None and are
-    /// filled in by the builder setters below.
-    pub fn new(kind: impl Into<String>, agent: Option<String>) -> Self {
-        StoryEvent {
-            event_id: crate::crypto::new_id("ev"),
-            trace_id: None,
-            ts_iso: crate::crypto::now_iso(),
-            ts_nanos: crate::telemetry::now_nanos(),
-            kind: kind.into(),
-            agent,
-            path: None,
-            hash_before: None,
-            hash_after: None,
-            detail: serde_json::Value::Object(serde_json::Map::new()),
-            refs: Vec::new(),
-        }
-    }
-
-    pub fn trace(mut self, trace_id: Option<String>) -> Self {
-        self.trace_id = trace_id;
-        self
-    }
-
-    pub fn path(mut self, path: Option<String>) -> Self {
-        self.path = path;
-        self
-    }
-
-    pub fn hashes(mut self, before: Option<String>, after: Option<String>) -> Self {
-        self.hash_before = before;
-        self.hash_after = after;
-        self
-    }
-
-    pub fn detail(mut self, detail: serde_json::Value) -> Self {
-        self.detail = detail;
-        self
-    }
-
-    pub fn refs(mut self, refs: Vec<String>) -> Self {
-        self.refs = refs;
-        self
-    }
-
-    /// Convenience: a single ref (the common case for run_end -> run_start).
-    pub fn ref_one(mut self, id: String) -> Self {
-        self.refs.push(id);
-        self
-    }
-}
-
-/// Filter for `read_story_events`. All fields optional; absent fields are
-/// not filtered on. Default = "all events, in append (seq) order".
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct StoryFilter {
-    /// Restrict to these event kinds. Empty = all kinds.
-    pub kinds: Vec<String>,
-    /// Restrict to one agent (or "squire").
-    pub agent: Option<String>,
-    /// Restrict to one path's history.
-    pub path: Option<String>,
-    /// Restrict to one telemetry trace id.
-    pub trace_id: Option<String>,
-    /// Only events with seq strictly greater than this (for incremental
-    /// readers). None = no lower bound.
-    pub after_seq: Option<i64>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1403,14 +859,8 @@ mod tests {
     #[test]
     fn agent_activity_state_as_str_is_stable() {
         assert_eq!(AgentActivityState::Running.as_str(), "running");
-        assert_eq!(
-            AgentActivityState::AvailableToHelp.as_str(),
-            "available-to-help"
-        );
-        assert_eq!(
-            AgentActivityState::ProjectComplete.as_str(),
-            "project-complete"
-        );
+        assert_eq!(AgentActivityState::AvailableToHelp.as_str(), "available-to-help");
+        assert_eq!(AgentActivityState::ProjectComplete.as_str(), "project-complete");
     }
 
     #[test]
@@ -1443,11 +893,5 @@ mod tests {
         assert_eq!(keys.pane_right, "F7");
         assert_eq!(keys.pane_up, "F8");
         assert_eq!(keys.pane_down, "F9");
-    }
-
-    #[test]
-    fn hard_forbidden_globs_covers_trelane_and_git() {
-        let globs = hard_forbidden_globs();
-        assert_eq!(globs, vec![".trelane/**".to_string(), ".git/**".to_string()]);
     }
 }

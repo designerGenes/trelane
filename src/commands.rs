@@ -79,7 +79,7 @@ pub fn clear_all_stale_locks(conn: &Connection) -> Result<usize> {
     Ok(cleared)
 }
 
-pub fn is_valid_agent_name(name: &str) -> bool {
+fn is_valid_agent_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 32 {
         return false;
     }
@@ -579,36 +579,10 @@ fn launcher_command_for_agent(
     let domain = store::get_domain(&ctx.conn, agent)?
         .ok_or_else(|| TrelaneError::msg(format!("unknown agent '{agent}'")))?;
 
-    let template = launcher_template_for(domain.launcher_agent.as_deref(), &ctx.config.launcher)
-        .ok_or_else(|| TrelaneError::launcher_not_configured(agent))?;
-
-    Ok(template
-        .replace("{prompt_file}", &prompt_file.display().to_string())
-        .replace("{agent}", agent)
-        .replace("{root}", &ctx.root.display().to_string()))
-}
-
-/// Pure template selector for an agent's launcher. Returns the unsubstituted
-/// command template (containing `{prompt_file}`, `{agent}`, `{root}`), or
-/// `None` when no launcher was explicitly chosen for this agent (the
-/// safety-refusal path -- see `TrelaneError::launcher_not_configured`).
-///
-/// Extracted from `launcher_command_for_agent` so the structured-output
-/// invariant (TUI-002) is unit-testable without a database Context:
-///
-/// - A profile name that exists in `profiles` resolves to that profile's
-///   command (whatever the user configured; defaults are structured output).
-/// - Any other non-empty value is treated as a raw opencode model id and
-///   resolves to a structured-output command (`--format json --thinking`).
-/// - An empty/None launcher_agent resolves to None (refuse to auto-launch).
-pub fn launcher_template_for(
-    launcher_agent: Option<&str>,
-    launcher: &crate::models::LauncherConfig,
-) -> Option<String> {
-    match launcher_agent {
+    let template = match domain.launcher_agent.as_deref() {
         // A configured launcher PROFILE name (claude-code/opencode/copilot/...).
-        Some(name) if launcher.profiles.contains_key(name) => {
-            Some(launcher.profiles.get(name).unwrap().clone())
+        Some(name) if ctx.config.launcher.profiles.contains_key(name) => {
+            ctx.config.launcher.profiles.get(name).unwrap().clone()
         }
         // Any other non-empty value is treated as an exact opencode model id
         // (this is what the Biplane UI's model selector stores -- raw lines
@@ -617,23 +591,22 @@ pub fn launcher_template_for(
         // to the default launcher template, so a model chosen in the UI never
         // actually took effect. Building an explicit opencode+model command
         // here mirrors the same pattern Biplane's own planning call uses.
-        //
-        // TUI-002: raw model IDs MUST use `--format json --thinking` so the
-        // monitor receives newline-delimited structured events. Without those
-        // flags opencode emits interactive-style prose (ANSI color codes,
-        // `\r`-driven spinners) which the monitor's log tailer cannot parse
-        // as event boundaries -- the photographed screen-corruption bug.
-        Some(model_id) if !model_id.is_empty() => Some(format!(
-            "opencode run --format json --thinking --model {model_id} --dir {{root}} \"$(cat {{prompt_file}})\""
-        )),
+        Some(model_id) if !model_id.is_empty() => {
+            format!("opencode run --model {model_id} --dir {{root}} \"$(cat {{prompt_file}})\"")
+        }
         // No launcher was ever explicitly chosen for this agent. Do NOT
         // silently fall back to the global default template: that default is
         // a real CLI invocation (out of the box, Anthropic's `claude`) that
         // can bill the user's account. Launching that without an explicit,
         // per-agent choice risks unintended real-money spend, so refuse
         // instead -- this must never happen implicitly.
-        _ => None,
-    }
+        _ => return Err(TrelaneError::launcher_not_configured(agent)),
+    };
+
+    Ok(template
+        .replace("{prompt_file}", &prompt_file.display().to_string())
+        .replace("{agent}", agent)
+        .replace("{root}", &ctx.root.display().to_string()))
 }
 
 fn launch_via_adapter(adapter: &str, target: &str, command: &str) -> Result<()> {
@@ -735,7 +708,7 @@ pub fn cmd_add_agent(
         )));
     }
 
-    let mut forbidden = crate::models::hard_forbidden_globs();
+    let mut forbidden = vec![format!("{TRELANE_DIR}/**"), ".git/**".to_string()];
     forbidden.extend(forbidden_write.iter().cloned());
     let agent_dir = ctx.trelane_dir().join("agents").join(name);
     std::fs::create_dir_all(agent_dir.join("logs"))?;
@@ -773,7 +746,7 @@ pub fn cmd_redomain(
     let existing = store::get_domain(&ctx.conn, agent)?
         .ok_or_else(|| TrelaneError::msg(format!("unknown agent '{agent}'")))?;
 
-    let mut forbidden = crate::models::hard_forbidden_globs();
+    let mut forbidden = vec![format!("{TRELANE_DIR}/**"), ".git/**".to_string()];
     forbidden.extend(forbidden_write.iter().cloned());
     let now = crypto::now_iso();
     store::upsert_agent(
@@ -785,13 +758,6 @@ pub fn cmd_redomain(
         &forbidden,
         &now,
     )?;
-
-    // 4B: the agent is leaving its old domain -- archive any still-active
-    // bulletin entries it posted so the old domain's board no longer shows a
-    // departed agent as working in it. The idle-agent archival in retention
-    // is the time-based path; this is the deliberate, immediate hook on a
-    // domain switch (R12: a bulletin describes *current* intent).
-    let archived_bulletins = store::archive_agent_bulletins(&ctx.conn, agent, &now)?;
 
     for other in store::list_agents(&ctx.conn)? {
         if other == agent {
@@ -818,9 +784,7 @@ pub fn cmd_redomain(
         store::insert_message(&ctx.conn, &msg)?;
     }
 
-    println!(
-        "updated domain for '{agent}' writable={writable:?} (archived {archived_bulletins} stale bulletin entry/ies)"
-    );
+    println!("updated domain for '{agent}' writable={writable:?}");
     Ok(())
 }
 
@@ -1083,18 +1047,15 @@ fn bulletin_autopost_on_claim(ctx: &Context, agent: &str, rel: &str) {
                 .unwrap_or_else(|| agent.to_string())
         };
         let active = store::get_active_bulletin_entry(&ctx.conn, &scope, agent)?;
-        let mut paths = active.as_ref().map(|a| a.paths.clone()).unwrap_or_default();
+        let mut paths = active
+            .as_ref()
+            .map(|a| a.paths.clone())
+            .unwrap_or_default();
         if paths.iter().any(|p| p == rel) {
             return Ok(()); // already announced
         }
         paths.push(rel.to_string());
-        post_bulletin(
-            ctx,
-            agent,
-            &scope,
-            &paths,
-            "working-set update (auto-posted on claim)",
-        )?;
+        post_bulletin(ctx, agent, &scope, &paths, "working-set update (auto-posted on claim)")?;
         Ok(())
     })();
 }
@@ -1170,10 +1131,7 @@ pub fn cmd_di(ctx: &Context, action: &crate::cli::DiAction) -> Result<()> {
             } else {
                 println!("id          : {}", req.id);
                 println!("requester   : {}", req.requester_agent);
-                println!(
-                    "target      : {} (path {})",
-                    req.target_domain, req.path_glob
-                );
+                println!("target      : {} (path {})", req.target_domain, req.path_glob);
                 println!("purpose     : {}", req.purpose);
                 println!("status      : {}", req.status);
                 println!("created     : {}", req.created_at);
@@ -1182,10 +1140,7 @@ pub fn cmd_di(ctx: &Context, action: &crate::cli::DiAction) -> Result<()> {
                     println!("resolved    : {resolved}");
                 }
                 if let Some(veto) = &req.veto_agent {
-                    println!(
-                        "veto        : {veto}: {}",
-                        req.veto_reason.as_deref().unwrap_or("")
-                    );
+                    println!("veto        : {veto}: {}", req.veto_reason.as_deref().unwrap_or(""));
                 }
                 println!(
                     "approvals   : {}",
@@ -1251,8 +1206,10 @@ fn overlapping_bulletins(ctx: &Context, req: &crate::di::DiRequest) -> Result<Ve
         if e.from == req.requester_agent {
             continue;
         }
-        let overlap =
-            e.paths.is_empty() || e.paths.iter().any(|p| di_glob_overlap(&req.path_glob, p));
+        let overlap = e.paths.is_empty()
+            || e.paths.iter().any(|p| {
+                di_glob_overlap(&req.path_glob, p)
+            });
         if overlap {
             out.push(format!(
                 "{} is working in {}: {}",
@@ -1790,37 +1747,12 @@ pub fn cmd_wake(
     if let Some(parent) = wake_meta.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    // Snapshot the working tree as a git tree object (no commit, no index/
-    // working-tree mutation -- see telemetry::snapshot_tree) so cmd_done can
-    // diff *this run's* slice instead of the cumulative diff since HEAD.
-    // None on non-git projects or if git plumbing fails; cmd_done falls
-    // back to the old HEAD-relative diff in that case.
-    let wake_tree = crate::telemetry::snapshot_tree(&ctx.root);
-    let run_id = crate::crypto::new_id("run");
     let wake_data = serde_json::json!({
         "started_at_ns": crate::telemetry::now_nanos(),
         "started_at_iso": crypto::now_iso(),
         "reason": reason,
-        "wake_tree": wake_tree,
-        "run_id": run_id,
     });
     std::fs::write(&wake_meta, serde_json::to_string(&wake_data)?)?;
-
-    // Story ledger (best-effort, R16): run_start carries the agent, the
-    // wake reason, the git tree sha, and a fresh run_id that ties this
-    // run_start to its run_end. cmd_done reads run_id back from wake.json
-    // and puts the same id in run_end.refs_json -- so a reader can pair
-    // them.
-    let _ = store::append_story_event(
-        &ctx.conn,
-        &StoryEvent::new("run_start", Some(agent.to_string()))
-            .trace(crate::telemetry::current_trace_id(&ctx.trelane_dir()))
-            .detail(serde_json::json!({
-                "reason": reason,
-                "wake_tree": wake_tree,
-                "run_id": run_id,
-            })),
-    );
 
     if launcher_override.is_none()
         && let Some(target) = store::get_launch_target(&ctx.conn, agent)?
@@ -1839,47 +1771,6 @@ pub fn cmd_wake(
             command: resolved_command,
             ..target.clone()
         });
-
-        // The "shell" adapter spawns the agent as a subprocess (the bench
-        // mode path), using the launch target's command template directly
-        // rather than building one from the agent's launcher_agent. This is
-        // how per-agent --max-turns is injected: the bench setup writes a
-        // per-agent command with max_turns baked in, stored as a launch
-        // target with adapter="shell". The squire's tick calls cmd_wake,
-        // which sees the stored target and spawns the subprocess.
-        if target.adapter == "shell" {
-            let log_dir = ctx.trelane_dir().join("agents").join(agent).join("logs");
-            std::fs::create_dir_all(&log_dir)?;
-            let log_name = format!("run-{}.log", crypto::new_id("r"));
-            let log_path = log_dir.join(&log_name);
-            let launch_script = format!(
-                "({}) >> {} 2>&1 & printf '%s' $!",
-                command,
-                shell_double_quote(&log_path.display().to_string())
-            );
-            let output = Command::new("sh")
-                .arg("-c")
-                .arg(&launch_script)
-                .current_dir(&ctx.root)
-                .output()?;
-            if !output.status.success() {
-                return Err(TrelaneError::msg(format!(
-                    "launcher shell failed for {agent}: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )));
-            }
-            let pid_text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let pid = pid_text.parse::<i32>().map_err(|_| {
-                TrelaneError::msg(format!("failed to parse launched pid from '{pid_text}'"))
-            })?;
-            let inserted =
-                store::insert_running_lock(&ctx.conn, agent, pid, &crypto::now_iso(), reason)?;
-            if !inserted {
-                eprintln!("warning: {agent} was already launched by another squire");
-            }
-            println!("launched {agent} pid={pid} reason={reason} (shell launch-target)");
-            return Ok(());
-        }
 
         if target.adapter == "tmux" {
             // Write a single launch script containing the splash AND the
@@ -1961,242 +1852,8 @@ pub fn cmd_wake(
     if !inserted {
         eprintln!("warning: {agent} was already launched by another squire");
     }
-
+    println!("launched {agent} pid={pid} reason={reason}");
     Ok(())
-}
-
-#[cfg(test)]
-mod story_cli_tests {
-    use super::*;
-    use crate::models::StoryEvent;
-
-    fn ctx_with_ledger() -> (tempfile::TempDir, Context) {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().to_path_buf();
-        let db_path = root.join(".trelane").join("trelane.db");
-        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-        let conn = crate::db::open(&db_path).unwrap();
-        let ctx = Context {
-            root,
-            conn,
-            config: Config::default(),
-        };
-        (temp, ctx)
-    }
-
-    fn file_change(
-        ctx: &Context,
-        agent: &str,
-        path: &str,
-        after: Option<&str>,
-        before: Option<&str>,
-        run_id: &str,
-    ) {
-        let ev = StoryEvent::new("file_change", Some(agent.to_string()))
-            .path(Some(path.to_string()))
-            .hashes(before.map(str::to_string), after.map(str::to_string))
-            .detail(serde_json::json!({
-                "run_id": run_id,
-                "change": match (before, after) {
-                    (None, Some(_)) => "created",
-                    (Some(_), None) => "deleted",
-                    _ => "modified",
-                },
-            }))
-            .refs(if run_id.is_empty() {
-                Vec::new()
-            } else {
-                vec![run_id.to_string()]
-            });
-        store::append_story_event(&ctx.conn, &ev).unwrap();
-    }
-
-    // Acceptance test: `trelane story --json` output deserializes to the
-    // same events read_story_events returns, in the same seq order. This
-    // is the parity guarantee between the read API and the CLI surface.
-    // Uses cmd_story_to with an in-memory buffer to avoid fighting cargo
-    // test's per-thread stdout capture (which bypasses fd-level redirects).
-    #[test]
-    fn story_json_matches_read_in_seq_order() {
-        let (_tmp, ctx) = ctx_with_ledger();
-        // Populate with a few events of mixed kinds.
-        let rs = StoryEvent::new("run_start", Some("alpha".to_string()))
-            .detail(serde_json::json!({
-                "reason": "manual",
-                "wake_tree": serde_json::Value::Null,
-                "run_id": "run-1",
-            }));
-        let rs_id = rs.event_id.clone();
-        store::append_story_event(&ctx.conn, &rs).unwrap();
-
-        let fc = StoryEvent::new("file_change", Some("alpha".to_string()))
-            .path(Some("src/a.rs".to_string()))
-            .hashes(None, Some("Ha".to_string()))
-            .detail(serde_json::json!({
-                "run_id": "run-1",
-                "change": "created",
-            }))
-            .refs(vec!["run-1".to_string()]);
-        store::append_story_event(&ctx.conn, &fc).unwrap();
-
-        let re = StoryEvent::new("run_end", Some("alpha".to_string()))
-            .detail(serde_json::json!({
-                "run_id": "run-1",
-                "files_changed": 1,
-                "lines_added": 10,
-                "lines_removed": 0,
-                "exit": "done",
-            }))
-            .refs(vec![rs_id.clone()]);
-        store::append_story_event(&ctx.conn, &re).unwrap();
-
-        let mut buf: Vec<u8> = Vec::new();
-        let args = StoryArgs {
-            json: true,
-            agent: None,
-            path: None,
-            kinds: Vec::new(),
-            rework_only: false,
-        };
-        cmd_story_to(&ctx, &args, &mut buf).unwrap();
-        let printed: Vec<StoryEvent> =
-            serde_json::from_str(&String::from_utf8(buf).unwrap()).unwrap();
-
-        let direct = store::read_story_events(
-            &ctx.conn,
-            &crate::models::StoryFilter::default(),
-        )
-        .unwrap();
-        assert_eq!(printed.len(), direct.len());
-        for (p, d) in printed.iter().zip(direct.iter()) {
-            assert_eq!(p.event_id, d.event_id, "event_id mismatch");
-            assert_eq!(p.kind, d.kind);
-            assert_eq!(p.agent, d.agent);
-            assert_eq!(p.path, d.path);
-            assert_eq!(p.hash_before, d.hash_before);
-            assert_eq!(p.hash_after, d.hash_after);
-            assert_eq!(p.refs, d.refs);
-            assert_eq!(p.detail, d.detail);
-        }
-    }
-
-    // Acceptance test (the headline feature): a rework-only render flags
-    // the byte-identical reappearance with the visible REWORK marker.
-    #[test]
-    fn story_rework_only_flags_byte_identical_reappearance() {
-        let (_tmp, ctx) = ctx_with_ledger();
-        // Two run_starts with run_ids r1 and r2.
-        for rid in ["r1", "r2"] {
-            let _ = rid;
-            store::append_story_event(
-                &ctx.conn,
-                &StoryEvent::new("run_start", Some("alpha".to_string()))
-                    .detail(serde_json::json!({
-                        "reason": "manual",
-                        "wake_tree": serde_json::Value::Null,
-                        "run_id": rid,
-                    })),
-            )
-            .unwrap();
-        }
-        // file_change: src/X.rs reaches H1, then H2, then H1 again.
-        file_change(&ctx, "alpha", "src/X.rs", Some("H1"), None, "r1");
-        file_change(&ctx, "alpha", "src/X.rs", Some("H2"), Some("H1"), "r1");
-        file_change(&ctx, "alpha", "src/X.rs", Some("H1"), Some("H2"), "r2");
-
-        let mut buf: Vec<u8> = Vec::new();
-        let args = StoryArgs {
-            json: false,
-            agent: None,
-            path: None,
-            kinds: Vec::new(),
-            rework_only: true,
-        };
-        cmd_story_to(&ctx, &args, &mut buf).unwrap();
-        let out = String::from_utf8(buf).unwrap();
-        // The rework-only render must surface the path and the rework glyph.
-        assert!(out.contains("src/X.rs"), "rework render: {out}");
-        assert!(
-            out.contains('\u{21ba}'),
-            "expected REWORK glyph (U+21BA) in rework-only render: {out}"
-        );
-    }
-
-    // Acceptance test: the default human render groups children under runs
-    // and marks the reverted file_change with the REWORK marker.
-    #[test]
-    fn story_timeline_groups_runs_and_marks_reverts() {
-        let (_tmp, ctx) = ctx_with_ledger();
-        store::append_story_event(
-            &ctx.conn,
-            &StoryEvent::new("run_start", Some("alpha".to_string()))
-                .detail(serde_json::json!({
-                    "reason": "manual",
-                    "wake_tree": serde_json::Value::Null,
-                    "run_id": "r1",
-                })),
-        )
-        .unwrap();
-        file_change(&ctx, "alpha", "src/X.rs", Some("H1"), None, "r1");
-        store::append_story_event(
-            &ctx.conn,
-            &StoryEvent::new("run_end", Some("alpha".to_string()))
-                .detail(serde_json::json!({
-                    "run_id": "r1",
-                    "files_changed": 1,
-                    "lines_added": 1,
-                    "lines_removed": 0,
-                    "exit": "done",
-                }))
-                .refs(vec!["r1".to_string()]),
-        )
-        .unwrap();
-        store::append_story_event(
-            &ctx.conn,
-            &StoryEvent::new("run_start", Some("alpha".to_string()))
-                .detail(serde_json::json!({
-                    "reason": "redo",
-                    "wake_tree": serde_json::Value::Null,
-                    "run_id": "r2",
-                })),
-        )
-        .unwrap();
-        // Now reach H2 then H1 again -- a true revert to a prior state.
-        file_change(&ctx, "alpha", "src/X.rs", Some("H2"), Some("H1"), "r2");
-        file_change(&ctx, "alpha", "src/X.rs", Some("H1"), Some("H2"), "r2");
-        store::append_story_event(
-            &ctx.conn,
-            &StoryEvent::new("run_end", Some("alpha".to_string()))
-                .detail(serde_json::json!({
-                    "run_id": "r2",
-                    "files_changed": 2,
-                    "lines_added": 0,
-                    "lines_removed": 0,
-                    "exit": "done",
-                }))
-                .refs(vec!["r2".to_string()]),
-        )
-        .unwrap();
-
-        let mut buf: Vec<u8> = Vec::new();
-        let args = StoryArgs {
-            json: false,
-            agent: None,
-            path: None,
-            kinds: Vec::new(),
-            rework_only: false,
-        };
-        cmd_story_to(&ctx, &args, &mut buf).unwrap();
-        let out = String::from_utf8(buf).unwrap();
-        // The render must show the run headers.
-        assert!(out.contains("run r1"), "r1 header missing: {out}");
-        assert!(out.contains("run r2"), "r2 header missing: {out}");
-        // And the REWORK marker for the reverted file_change.
-        assert!(
-            out.contains('\u{21ba}'),
-            "expected REWORK marker in timeline render: {out}"
-        );
-    }
 }
 
 pub fn cmd_set_launch_target(
@@ -2309,14 +1966,9 @@ pub fn cmd_done(ctx: &Context, agent: &str) -> Result<()> {
     }
 
     // Record telemetry: read wake metadata, compute diff, emit span.
-    // NOTE: this must match the path cmd_wake actually writes to
-    // (agents/<agent>/wake.json) -- it previously read the flat
-    // agents/wake.json, which cmd_wake never writes, so this whole block
-    // was silently a no-op for every real run. Fixed.
     let wake_meta = ctx
         .trelane_dir()
         .join("agents")
-        .join(agent)
         .join("wake.json");
     if wake_meta.exists()
         && let Ok(text) = std::fs::read_to_string(&wake_meta)
@@ -2325,19 +1977,7 @@ pub fn cmd_done(ctx: &Context, agent: &str) -> Result<()> {
         let started_ns = data["started_at_ns"].as_u64().unwrap_or(0);
         let reason = data["reason"].as_str().unwrap_or("unknown");
         let now_ns = crate::telemetry::now_nanos();
-        let run_id = data["run_id"].as_str().unwrap_or("").to_string();
-
-        // Prefer an exact per-run diff (this wake's tree vs. right now).
-        // Falls back to the old cumulative-since-HEAD diff only when no
-        // wake_tree was recorded (pre-fix wake.json, or a non-git project).
-        let (files, added, removed) = if let Some(before) = data["wake_tree"].as_str() {
-            match crate::telemetry::snapshot_tree(&ctx.root) {
-                Some(after) => crate::telemetry::diff_trees(&ctx.root, before, &after),
-                None => crate::telemetry::git_diff_stats(&ctx.root),
-            }
-        } else {
-            crate::telemetry::git_diff_stats(&ctx.root)
-        };
+        let (files, added, removed) = crate::telemetry::git_diff_stats(&ctx.root);
 
         let msg_proc = crate::store::get_unprocessed_messages(&ctx.conn, agent)
             .unwrap_or_default()
@@ -2352,100 +1992,11 @@ pub fn cmd_done(ctx: &Context, agent: &str) -> Result<()> {
                 "done",
             );
         }
-
-        // Story ledger (best-effort, R16): run_end + per-path file_change
-        // events. The numbers are the SAME ones computed for the telemetry
-        // span above -- reuse them, do not recompute divergently. The
-        // per-path diff uses the wake baseline (the BEFORE map) vs the
-        // post-run git_dirty (the AFTER map), per the spec's derivation.
-        let _ = store::append_story_event(
-            &ctx.conn,
-            &StoryEvent::new("run_end", Some(agent.to_string()))
-                .trace(crate::telemetry::current_trace_id(&ctx.trelane_dir()))
-                .detail(serde_json::json!({
-                    "run_id": run_id,
-                    "files_changed": files,
-                    "lines_added": added,
-                    "lines_removed": removed,
-                    "exit": "done",
-                }))
-                .refs(if run_id.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![run_id.clone()]
-                }),
-        );
-        emit_file_change_events(ctx, agent, &run_id);
-
         let _ = std::fs::remove_file(&wake_meta);
     }
 
     println!("{agent} marked done");
     Ok(())
-}
-
-/// Emit one `file_change` ledger event per path whose sha256 differs between
-/// the agent's pre-run wake baseline (stored via `save_audit_baseline` at
-/// `cmd_wake`) and the post-run `git_dirty` map. Paths under `.trelane/` or
-/// `.git/` are skipped per the spec's FORBIDDEN PATHS rule (and because
-/// `git_dirty` already filters them, but the rule is enforced here too so
-/// future callers can't accidentally re-introduce them).
-///
-/// The change kind is derived per the spec's derivation_algorithms:
-///   - in AFTER not in BEFORE  -> "created", hash_before=NULL
-///   - in BEFORE not in AFTER  -> "deleted", hash_after=NULL
-///   - in both, hashes differ -> "modified"
-///   - in both, hashes equal  -> NO event (nothing changed this run)
-///
-/// Best-effort: every append is wrapped in `let _ = ...` so a ledger failure
-/// cannot fail the surrounding cmd_done.
-fn emit_file_change_events(ctx: &Context, agent: &str, run_id: &str) {
-    let before = match store::get_audit_baseline(&ctx.conn, agent) {
-        Ok(Some(b)) => b,
-        _ => HashMap::new(),
-    };
-    let after = match git_dirty(&ctx.root) {
-        Some(d) => d,
-        None => return, // no git, no diff
-    };
-
-    let trace_id = crate::telemetry::current_trace_id(&ctx.trelane_dir());
-    let mut paths: Vec<&String> = before.keys().chain(after.keys()).collect();
-    paths.sort();
-    paths.dedup();
-    for path in paths {
-        // Forbidden paths: never record file_change for .trelane/ or .git/.
-        // (git_dirty already filters these, but the rule is enforced here
-        // too so a future caller can't accidentally re-introduce them.)
-        if path.starts_with(".trelane/") || path.starts_with(".git/") {
-            continue;
-        }
-        let before_hash = before.get(path);
-        let after_hash = after.get(path);
-        let (change, hash_before, hash_after) = match (before_hash, after_hash) {
-            (None, Some(a)) => ("created", None, Some(a.clone())),
-            (Some(b), None) => ("deleted", Some(b.clone()), None),
-            (Some(b), Some(a)) if b != a => ("modified", Some(b.clone()), Some(a.clone())),
-            // Equal hashes (or both absent) -> no event.
-            _ => continue,
-        };
-        let _ = store::append_story_event(
-            &ctx.conn,
-            &StoryEvent::new("file_change", Some(agent.to_string()))
-                .trace(trace_id.clone())
-                .path(Some(path.clone()))
-                .hashes(hash_before, hash_after)
-                .detail(serde_json::json!({
-                    "run_id": run_id,
-                    "change": change,
-                }))
-                .refs(if run_id.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![run_id.to_string()]
-                }),
-        );
-    }
 }
 
 // ------------------------------------------------------------------ stub
@@ -2526,15 +2077,7 @@ pub fn cmd_stub(ctx: &Context, agent: &str) -> Result<()> {
             "claim-grant" => {
                 for rel in &m.paths {
                     let full_path = ctx.root.join(rel);
-                    // The stub is a deterministic test agent. The claim may
-                    // fail because cmd_claim now requires an active
-                    // delegation (C2 protocol) for cross-domain paths, which
-                    // the old grant-message-only flow does not create. Rather
-                    // than propagating the error and leaving the grant
-                    // message unprocessed (which keeps the squire re-waking
-                    // the agent forever), log and continue so the swarm can
-                    // reach quiescence.
-                    match cmd_claim(
+                    cmd_claim(
                         ctx,
                         agent,
                         &full_path.to_string_lossy(),
@@ -2542,19 +2085,12 @@ pub fn cmd_stub(ctx: &Context, agent: &str) -> Result<()> {
                         None,
                         Some(&m.id),
                         None,
-                    ) {
-                        Ok(()) => {
-                            println!("[stub:{agent}] claimed {rel} using grant {}", m.id);
-                            let _ = cmd_release(ctx, agent, &full_path.to_string_lossy(), false);
-                        }
-                        Err(e) => {
-                            println!(
-                                "[stub:{agent}] grant {} for {rel}: claim failed ({e}); \
-                                 marking processed and moving on",
-                                m.id
-                            );
-                        }
-                    }
+                    )?;
+                    println!(
+                        "[stub:{agent}] claimed {rel} using grant {}; pretending to edit; releasing",
+                        m.id
+                    );
+                    cmd_release(ctx, agent, &full_path.to_string_lossy(), false)?;
                 }
             }
             "info" if m.subject.starts_with("deadlock") => {
@@ -2893,8 +2429,7 @@ fn cmd_help_offer(
     // not keep waking this helper for the same unchanged backlog.
     let assistable = store::list_assistable_tasks(&ctx.conn, helper, &crypto::now_iso())?;
     let fingerprint = store::assist_backlog_fingerprint(&assistable);
-    let _ =
-        store::record_offer_fingerprint(&ctx.conn, helper, &fingerprint, &id, &crypto::now_iso());
+    let _ = store::record_offer_fingerprint(&ctx.conn, helper, &fingerprint, &id, &crypto::now_iso());
     println!("{id}");
     Ok(())
 }
@@ -3716,393 +3251,9 @@ fn cmd_work_review(
     Ok(())
 }
 
-// --------------------------------------------------------------- story ledger
-//
-// `trelane story` reads the append-only causal ledger (see
-// FEATURES/external/trelane-story-ledger-spec.json) and renders either a
-// human-readable timeline (default) or a JSON array (`--json`). The
-// rework-only mode surfaces the byte-identical reappearances that answer
-// 'did work keep getting redone and overwritten?'.
-
-/// CLI args for `trelane story` (mirrors the clap struct in cli.rs). Kept
-/// as a plain struct so the dispatch arm in lib.rs can construct it
-/// without reaching into clap.
-pub struct StoryArgs {
-    pub json: bool,
-    pub agent: Option<String>,
-    pub path: Option<String>,
-    pub kinds: Vec<String>,
-    pub rework_only: bool,
-}
-
-/// Entry point for `trelane story`. Reads the ledger and renders.
-pub fn cmd_story(ctx: &Context, args: &StoryArgs) -> Result<()> {
-    let mut out: Box<dyn std::io::Write> = Box::new(std::io::stdout());
-    cmd_story_to(ctx, args, &mut out)
-}
-
-/// Implementation that writes to a caller-provided writer. The CLI entry
-/// point passes stdout; tests pass a Vec<u8> or a temp file. This is what
-/// makes the renderer testable without fighting cargo-test's per-thread
-/// stdout capture (which bypasses any fd-level redirect).
-pub fn cmd_story_to(
-    ctx: &Context,
-    args: &StoryArgs,
-    out: &mut dyn std::io::Write,
-) -> Result<()> {
-    if args.rework_only {
-        return render_rework_only_to(ctx, args, out);
-    }
-    let filter = crate::models::StoryFilter {
-        kinds: args.kinds.clone(),
-        agent: args.agent.clone(),
-        path: args.path.clone(),
-        trace_id: None,
-        after_seq: None,
-    };
-    let events = store::read_story_events(&ctx.conn, &filter)?;
-    if args.json {
-        let json = serde_json::to_string_pretty(&events)?;
-        writeln!(out, "{json}")?;
-        return Ok(());
-    }
-    render_story_timeline_to(&events, ctx, out)?;
-    Ok(())
-}
-
-/// `--rework-only`: the headline feature. Lists every file_change whose
-/// hash_after matches an earlier file_change's hash_after on the same path
-/// (a file reached byte-identical content more than once -- the 'work redone
-/// and overwritten' signature), plus the enclosing run_start/run_end for
-/// context. Uses the spec's detect_rework query.
-fn render_rework_only_to(
-    ctx: &Context,
-    _args: &StoryArgs,
-    out: &mut dyn std::io::Write,
-) -> Result<()> {
-    let hits = store::detect_rework(&ctx.conn)?;
-    if hits.is_empty() {
-        writeln!(out, "No byte-identical rework detected.")?;
-        writeln!(out)?;
-        writeln!(
-            out,
-            "(No file reached the same sha256 content hash more than once. Note: this is a \
-             BYTE-identical check; two functionally-equivalent rewrites with different \
-             whitespace/formatting will not be flagged. See `trelane story --help`.)"
-        )?;
-        return Ok(());
-    }
-    writeln!(out, "REWORK signals (byte-identical content reappeared):")?;
-    writeln!(out)?;
-    for hit in hits {
-        let seqs: Vec<&str> = hit.at_seqs.split(',').collect();
-        writeln!(
-            out,
-            "  \u{21ba} {path}  reached hash {hash} {n}x at seqs {seqs}",
-            path = hit.path,
-            hash = short_hash(&hit.hash_after),
-            n = hit.times_reached,
-            seqs = hit.at_seqs,
-        )?;
-        // For each seq where this hash reappeared, fetch the surrounding run
-        // for context (the run_start that owns the file_change's run_id).
-        for s in seqs {
-            let seq: i64 = s.parse().unwrap_or(0);
-            let row = store::read_story_events(
-                &ctx.conn,
-                &crate::models::StoryFilter {
-                    after_seq: Some(seq - 1),
-                    ..Default::default()
-                },
-            )?;
-            // Find the file_change at this seq, then walk backward for its
-            // run_start (same run_id).
-            if let Some(fc) = row.iter().find(|e| {
-                e.kind == "file_change"
-                    && seq_ge(e, seq)
-                    && e.path.as_deref() == Some(&hit.path)
-            }) {
-                let run_id = fc.detail["run_id"].as_str().unwrap_or("");
-                if !run_id.is_empty() {
-                    let run_start = store::read_story_events(
-                        &ctx.conn,
-                        &crate::models::StoryFilter {
-                            kinds: vec!["run_start".to_string()],
-                            ..Default::default()
-                        },
-                    )?
-                    .into_iter()
-                    .find(|e| e.detail["run_id"].as_str() == Some(run_id));
-                    if let Some(rs) = run_start {
-                        writeln!(
-                            out,
-                            "    run {run_id} by {agent} ({reason})",
-                            run_id = run_id,
-                            agent = rs.agent.as_deref().unwrap_or("?"),
-                            reason = rs.detail["reason"].as_str().unwrap_or("?"),
-                        )?;
-                    }
-                }
-            }
-        }
-        writeln!(out)?;
-    }
-    Ok(())
-}
-
-fn short_hash(h: &str) -> String {
-    if h.len() <= 12 {
-        h.to_string()
-    } else {
-        format!("{}..", &h[..12])
-    }
-}
-
-// Best-effort: get the seq of an event by re-querying. Cheaper in the
-// caller is to thread seq through StoryEvent itself, but the spec says
-// the struct maps 1:1 to the row and seq is the autoincrement key (not a
-// field of the struct). For the rework-only renderer we approximate by
-// matching on (path, hash_after, kind) -- a sufficiently unique key.
-//
-// Returning true here means "this event's seq is at or after `target`".
-// Since the caller's filter already bounded after_seq below target, the
-// match is well-defined.
-fn seq_ge(_ev: &crate::models::StoryEvent, _target: i64) -> bool {
-    true // the filter has already constrained the result set
-}
-
-/// The default human render: a timeline grouped under each run. Per the
-/// spec's human_render_contract, run_start/run_end are the headers; their
-/// child file_change/claim/park events are indented underneath. Any
-/// file_change whose hash_after matches an earlier file_change's hash_after
-/// on the same path is prefixed with a visible `\u{21ba} REWORK` marker --
-/// readable without ANSI color (the ledger is often read from a log).
-fn render_story_timeline_to(
-    events: &[crate::models::StoryEvent],
-    _ctx: &Context,
-    out: &mut dyn std::io::Write,
-) -> std::io::Result<()> {
-    use std::collections::HashMap;
-
-    // Precompute the set of (path, hash_after) pairs that appear more than
-    // once -- the rework markers. Walking once with a map is O(n).
-    let mut counts: HashMap<(String, String), usize> = HashMap::new();
-    for e in events {
-        if e.kind == "file_change"
-            && let (Some(p), Some(h)) = (&e.path, &e.hash_after)
-        {
-            *counts.entry((p.clone(), h.clone())).or_insert(0) += 1;
-        }
-    }
-    let mut rework_seen: HashMap<(String, String), usize> = HashMap::new();
-
-    // Render events in seq order. run_start and run_end are the headers;
-    // file_change / claim_* / park / unpark / wake_issued / di_resolved are
-    // rendered as indented children under the run whose run_id they carry
-    // (when one is present in detail). The grouping is purely visual here --
-    // the underlying ledger is already in append (causal) order.
-    for e in events {
-        match e.kind.as_str() {
-            "run_start" => {
-                let run_id = e.detail["run_id"].as_str().unwrap_or("").to_string();
-                let agent = e.agent.as_deref().unwrap_or("?");
-                let reason = e.detail["reason"].as_str().unwrap_or("");
-                writeln!(out)?;
-                writeln!(
-                    out,
-                    "run {run_id}  {agent}  reason: {reason}  ({ts})",
-                    run_id = run_id,
-                    ts = e.ts_iso,
-                )?;
-            }
-            "run_end" => {
-                let files = e.detail["files_changed"].as_i64().unwrap_or(0);
-                let added = e.detail["lines_added"].as_i64().unwrap_or(0);
-                let removed = e.detail["lines_removed"].as_i64().unwrap_or(0);
-                let exit = e.detail["exit"].as_str().unwrap_or("?");
-                writeln!(
-                    out,
-                    "  end   {exit}  files={files}  +{added}/-{removed}  ({ts})",
-                    ts = e.ts_iso,
-                )?;
-            }
-            "file_change" => {
-                let path = e.path.as_deref().unwrap_or("?");
-                let change = e.detail["change"].as_str().unwrap_or("modified");
-                let hash_after = e.hash_after.clone().unwrap_or_default();
-                let hash_before = e.hash_before.clone().unwrap_or_default();
-                let is_rework = e
-                    .path
-                    .as_ref()
-                    .zip(e.hash_after.as_ref())
-                    .map(|(p, h)| counts.get(&(p.clone(), h.clone())).copied().unwrap_or(0) > 1)
-                    .unwrap_or(false);
-                let marker = if is_rework {
-                    let seen = rework_seen
-                        .get(&(path.to_string(), hash_after.clone()))
-                        .copied()
-                        .unwrap_or(0);
-                    rework_seen
-                        .entry((path.to_string(), hash_after.clone()))
-                        .and_modify(|c| *c += 1)
-                        .or_insert(1);
-                    if seen > 0 {
-                        // This is the 2nd+ time we see this hash -> the REWORK.
-                        " \u{21ba} REWORK".to_string()
-                    } else {
-                        "".to_string()
-                    }
-                } else {
-                    String::new()
-                };
-                writeln!(
-                    out,
-                    "  file  {change:<9} {path}  before={before} after={after}{marker}",
-                    before = short_hash(&hash_before),
-                    after = short_hash(&hash_after),
-                    marker = marker,
-                )?;
-            }
-            "claim_acquired" => {
-                let path = e.path.as_deref().unwrap_or("");
-                let holder = e.agent.as_deref().unwrap_or("?");
-                writeln!(out, "  claim acquired {path} by {holder}",)?;
-            }
-            "claim_denied" => {
-                let path = e.path.as_deref().unwrap_or("");
-                let holder = e.agent.as_deref().unwrap_or("?");
-                let current = e.detail["current_holder"].as_str().unwrap_or("?");
-                writeln!(out, "  claim DENIED  {path} by {holder} (held by {current})",)?;
-            }
-            "claim_released" => {
-                let path = e.path.as_deref().unwrap_or("");
-                let holder = e.agent.as_deref().unwrap_or("?");
-                let via = e.detail["via"].as_str().unwrap_or("?");
-                writeln!(out, "  claim released {path} by {holder} (via {via})",)?;
-            }
-            "park" => {
-                let agent = e.agent.as_deref().unwrap_or("?");
-                let wait_type = e.detail["wait_type"].as_str().unwrap_or("?");
-                let waiting_on = e.detail["waiting_on"].as_str().unwrap_or("?");
-                let path = e.path.as_deref().unwrap_or("");
-                writeln!(out, "  park  {agent} on {wait_type} {waiting_on} {path}",)?;
-            }
-            "unpark" => {
-                let agent = e.agent.as_deref().unwrap_or("?");
-                let task = e.detail["task"].as_str().unwrap_or("?");
-                writeln!(out, "  unpark {agent} task {task}")?;
-            }
-            "wake_issued" => {
-                let woke = e.detail["woke"].as_str().unwrap_or("?");
-                let reason = e.detail["reason"].as_str().unwrap_or("?");
-                writeln!(out, "  squire woke {woke} ({reason})")?;
-            }
-            "di_resolved" => {
-                let request_id = e.detail["request_id"].as_str().unwrap_or("?");
-                let target = e.detail["target_domain"].as_str().unwrap_or("?");
-                let outcome = e.detail["outcome"].as_str().unwrap_or("?");
-                let decided_by = e.detail["decided_by"].as_str().unwrap_or("");
-                let decided = if decided_by.is_empty() {
-                    String::new()
-                } else {
-                    format!(" by {decided_by}")
-                };
-                writeln!(
-                    out,
-                    "  di    {request_id} -> {outcome} (target {target}){decided}",
-                )?;
-            }
-            other => {
-                writeln!(out, "  {other}  ({ts})", ts = e.ts_iso)?;
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---------------- TUI-002: launcher template selection ----------------
-    //
-    // The launcher profile defaults flipped from human-readable prose to
-    // structured NDJSON output so the monitor's feed tailer can parse event
-    // boundaries. These tests lock in that:
-    //   * raw opencode model IDs resolve to a command containing
-    //     `--format json` and the selected `--model` value;
-    //   * built-in monitor-facing profiles resolve to structured output;
-    //   * the empty-launcher case refuses auto-launch (no billing surprise).
-
-    #[test]
-    fn raw_model_id_resolves_to_structured_output_command() {
-        let launcher = crate::models::LauncherConfig {
-            template: String::new(),
-            profiles: std::collections::HashMap::new(),
-        };
-        let cmd = launcher_template_for(Some("openrouter/z-ai/glm-5.2"), &launcher)
-            .expect("raw model id resolves");
-        assert!(
-            cmd.contains("--format json"),
-            "raw model id must use --format json: {cmd}"
-        );
-        assert!(
-            cmd.contains("--thinking"),
-            "raw model id must use --thinking: {cmd}"
-        );
-        assert!(
-            cmd.contains("--model openrouter/z-ai/glm-5.2"),
-            "raw model id must pass through: {cmd}"
-        );
-        // The {root} and {prompt_file} placeholders survive for the caller
-        // to substitute -- this is the template, not the final command.
-        assert!(cmd.contains("{root}"), "root placeholder kept: {cmd}");
-        assert!(cmd.contains("{prompt_file}"), "prompt placeholder kept: {cmd}");
-    }
-
-    #[test]
-    fn builtin_opencode_profile_resolves_to_structured_output() {
-        let launcher = crate::models::Config::default().launcher;
-        let cmd = launcher_template_for(Some("opencode"), &launcher).expect("opencode resolves");
-        assert!(
-            cmd.contains("--format json"),
-            "builtin opencode default must be structured: {cmd}"
-        );
-        assert!(cmd.contains("--thinking"), "thoughts enabled: {cmd}");
-    }
-
-    #[test]
-    fn builtin_claude_code_profile_resolves_to_stream_json() {
-        let launcher = crate::models::Config::default().launcher;
-        let cmd = launcher_template_for(Some("claude-code"), &launcher)
-            .expect("claude-code resolves");
-        assert!(
-            cmd.contains("--output-format stream-json"),
-            "builtin claude-code default must be stream-json: {cmd}"
-        );
-    }
-
-    #[test]
-    fn empty_launcher_refuses_to_resolve() {
-        let launcher = crate::models::Config::default().launcher;
-        assert!(launcher_template_for(None, &launcher).is_none());
-        assert!(launcher_template_for(Some(""), &launcher).is_none());
-    }
-
-    #[test]
-    fn user_custom_profile_passes_through_verbatim() {
-        let mut profiles = std::collections::HashMap::new();
-        profiles.insert(
-            "custom".to_string(),
-            "my-binary --no-flags {prompt_file}".to_string(),
-        );
-        let launcher = crate::models::LauncherConfig {
-            template: String::new(),
-            profiles,
-        };
-        let cmd = launcher_template_for(Some("custom"), &launcher).expect("custom resolves");
-        assert_eq!(cmd, "my-binary --no-flags {prompt_file}");
-    }
 
     #[test]
     fn parse_agent_list_trims_and_drops_empty() {
@@ -4246,15 +3397,8 @@ mod tests {
         )
         .unwrap();
         let cmd = launcher_command_for_agent(&ctx, "alpha", Path::new("/tmp/p.md"), None).unwrap();
-        // TUI-002: the "opencode" profile's monitor-facing default is now
-        // the structured-output command (`--format json --thinking`), not
-        // the human-readable plain invocation. A profile name resolves to
-        // the profile's configured command verbatim; it never builds a
-        // `--model` command (that path is for raw model IDs only).
-        assert!(
-            cmd.starts_with("opencode run --format json --thinking"),
-            "expected structured-output opencode command, got: {cmd}"
-        );
+        // The "opencode" profile's default template, not a model-specific one.
+        assert!(cmd.starts_with("opencode run \""));
         assert!(!cmd.contains("--model"));
     }
 
@@ -4275,12 +3419,7 @@ mod tests {
         )
         .unwrap();
         let cmd = launcher_command_for_agent(&ctx, "alpha", Path::new("/tmp/p.md"), None).unwrap();
-        // TUI-002: raw model IDs MUST resolve to a structured-output
-        // command (--format json --thinking) so the monitor can parse event
-        // boundaries; without those flags the photographed corruption
-        // reappears.
-        assert!(cmd.contains("opencode run --format json --thinking"));
-        assert!(cmd.contains("--model openrouter/z-ai/glm-5.2"));
+        assert!(cmd.contains("opencode run --model openrouter/z-ai/glm-5.2"));
         assert!(cmd.contains("/tmp/p.md"));
     }
 
@@ -4491,7 +3630,7 @@ mod tests {
             description: String::new(),
             writable: vec!["**".to_string()],
             launcher_agent: None,
-            forbidden_write: crate::models::hard_forbidden_globs(),
+            forbidden_write: vec![".trelane/**".to_string(), ".git/**".to_string()],
             granularity_tier: default_granularity_tier(),
             parent_domain: None,
             created_in_pass: 0,
@@ -4541,11 +3680,7 @@ mod tests {
         let ctx = assistance_ctx(&temp);
         // Snapshot at the end of owner's last run: clean tree.
         store::save_audit_baseline(&ctx.conn, "owner", &git_dirty(root).unwrap()).unwrap();
-        assert!(
-            domain_change_since_baseline(&ctx, "owner")
-                .unwrap()
-                .is_empty()
-        );
+        assert!(domain_change_since_baseline(&ctx, "owner").unwrap().is_empty());
 
         // Another agent dirties one file in owner's domain and one outside it.
         std::fs::write(root.join("src/a.rs"), "const A: u8 = 2;\n").unwrap();
@@ -4563,11 +3698,7 @@ mod tests {
         // The done-time refresh captures the current state as the new "seen"
         // baseline -- the agent's own acknowledged work never re-flags.
         store::save_audit_baseline(&ctx.conn, "owner", &git_dirty(root).unwrap()).unwrap();
-        assert!(
-            domain_change_since_baseline(&ctx, "owner")
-                .unwrap()
-                .is_empty()
-        );
+        assert!(domain_change_since_baseline(&ctx, "owner").unwrap().is_empty());
     }
 
     /// No prior snapshot (first-ever run) means nothing to diff against.
@@ -4581,63 +3712,7 @@ mod tests {
         let ctx = assistance_ctx(&temp);
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/new.rs"), "// new\n").unwrap();
-        assert!(
-            domain_change_since_baseline(&ctx, "owner")
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    /// 4B remainder: redomain archives the agent's still-active bulletin
-    /// entries so the old domain's board no longer shows a departed agent as
-    /// working in it. Archived entries stay readable via --include-archived
-    /// (R15: staleness demotes, it never destroys).
-    #[test]
-    fn redomain_archives_active_bulletins() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        git_ok(root, &["init", "-q"]);
-        git_ok(root, &["config", "user.email", "tests@example.invalid"]);
-        git_ok(root, &["config", "user.name", "Trelane Tests"]);
-        let ctx = assistance_ctx(&temp);
-
-        // Owner announces intent in its own domain (scope "owner").
-        post_bulletin(
-            &ctx,
-            "owner",
-            "owner",
-            &["src/a.rs".to_string()],
-            "starting work",
-        )
-        .unwrap();
-        assert_eq!(
-            store::get_bulletin(&ctx.conn, "owner", false)
-                .unwrap()
-                .len(),
-            1
-        );
-
-        // Owner switches to a different domain.
-        cmd_redomain(
-            &ctx,
-            "owner",
-            &["ui/**".to_string()],
-            &[],
-            Some("moved to ui"),
-        )
-        .unwrap();
-
-        // The old domain's active board no longer carries the departed agent.
-        assert!(
-            store::get_bulletin(&ctx.conn, "owner", false)
-                .unwrap()
-                .is_empty()
-        );
-        // But the entry survives in history (archived, not deleted).
-        assert_eq!(
-            store::get_bulletin(&ctx.conn, "owner", true).unwrap().len(),
-            1
-        );
+        assert!(domain_change_since_baseline(&ctx, "owner").unwrap().is_empty());
     }
 
     // ------------------------------------------------------------- 4A DI
@@ -4682,7 +3757,8 @@ mod tests {
         std::fs::write(&file, "// nope\n").unwrap();
         let abs = file.to_string_lossy().to_string();
         let ctx = assistance_ctx(&temp);
-        let err = cmd_claim(&ctx, "helper", &abs, None, None, None, None).unwrap_err();
+        let err = cmd_claim(&ctx, "helper", &abs, None, None, None, None)
+            .unwrap_err();
         assert!(err.to_string().contains("delegation"));
     }
 
@@ -4709,7 +3785,8 @@ mod tests {
         crate::di::approve(&ctx, &id, "owner").unwrap();
         crate::di::resolve_pending(&ctx).unwrap();
 
-        let err = cmd_claim(&ctx, "helper", &abs, None, None, None, None).unwrap_err();
+        let err = cmd_claim(&ctx, "helper", &abs, None, None, None, None)
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("DENIED"), "got: {msg}");
         assert!(msg.contains("--wait-contested-claim"), "got: {msg}");

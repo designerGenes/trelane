@@ -1,5 +1,5 @@
 use crate::error::{Result, TrelaneError};
-use crate::models::{Domain, TRELANE_DIR, default_granularity_tier, hard_forbidden_globs};
+use crate::models::{default_granularity_tier, Domain, TRELANE_DIR};
 use globset::Glob;
 use std::path::{Path, PathBuf};
 
@@ -114,7 +114,7 @@ pub fn domain_allows_scope(dom: &Domain, candidate: &str) -> Result<bool> {
     for forbidden in dom
         .forbidden_write
         .iter()
-        .chain(hard_forbidden_globs().iter())
+        .chain([format!("{TRELANE_DIR}/**"), ".git/**".to_string()].iter())
     {
         if scope_entries_may_overlap(candidate, forbidden)? {
             return Ok(false);
@@ -155,7 +155,7 @@ pub fn default_domain(agent: &str) -> Domain {
         description: String::new(),
         writable: vec![],
         launcher_agent: None,
-        forbidden_write: hard_forbidden_globs(),
+        forbidden_write: vec![format!("{TRELANE_DIR}/**"), ".git/**".to_string()],
         // v13 (Slice 5): a freshly-created domain starts at the coarsest tier
         // with no lineage and no split metadata; refinement fills these in.
         granularity_tier: default_granularity_tier(),

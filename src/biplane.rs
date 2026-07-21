@@ -301,7 +301,7 @@ fn execute_biplane_plan(
     )))
 }
 
-pub(crate) fn resolve_launcher_template(model: &str) -> Result<String> {
+fn resolve_launcher_template(model: &str) -> Result<String> {
     // Determine the fully-qualified model id. Prefer the exact id from a
     // configured launcher profile so we never guess an "openrouter/{model}"
     // id -- an invalid id makes OpenRouter return an opaque
@@ -429,7 +429,7 @@ fn strip_ansi(input: &str) -> String {
     result
 }
 
-pub(crate) fn extract_text_from_json_events(stdout: &str) -> String {
+fn extract_text_from_json_events(stdout: &str) -> String {
     let mut text_parts = Vec::new();
     for line in stdout.lines() {
         let line = line.trim();
@@ -560,130 +560,6 @@ fn collect_feature_text(base: &Path, dir: &Path, texts: &mut Vec<String>) {
     }
 }
 
-/// A gathered markdown file: its path (for display) and content.
-#[derive(Debug, Clone)]
-pub struct GatheredMarkdown {
-    pub path: PathBuf,
-    pub content: String,
-}
-
-/// Result of gathering markdown across one or more directories.
-#[derive(Debug, Clone, Default)]
-pub struct MarkdownGather {
-    pub files: Vec<GatheredMarkdown>,
-    pub total_bytes: usize,
-}
-
-impl MarkdownGather {
-    pub fn count(&self) -> usize {
-        self.files.len()
-    }
-    /// Whether this gather is large enough to warrant a pre-submission warning.
-    /// Trips on EITHER many files OR a large total size, since model context is
-    /// what actually constrains submission and both dimensions can blow it.
-    pub fn is_large(&self) -> bool {
-        self.count() > MARKDOWN_WARN_FILE_COUNT || self.total_bytes > MARKDOWN_WARN_TOTAL_BYTES
-    }
-    /// The combined text submitted to the model, each file prefixed with its
-    /// path as a heading so the model can attribute content to sources.
-    pub fn combined_text(&self) -> String {
-        self.files
-            .iter()
-            .map(|f| format!("## {}\n\n{}", f.path.display(), f.content))
-            .collect::<Vec<_>>()
-            .join("\n\n---\n\n")
-    }
-}
-
-/// Warn before submission above ~50 markdown files...
-pub const MARKDOWN_WARN_FILE_COUNT: usize = 50;
-/// ...or ~500 KB of total markdown, whichever trips first.
-pub const MARKDOWN_WARN_TOTAL_BYTES: usize = 500 * 1024;
-
-/// Recursively gather every `.md` file under each of `dirs`. Skips `.trelane`
-/// and hidden directories (dotfolders) so we don't sweep in machine state or
-/// VCS internals. A file reachable from two `dirs` is included once (dedup by
-/// canonical path). Unreadable files and dirs are skipped, not fatal.
-pub fn gather_markdown_files(dirs: &[PathBuf]) -> MarkdownGather {
-    let mut gather = MarkdownGather::default();
-    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    for dir in dirs {
-        gather_md_recursive(dir, &mut gather, &mut seen);
-    }
-    // Stable, path-sorted order so the same tree always produces the same
-    // combined text (deterministic prompts, easier diffing).
-    gather.files.sort_by(|a, b| a.path.cmp(&b.path));
-    gather
-}
-
-fn gather_md_recursive(
-    dir: &Path,
-    gather: &mut MarkdownGather,
-    seen: &mut std::collections::HashSet<PathBuf>,
-) {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            // Skip .trelane, .git, and any dotfolder.
-            let is_hidden = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with('.'));
-            if !is_hidden {
-                gather_md_recursive(&path, gather, seen);
-            }
-        } else if path.extension().is_some_and(|ext| ext == "md") {
-            let canon = path.canonicalize().unwrap_or_else(|_| path.clone());
-            if !seen.insert(canon) {
-                continue; // already gathered via another include dir
-            }
-            if let Ok(content) = fs::read_to_string(&path) {
-                gather.total_bytes += content.len();
-                gather.files.push(GatheredMarkdown { path, content });
-            }
-        }
-    }
-}
-
-/// Look for an existing `biplane-report.json` for the project at `root`. A
-/// report is a projectDir artifact (never in an `-i` markdown-source folder):
-/// the canonical location is `<root>/.trelane/biplane-report.json`, but a
-/// portable report dropped directly in `<root>` is also accepted so a report
-/// can be moved between machines/folders with the project.
-pub fn find_project_report(root: &Path) -> Option<PathBuf> {
-    let nested = root.join(".trelane").join(BIPLANE_REPORT_FILENAME);
-    if nested.is_file() {
-        return Some(nested);
-    }
-    let direct = root.join(BIPLANE_REPORT_FILENAME);
-    if direct.is_file() {
-        return Some(direct);
-    }
-    None
-}
-
-/// Look for an existing `biplane-description.json` (the editable domain plan the
-/// UI loads and a Trelane session launches from) for the project at `root`.
-/// Like the report, this is a projectDir artifact -- never searched in `-i`
-/// folders, which contribute markdown only. Canonical location is
-/// `<root>/.trelane/biplane-description.json`; a portable plan dropped directly
-/// in `<root>` is also accepted.
-pub fn find_project_description(root: &Path) -> Option<PathBuf> {
-    let nested = root.join(".trelane").join("biplane-description.json");
-    if nested.is_file() {
-        return Some(nested);
-    }
-    let direct = root.join("biplane-description.json");
-    if direct.is_file() {
-        return Some(direct);
-    }
-    None
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct BiplaneReport {
     pub project_root: String,
@@ -694,11 +570,6 @@ pub struct BiplaneReport {
     pub deadlock: Option<Vec<String>>,
     pub safe_pocket_features: Vec<String>,
     pub recommendations: Vec<String>,
-    /// Static deadlock-likelihood estimate derived from the domain structure
-    /// at analysis time. Displayed in the Trelane diagnostics UI. Optional so
-    /// reports produced before this field existed still deserialize.
-    #[serde(default)]
-    pub entropy: Option<crate::entropy::EntropyScore>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -845,40 +716,6 @@ pub fn generate_biplane_report(
         ));
     }
 
-    // Static deadlock-likelihood estimate from the domain structure. Built
-    // from the same agent/domain data already gathered above plus the live
-    // cycle signal, so it costs no extra analysis pass.
-    //
-    // Dependency edges (depends_on) live on the stored ProjectDescription, not
-    // on BiplaneAgentSummary, so we read them from disk when a description is
-    // present and key them by domain name. When no description exists (agents
-    // registered directly), the estimate is overlap- and count-driven only —
-    // still a meaningful signal, just missing the dependency dimension.
-    let desc_path = ctx.trelane_dir().join("biplane-description.json");
-    let depends_by_name: std::collections::HashMap<String, Vec<String>> = desc_path
-        .exists()
-        .then(|| load_project_description(&desc_path).ok())
-        .flatten()
-        .map(|desc| {
-            desc.domains
-                .into_iter()
-                .map(|d| (d.name, d.depends_on))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let domain_views: Vec<crate::entropy::DomainView> = agent_summaries
-        .iter()
-        .map(|a| crate::entropy::DomainView {
-            name: a.name.clone(),
-            writable: a.writable.clone(),
-            depends_on: depends_by_name.get(&a.name).cloned().unwrap_or_default(),
-        })
-        .collect();
-    let entropy = Some(crate::entropy::compute(
-        crate::entropy::inputs_from_domains(&domain_views, deadlock.is_some()),
-    ));
-
     let report = BiplaneReport {
         project_root: ctx.root.display().to_string(),
         analysis_at: crate::crypto::now_iso(),
@@ -888,7 +725,6 @@ pub fn generate_biplane_report(
         deadlock,
         safe_pocket_features,
         recommendations,
-        entropy,
     };
 
     Ok(report)
@@ -966,7 +802,6 @@ pub fn has_existing_biplane_report(project_root: &Path) -> Option<PathBuf> {
     }
 }
 
-#[allow(dead_code)]
 pub fn cmd_welcome(project: Option<PathBuf>) -> Result<()> {
     let root = match project {
         Some(p) => p.canonicalize()?,
@@ -1362,18 +1197,6 @@ pub fn validate_description(desc: &ProjectDescription) -> Result<()> {
             return Err(TrelaneError::msg(
                 "project description: a domain has an empty name",
             ));
-        }
-        // Domain names become agent IDs, which must match the agent-name
-        // charset (lowercase alnum, '-', '_', max 32 chars). Catching this
-        // at validation time (in the Biplane UI's save path) tells the user
-        // to rename BEFORE the description is saved, rather than failing
-        // silently at session-launch time with a cryptic apply error.
-        if !crate::commands::is_valid_agent_name(&d.name) {
-            return Err(TrelaneError::msg(format!(
-                "project description: domain name '{}' is not a valid agent id \
-                 (use lowercase letters, digits, '-', '_'; max 32 chars)",
-                d.name
-            )));
         }
         if d.writable.is_empty() {
             return Err(TrelaneError::msg(format!(
@@ -1963,7 +1786,10 @@ fn apply_plan_to_session(
             // re-applied, which is exactly what left some agents stuck on the
             // (now safety-refused) default launcher while sibling agents
             // created in a later apply picked up the right one.
-            let mut forbidden = crate::models::hard_forbidden_globs();
+            let mut forbidden = vec![
+                format!("{}/**", crate::models::TRELANE_DIR),
+                ".git/**".to_string(),
+            ];
             forbidden.extend(fw.iter().cloned());
             crate::store::upsert_agent(
                 &ctx.conn,
@@ -2013,11 +1839,7 @@ fn apply_plan_to_session(
         let task_id = if let Some(found) = existing.iter().find(|et| et.subject == t.work.subject) {
             found.id.clone()
         } else {
-            let id = t
-                .work
-                .id
-                .clone()
-                .unwrap_or_else(|| crate::crypto::new_id("task"));
+            let id = t.work.id.clone().unwrap_or_else(|| crate::crypto::new_id("task"));
             let task = crate::models::Task {
                 id: id.clone(),
                 owner_agent: t.agent.clone(),
@@ -2049,10 +1871,7 @@ fn apply_plan_to_session(
             if sub_existing.iter().any(|et| et.subject == sub.subject) {
                 continue;
             }
-            let sub_id = sub
-                .id
-                .clone()
-                .unwrap_or_else(|| crate::crypto::new_id("task"));
+            let sub_id = sub.id.clone().unwrap_or_else(|| crate::crypto::new_id("task"));
             let sub_path = if !sub.path_scope.is_empty() {
                 sub.path_scope.clone()
             } else {
@@ -2084,19 +1903,16 @@ fn apply_plan_to_session(
         // Create reviewer assignment if designated.
         if let Some(ref reviewer) = t.work.reviewer {
             if crate::store::agent_exists(&ctx.conn, reviewer)? {
-                crate::store::upsert_assignment(
-                    &ctx.conn,
-                    &crate::models::TaskAssignment {
-                        task_id: task_id.clone(),
-                        agent: reviewer.clone(),
-                        role: crate::models::TaskRole::Reviewer,
-                        state: "assigned".to_string(),
-                        offer_id: None,
-                        delegation_id: None,
-                        started_at: None,
-                        completed_at: None,
-                    },
-                )?;
+                crate::store::upsert_assignment(&ctx.conn, &crate::models::TaskAssignment {
+                    task_id: task_id.clone(),
+                    agent: reviewer.clone(),
+                    role: crate::models::TaskRole::Reviewer,
+                    state: "assigned".to_string(),
+                    offer_id: None,
+                    delegation_id: None,
+                    started_at: None,
+                    completed_at: None,
+                })?;
             }
         }
 
@@ -2121,9 +1937,7 @@ fn apply_plan_to_session(
         }
         let existing = crate::store::list_tasks_for_owner(&ctx.conn, &t.agent)?;
         if let Some(found) = existing.iter().find(|et| et.subject == t.work.subject) {
-            let resolved: Vec<String> = t
-                .work
-                .depends_on
+            let resolved: Vec<String> = t.work.depends_on
                 .iter()
                 .filter_map(|dep| id_map.get(dep).cloned())
                 .collect();
@@ -2312,159 +2126,6 @@ pub fn cmd_biplane_interactive(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn gather_markdown_recurses_and_skips_dotfolders() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        std::fs::write(root.join("README.md"), "top level").unwrap();
-        std::fs::create_dir_all(root.join("docs/sub")).unwrap();
-        std::fs::write(root.join("docs/guide.md"), "guide").unwrap();
-        std::fs::write(root.join("docs/sub/deep.md"), "deep nested").unwrap();
-        std::fs::write(root.join("notes.txt"), "not markdown").unwrap();
-        // A dotfolder that must be skipped (e.g. .trelane machine state).
-        std::fs::create_dir_all(root.join(".trelane")).unwrap();
-        std::fs::write(root.join(".trelane/state.md"), "should be skipped").unwrap();
-
-        let g = gather_markdown_files(&[root.to_path_buf()]);
-        assert_eq!(g.count(), 3, "3 real .md, dotfolder + .txt excluded");
-        assert!(g.files.iter().all(|f| f.path.extension().unwrap() == "md"));
-        assert!(!g.combined_text().contains("should be skipped"));
-    }
-
-    #[test]
-    fn gather_markdown_dedups_across_include_dirs() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        std::fs::create_dir_all(root.join("a")).unwrap();
-        std::fs::write(root.join("a/x.md"), "content").unwrap();
-        // Pass the same dir twice and also the parent that contains it: the
-        // file must be counted once.
-        let g = gather_markdown_files(&[
-            root.join("a"),
-            root.join("a"),
-            root.to_path_buf(),
-        ]);
-        assert_eq!(g.count(), 1, "same file via multiple dirs counted once");
-    }
-
-    #[test]
-    fn gather_reports_total_bytes_and_large_flag() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        std::fs::write(root.join("a.md"), "12345").unwrap(); // 5 bytes
-        std::fs::write(root.join("b.md"), "678").unwrap(); // 3 bytes
-        let g = gather_markdown_files(&[root.to_path_buf()]);
-        assert_eq!(g.total_bytes, 8);
-        assert!(!g.is_large(), "tiny gather is not large");
-    }
-
-    #[test]
-    fn is_large_trips_on_either_count_or_size() {
-        // Many small files -> large by count.
-        let by_count = MarkdownGather {
-            files: (0..MARKDOWN_WARN_FILE_COUNT + 1)
-                .map(|i| GatheredMarkdown {
-                    path: PathBuf::from(format!("f{i}.md")),
-                    content: String::new(),
-                })
-                .collect(),
-            total_bytes: 10,
-        };
-        assert!(by_count.is_large(), "over the file-count threshold");
-
-        // Few files but huge -> large by size.
-        let by_size = MarkdownGather {
-            files: vec![GatheredMarkdown {
-                path: PathBuf::from("big.md"),
-                content: String::new(),
-            }],
-            total_bytes: MARKDOWN_WARN_TOTAL_BYTES + 1,
-        };
-        assert!(by_size.is_large(), "over the total-size threshold");
-    }
-
-    #[test]
-    fn find_project_report_detects_nested_and_direct() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        // Nested canonical location.
-        let td = root.join(".trelane");
-        std::fs::create_dir_all(&td).unwrap();
-        std::fs::write(td.join(BIPLANE_REPORT_FILENAME), "{}").unwrap();
-        assert_eq!(
-            find_project_report(root),
-            Some(td.join(BIPLANE_REPORT_FILENAME))
-        );
-    }
-
-    #[test]
-    fn find_project_report_direct_portable_drop_in() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        // A portable report dropped directly in the project dir (no .trelane).
-        std::fs::write(root.join(BIPLANE_REPORT_FILENAME), "{}").unwrap();
-        assert_eq!(
-            find_project_report(root),
-            Some(root.join(BIPLANE_REPORT_FILENAME))
-        );
-    }
-
-    #[test]
-    fn find_project_description_detects_nested_trelane_layout() {
-        // The real layout: <root>/.trelane/biplane-description.json
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        let td = root.join(".trelane");
-        std::fs::create_dir_all(&td).unwrap();
-        std::fs::write(td.join("biplane-description.json"), "{}").unwrap();
-        assert_eq!(
-            find_project_description(root),
-            Some(td.join("biplane-description.json"))
-        );
-    }
-
-    #[test]
-    fn find_project_description_detects_direct_portable_layout() {
-        // A portable plan dropped directly in the project dir.
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path();
-        std::fs::write(root.join("biplane-description.json"), "{}").unwrap();
-        assert_eq!(
-            find_project_description(root),
-            Some(root.join("biplane-description.json"))
-        );
-    }
-
-    #[test]
-    fn detection_is_projectdir_only_not_sibling_folders() {
-        // The corrected model: a plan living in a DIFFERENT folder (as an `-i`
-        // markdown source would) is NOT detected for the project dir. Detection
-        // and generation belong to the projectDir; `-i` contributes markdown
-        // only. This test pins that boundary so the old conflation can't creep
-        // back.
-        let temp = tempfile::tempdir().unwrap();
-        let project = temp.path().join("projectDir");
-        let source = temp.path().join("safe_pocket");
-        std::fs::create_dir_all(&project).unwrap();
-        std::fs::create_dir_all(source.join(".trelane")).unwrap();
-        // A plan exists in the -i-style source folder, but NOT in projectDir.
-        std::fs::write(
-            source.join(".trelane").join("biplane-description.json"),
-            "{}",
-        )
-        .unwrap();
-        assert!(
-            find_project_description(&project).is_none(),
-            "a plan in a sibling/source folder must not be detected for projectDir"
-        );
-    }
-
-    #[test]
-    fn find_project_description_none_when_absent() {
-        let temp = tempfile::tempdir().unwrap();
-        assert!(find_project_description(temp.path()).is_none());
-    }
 
     fn migrated_ctx(temp: &tempfile::TempDir) -> crate::Context {
         let root = temp.path().to_path_buf();
@@ -2736,26 +2397,6 @@ mod tests {
         let d = desc(vec![domain("a", &["ghost"], 1)], None);
         let err = validate_description(&d).unwrap_err();
         assert!(format!("{err:?}").contains("unknown domain"));
-    }
-
-    #[test]
-    fn validate_rejects_uppercase_domain_name() {
-        // Domain names become agent IDs, which require lowercase alnum +
-        // '-'/'_'. The validator must catch this at save time (in the
-        // Biplane UI) rather than failing silently at session-launch time.
-        let d = desc(vec![domain("FrontEnd", &[], 1)], None);
-        let err = validate_description(&d).unwrap_err();
-        assert!(format!("{err:?}").contains("not a valid agent id"));
-        assert!(format!("{err:?}").contains("FrontEnd"));
-    }
-
-    #[test]
-    fn validate_accepts_valid_agent_name_chars() {
-        let d = desc(
-            vec![domain("front-end_2", &[], 1)],
-            None,
-        );
-        assert!(validate_description(&d).is_ok());
     }
 
     #[test]
@@ -3047,10 +2688,7 @@ mod tests {
         let tasks = crate::store::list_tasks_for_owner(&ctx.conn, "backend").unwrap();
         assert_eq!(tasks.len(), 2, "parent and child task");
         let child = tasks.iter().find(|t| t.subject == "add API tests").unwrap();
-        assert!(
-            child.parent_task.is_some(),
-            "child must have parent_task set"
-        );
+        assert!(child.parent_task.is_some(), "child must have parent_task set");
         let parent = tasks.iter().find(|t| t.subject == "build API").unwrap();
         assert_eq!(child.parent_task.as_ref().unwrap(), &parent.id);
     }
@@ -3077,12 +2715,8 @@ mod tests {
         let tasks = crate::store::list_tasks_for_owner(&ctx.conn, "backend").unwrap();
         let task = tasks.iter().find(|t| t.subject == "build API").unwrap();
         let assignments = crate::store::list_assignments_for_task(&ctx.conn, &task.id).unwrap();
-        assert!(
-            assignments
-                .iter()
-                .any(|a| a.role == crate::models::TaskRole::Reviewer),
-            "reviewer assignment must be created"
-        );
+        assert!(assignments.iter().any(|a| a.role == crate::models::TaskRole::Reviewer),
+            "reviewer assignment must be created");
     }
 
     #[test]

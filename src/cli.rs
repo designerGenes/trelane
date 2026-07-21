@@ -80,43 +80,6 @@ pub struct Cli {
     pub no_agents: Option<String>,
 
     #[arg(
-        long = "headless",
-        global = true,
-        help = "run the session without the monitor UI (squire tick-loop only). \
-                The default `trelane` launches the tabbed monitor UI."
-    )]
-    pub headless: bool,
-
-    #[arg(
-        long = "launcher",
-        global = true,
-        help = "launcher template/profile override for this session's agents"
-    )]
-    pub launcher: Option<String>,
-
-    #[arg(
-        long = "interval",
-        global = true,
-        help = "squire tick interval in seconds (default: config squire.interval_s)"
-    )]
-    pub interval: Option<u64>,
-
-    #[arg(
-        long = "verbose",
-        short = 'v',
-        global = true,
-        help = "narrate normally-quiet session events"
-    )]
-    pub verbose: bool,
-
-    #[arg(
-        long = "bench-sandbox",
-        global = true,
-        help = "watch a `trelane bench run` sandbox instead of the current project"
-    )]
-    pub bench_sandbox: Option<PathBuf>,
-
-    #[arg(
         value_name = "PROJECT",
         help = "attach/init a trelane session for an existing project"
     )]
@@ -323,6 +286,35 @@ pub enum Command {
     /// Mark an agent as done (release running lock)
     Done { agent: String },
 
+    /// The dutiful squire -- relaunches agents that have a reason to wake
+    /// (`prop` and `pump` still work as aliases).
+    ///
+    /// Liveness boundary: Trelane never restarts the squire itself. If you
+    /// want the squire kept alive, supervise it from OUTSIDE Trelane --
+    /// launchd, systemd, cron (`--once`), or a `while true` shell loop.
+    #[command(alias = "pump", alias = "prop")]
+    Squire {
+        #[arg(long = "once")]
+        once: bool,
+        #[arg(long = "watch")]
+        watch: bool,
+        #[arg(long = "interval")]
+        interval: Option<u64>,
+        #[arg(long = "launcher")]
+        launcher: Option<String>,
+        #[arg(
+            long = "verbose",
+            short = 'v',
+            help = "narrate normally-quiet events (e.g. concurrency-budget deferrals)"
+        )]
+        verbose: bool,
+        #[arg(
+            long = "max-concurrent",
+            help = "override squire.max_concurrent for this run (simultaneous agent ceiling)"
+        )]
+        max_concurrent: Option<usize>,
+    },
+
     /// Token-free scripted agent for demos and testing
     Stub { agent: String },
 
@@ -375,20 +367,6 @@ pub enum Command {
             help = "model/launcher profile for --refine decisions (default: config launcher default)"
         )]
         refine_model: Option<String>,
-        #[arg(
-            short = 'i',
-            long = "include",
-            value_name = "DIR",
-            help = "additional folder(s) whose markdown files are gathered recursively for \
-                    report generation (repeatable: -i dirA -i dirB). Also searched for an \
-                    existing biplane-report.json to load."
-        )]
-        include: Vec<PathBuf>,
-        #[arg(
-            long = "regenerate",
-            help = "ignore any existing biplane-report.json and regenerate from gathered markdown"
-        )]
-        regenerate: bool,
     },
 
     /// Review Biplane split proposals for owned domains (R20/R29)
@@ -401,35 +379,6 @@ pub enum Command {
     Metrics {
         #[arg(long)]
         json: bool,
-    },
-
-    /// Show the causal story ledger: who wrote each file when, which writes
-    /// reverted earlier byte-identical states, and the sequence of claim/
-    /// park/run events for the session. Append-only; observation, not
-    /// coordination. (story-events ledger)
-    Story {
-        /// Emit the events as a JSON array (StoryEvent[]) instead of the
-        /// rendered timeline. For machine consumption / piping.
-        #[arg(long)]
-        json: bool,
-        /// Filter to one agent's events (use 'squire' for squire-emitted
-        /// events).
-        #[arg(long)]
-        agent: Option<String>,
-        /// Filter to one file's history (e.g. 'src/data/store.js').
-        #[arg(long)]
-        path: Option<String>,
-        /// Filter to given kinds (repeatable): run_start, run_end,
-        /// file_change, claim_acquired, claim_denied, claim_released,
-        /// park, unpark, wake_issued, di_resolved.
-        #[arg(long = "kind", value_name = "KIND")]
-        kinds: Vec<String>,
-        /// Show only file_change events that are overwrite/rework signals
-        /// (a hash_after that reappears on the same path), plus their
-        /// enclosing run_start/run_end for context. The direct answer to
-        /// 'did work keep getting redone and overwritten?'.
-        #[arg(long)]
-        rework_only: bool,
     },
 
     /// Run repeatable benchmarks against free-model agents (step 3 of the
@@ -453,6 +402,20 @@ pub enum Command {
 
     /// Interactive diagnostic view for the main Trelane session (TUI)
     Diagnostic,
+
+    /// Native tabbed session monitor: one tab per agent plus a Trelane
+    /// summary tab. Each agent tab tails that agent's run log and shows its
+    /// live thoughts, tool calls, and output (richest with a streaming
+    /// launcher profile such as `opencode-stream` or `claude-code-stream`).
+    Monitor {
+        /// Watch a `trelane bench run` sandbox instead of the current project.
+        /// Pass the sandbox root used by the bench (the `--sandbox-root` you
+        /// gave `bench run`, or the default temp dir); the monitor resolves
+        /// the active `scenario-run-1` session under it. Without this flag the
+        /// monitor watches the project resolved from `--root`/cwd as usual.
+        #[arg(long = "bench-sandbox")]
+        bench_sandbox: Option<PathBuf>,
+    },
 
     /// Inspect or change Trelane configuration values
     Config {

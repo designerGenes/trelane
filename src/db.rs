@@ -353,45 +353,6 @@ CREATE INDEX IF NOT EXISTS idx_split_proposals_owner
 ALTER TABLE project_state ADD COLUMN refinement_pass INTEGER NOT NULL DEFAULT 0;
 "#;
 
-/// V14: the append-only story-events ledger (TUI-005 / story-ledger spec).
-///
-/// Records the full causal "story" of a Trelane session -- claim
-/// acquire/release, file-content changes with hashes, park/unpark, agent
-/// run boundaries, squire wakes, and DI resolutions -- so `trelane story`
-/// can answer after the fact: who wrote each file when, whether a write
-/// reverted an earlier byte-identical state, and which contended path was
-/// held by whom for how long. The ledger is APPEND-ONLY by convention and
-/// enforced by the absence of any UPDATE/DELETE code path against it
-/// anywhere in the codebase; the AUTOINCREMENT column documents that intent
-/// and prevents rowid reuse. Existing ephemeral rows (claims,
-/// audit_baselines) keep their lifetimes; this table outlives them, which
-/// is the whole point.
-///
-/// Column rationale is in the spec under schema.column_rationale; the
-/// per-event `detail_json` shape is specified under events.kinds and MUST
-/// be honored by every emitter so the renderer can decode without guessing.
-const SCHEMA_V14: &str = r#"
-CREATE TABLE IF NOT EXISTS story_events (
-    seq          INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_id     TEXT NOT NULL,
-    trace_id     TEXT,
-    ts_iso       TEXT NOT NULL,
-    ts_nanos     INTEGER NOT NULL,
-    kind         TEXT NOT NULL,
-    agent        TEXT,
-    path         TEXT,
-    hash_before  TEXT,
-    hash_after   TEXT,
-    detail_json  TEXT NOT NULL DEFAULT '{}',
-    refs_json    TEXT NOT NULL DEFAULT '[]'
-);
-CREATE INDEX IF NOT EXISTS idx_story_kind  ON story_events(kind, seq);
-CREATE INDEX IF NOT EXISTS idx_story_agent ON story_events(agent, seq);
-CREATE INDEX IF NOT EXISTS idx_story_path  ON story_events(path, seq);
-CREATE INDEX IF NOT EXISTS idx_story_trace ON story_events(trace_id, seq);
-CREATE INDEX IF NOT EXISTS idx_story_hash_after ON story_events(hash_after);
-"#;
-
 pub fn open(db_path: &std::path::Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
     conn.execute_batch(
@@ -531,14 +492,6 @@ fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch(SCHEMA_V13)?;
         conn.execute_batch("PRAGMA user_version = 13;")?;
     }
-    if version < 14 {
-        // The story-events ledger (see FEATURES/external/trelane-story-ledger-spec.json):
-        // an append-only causal record of claim/park/run/DI events. Pure
-        // CREATE TABLE IF NOT EXISTS -- idempotent on both fresh and existing
-        // databases, safe to re-run.
-        conn.execute_batch(SCHEMA_V14)?;
-        conn.execute_batch("PRAGMA user_version = 14;")?;
-    }
 
     // Repair: task_submissions.message_id is referenced by the C2 code path
     // but was missing from the original C2 migration. Add it wherever absent,
@@ -599,7 +552,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 13);
         assert!(has_column(&conn, "claims", "delegation_id"));
         assert!(has_column(&conn, "delegations", "offer_message"));
         assert!(has_column(&conn, "task_submissions", "message_id"));
@@ -655,7 +608,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 13);
     }
 
     #[test]
@@ -679,7 +632,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 13);
     }
 
     #[test]
@@ -712,7 +665,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 13);
     }
 
     #[test]
@@ -730,101 +683,5 @@ mod tests {
             })
             .unwrap();
         assert_eq!(v1, v2);
-    }
-
-    /// V14 story-events ledger: a fresh DB reaches user_version 14 and the
-    /// story_events table exists with all specified columns and indexes.
-    /// Reopening is idempotent (no error, version stays 14). See the spec
-    /// under acceptance_tests.
-    #[test]
-    fn fresh_database_reaches_v14_story_events_schema() {
-        let conn = open_in_memory().unwrap();
-        let version: u32 = conn
-            .query_row("SELECT user_version FROM pragma_user_version", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(version, 14);
-
-        // story_events table with the spec columns.
-        assert!(has_column(&conn, "story_events", "seq"));
-        assert!(has_column(&conn, "story_events", "event_id"));
-        assert!(has_column(&conn, "story_events", "trace_id"));
-        assert!(has_column(&conn, "story_events", "ts_iso"));
-        assert!(has_column(&conn, "story_events", "ts_nanos"));
-        assert!(has_column(&conn, "story_events", "kind"));
-        assert!(has_column(&conn, "story_events", "agent"));
-        assert!(has_column(&conn, "story_events", "path"));
-        assert!(has_column(&conn, "story_events", "hash_before"));
-        assert!(has_column(&conn, "story_events", "hash_after"));
-        assert!(has_column(&conn, "story_events", "detail_json"));
-        assert!(has_column(&conn, "story_events", "refs_json"));
-
-        // seq must be INTEGER PRIMARY KEY AUTOINCREMENT (the append-only
-        // intent of the ledger). pragma_table_info.pk > 0 means the column
-        // is part of the primary key; AUTOINCREMENT keyword is verified by
-        // the rowid behavior tested below.
-        let pk_decl: i64 = conn
-            .query_row(
-                "SELECT pk FROM pragma_table_info('story_events') WHERE name='seq'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(pk_decl, 1, "seq is part of the primary key");
-
-        // Indexes exist.
-        let n_indexes: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='story_events'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(n_indexes, 5, "expected 5 indexes (kind/agent/path/trace/hash_after)");
-
-        // Reopening the same connection: re-running migrate is a no-op.
-        migrate(&conn).unwrap();
-        let v_after: u32 = conn
-            .query_row("SELECT user_version FROM pragma_user_version", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(v_after, 14, "idempotent reopen keeps version 14");
-    }
-
-    /// A DB that's been advanced to v13 (the pre-ledger max) upgrades to
-    /// v14 on the next open and gains the story_events table without
-    /// losing any prior data.
-    #[test]
-    fn v13_database_upgrades_to_v14_story_events() {
-        let conn = Connection::open_in_memory().unwrap();
-        // Take a DB to v13 by running the full migration.
-        migrate(&conn).unwrap();
-        let v13: u32 = conn
-            .query_row("SELECT user_version FROM pragma_user_version", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(v13, 14, "fresh migrate already at v14");
-        // Simulate a "reopening at v13" by reverting the version marker.
-        // The story_events table still exists (CREATE TABLE IF NOT EXISTS),
-        // so the V14 block must be safe to fire again.
-        conn.execute_batch("PRAGMA user_version = 13;").unwrap();
-        migrate(&conn).unwrap();
-        let v_after: u32 = conn
-            .query_row("SELECT user_version FROM pragma_user_version", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(v_after, 14);
-        // Idempotent: another migrate is a no-op.
-        migrate(&conn).unwrap();
-        let v_again: u32 = conn
-            .query_row("SELECT user_version FROM pragma_user_version", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(v_again, 14);
     }
 }

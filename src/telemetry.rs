@@ -439,31 +439,6 @@ pub fn current_trace_id(trelane_dir: &Path) -> Option<String> {
 }
 
 fn generate_span_id() -> SpanId {
-    use rand::RngCore;
-    let mut bytes = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    hex_encode(&bytes)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-pub fn now_nanos() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
-pub fn iso_to_nanos(iso: &str) -> u64 {
-    chrono::DateTime::parse_from_rfc3339(iso)
-        .ok()
-        .map(|dt| dt.timestamp_nanos_opt().unwrap_or(0) as u64)
-        .unwrap_or(0)
-}
-
 /// Count git diff lines for the project root.
 /// Returns (files_changed, lines_added, lines_removed).
 pub fn git_diff_stats(root: &Path) -> (usize, usize, usize) {
@@ -472,6 +447,114 @@ pub fn git_diff_stats(root: &Path) -> (usize, usize, usize) {
         .arg(root)
         .args(["diff", "--numstat"])
         .output();
+    let Ok(output) = output else {
+        return (0, 0, 0);
+    };
+    if !output.status.success() {
+        return (0, 0, 0);
+    }
+    parse_numstat(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse `git diff --numstat` output into (files_changed, lines_added,
+/// lines_removed). Shared by `git_diff_stats` and `diff_trees` so the two
+/// diff sources (against HEAD, and between two snapshotted trees) can't
+/// silently drift apart in how they count.
+fn parse_numstat(text: &str) -> (usize, usize, usize) {
+    let mut files = 0;
+    let mut added = 0;
+    let mut removed = 0;
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        files += 1;
+        if parts[0] != "-" {
+            added += parts[0].parse::<usize>().unwrap_or(0);
+        }
+        if parts[1] != "-" {
+            removed += parts[1].parse::<usize>().unwrap_or(0);
+        }
+    }
+    (files, added, removed)
+}
+
+/// Snapshot the working tree as a git tree object, without touching the
+/// repository's real index, HEAD, or any ref. Uses a throwaway index file
+/// (via `GIT_INDEX_FILE`) so it's safe to call mid-run, alongside an agent
+/// that's actively editing files, without disturbing the user's actual
+/// staging area. Returns the tree SHA, or `None` on a non-git project or if
+/// the git plumbing calls fail.
+///
+/// This exists because `git_diff_stats` can only compare against HEAD, and
+/// nothing in the live wake/done path ever commits -- so a HEAD diff reports
+/// the cumulative change since the *session* started, not since this *run*
+/// started. Snapshotting a tree at wake time and again at done time lets
+/// `diff_trees` report exactly this run's delta instead.
+pub fn snapshot_tree(root: &Path) -> Option<String> {
+    let tmp_index = std::env::temp_dir().join(format!(
+        "trelane-idx-{}-{}",
+        std::process::id(),
+        now_nanos()
+    ));
+    let add = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .env("GIT_INDEX_FILE", &tmp_index)
+        .args(["add", "-A"])
+        .output();
+    let Ok(add) = add else {
+        let _ = fs::remove_file(&tmp_index);
+        return None;
+    };
+    if !add.status.success() {
+        let _ = fs::remove_file(&tmp_index);
+        return None;
+    }
+    let write_tree = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .env("GIT_INDEX_FILE", &tmp_index)
+        .args(["write-tree"])
+        .output();
+    let _ = fs::remove_file(&tmp_index);
+    let Ok(write_tree) = write_tree else {
+        return None;
+    };
+    if !write_tree.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&write_tree.stdout)
+        .trim()
+        .to_string();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
+    }
+}
+
+/// Diff two tree snapshots from `snapshot_tree` for (files_changed,
+/// lines_added, lines_removed). Identical trees short-circuit to zeros
+/// without shelling out.
+pub fn diff_trees(root: &Path, before: &str, after: &str) -> (usize, usize, usize) {
+    if before == after {
+        return (0, 0, 0);
+    }
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["diff", "--numstat", before, after])
+        .output();
+    let Ok(output) = output else {
+        return (0, 0, 0);
+    };
+    if !output.status.success() {
+        return (0, 0, 0);
+    }
+    parse_numstat(&String::from_utf8_lossy(&output.stdout))
+}
     let Ok(output) = output else {
         return (0, 0, 0);
     };
